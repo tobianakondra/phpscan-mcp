@@ -1,6 +1,13 @@
 <?xml version="1.0"?>
-<projectFiles>
+<psalm xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xsi:noNamespaceSchemaLocation="https://getpsalm.org/schema/config"
+       errorLevel="4"
+       findUnusedVariables="false"
+       findUnusedCode="false"
+       checkExternalDeclarations="false">
+    <projectFiles>
     <directory name="src"/>
     <directory name="tests"/>
     <directory name="vendor"/>
 </projectFiles>
+</psalm>
