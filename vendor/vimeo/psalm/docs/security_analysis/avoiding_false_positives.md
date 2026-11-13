@@ -1,0 +1,375 @@
+# Avoiding false-positives
+
+When you run Psalm's taint analysis for the first time you may see a bunch of false-positives.
+
+Nobody likes false-positives!
+
+There are a number of ways you can prevent them:
+
+## Escaping tainted input
+
+Some operations remove taints from data – for example, wrapping `$_GET['name']` in an `htmlentities` call prevents cross-site-scripting attacks in that `$_GET` call.
+
+`json_encode()` removes the `html` taint when its flags are a known value including `JSON_HEX_TAG` and `JSON_HEX_AMP`: what it returns then has no `<`, `>` or `&`. It keeps the `has_quotes` taint whatever the flags, as the `"` delimiting a JSON string ends a double-quoted attribute; a function that only puts JSON in a `<script>`, or with `JSON_HEX_APOS` in an attribute in single quotes, can declare `@psalm-taint-escape has_quotes`.
+
+Psalm allows you to remove taints via a `@psalm-taint-escape <taint-type>` annotation:
+
+```php
+<?php
+
+function echoVar(string $str) : void {
+    /**
+     * @psalm-taint-escape html
+     */
+    $str = str_replace(['<', '>'], '', $str);
+    echo $str;
+}
+
+echoVar($_GET["text"]);
+```
+
+## Types
+
+A value can only carry the taints its type can hold: a number or a boolean can't hold HTML, SQL or a path, a string can't be a NoSQL query document (but what `json_decode()`, `unserialize()`, `parse_str()` and the other decoders build out of it can), and a literal string (a value the code wrote, or one Psalm knows is among such values) can't hold anything the client sent. An array holds what its keys and values can: `list<int>` holds no HTML, while the string keys of `array<string, int>` can hold anything. A union holds what any of its types can hold, and `null` holds nothing.
+
+Psalm removes the taints a value can't carry where it is cast, passed to a function, returned, or assigned to a variable or a property, using the type it infers for the value, and where PHP guarantees a type:
+
+- casts: `(int) $_GET['id']` is only left with the taints a number can carry;
+- the native type of a parameter, inside the function;
+- the native return type of a function or method, for what it returns, taint sources included: a method annotated `@psalm-taint-source input` with a `string` return type never returns a NoSQL query.
+
+```php
+<?php
+
+/** @psalm-taint-source input */
+function getParam(string $name): string {
+    return (string) ($_GET[$name] ?? '');
+}
+
+function getId(string $name): int {
+    return (int) getParam($name);
+}
+
+$collection->find(['name' => getParam('name')]); // a string can't inject query operators
+echo '<b>' . getId('id') . '</b>'; // an int can't carry HTML
+
+$direction = getParam('direction');
+if ($direction === 'asc' || $direction === 'desc') {
+    echo $direction; // 'asc'|'desc' is a literal
+}
+```
+
+A function that validates a value against data the code trusts can tell Psalm about it with `@psalm-assert-if-true literal-string`: once validated, the value can't hold anything the client chose.
+
+```php
+<?php
+
+/** @psalm-assert-if-true literal-string $city */
+function isKnownCity(string $city): bool {
+    return in_array($city, getCityKeysFromDatabase(), true);
+}
+
+$city = getParam('city');
+if (isKnownCity($city)) {
+    $organization->city = $city; // stored without any taint
+}
+```
+
+## Conditionally escaping tainted input
+
+A slightly modified version of the previous example is using a condition to determine whether the return value
+is considered secure. Only in case function argument `$escape` is true, the corresponding annotation
+`@psalm-taint-escape` is applied for taint types `html` and `has_quotes`.
+
+```php
+<?php
+/**
+ * @param string $str
+ * @param bool $escape
+ * @psalm-taint-escape ($escape is true ? 'html'|'has_quotes' : null)
+ */
+function processVar(string $str, bool $escape = true) : string {
+    if ($escape) {
+      $str = htmlspecialchars($str, ENT_QUOTES);
+    }
+    return $str;
+}
+
+echo processVar($_GET['text'], false); // detects tainted HTML
+echo processVar($_GET['text'], true); // considered secure
+```
+
+## Output of command-line code
+
+What a script run from the command line prints goes to a terminal or a log, not to an HTML page. `@psalm-cli-only` on
+a function, a method or a class says that it only runs from the command line: what its code (and the closures in it)
+prints with `echo`, `print`, `printf()`, `vprintf()`, `var_dump()`, `debug_zval_dump()`, and `print_r()` and
+`var_export()` not returning it, isn't reported as `TaintedHtml`.
+
+```php
+<?php
+
+/**
+ * @psalm-cli-only
+ */
+final class ImportCommand
+{
+    public function run(): void
+    {
+        $file = (string) ($_SERVER['argv'][1] ?? '');
+        echo 'Importing ' . $file . "\n"; // not reported
+    }
+}
+```
+
+Printing a secret is still reported, and the values stay tainted for every other sink. The annotation only covers the
+code it is on: a method of another class, or a function, called from there is checked as usual, so annotate it too if
+it only runs from the command line.
+
+## Sanitizing HTML user input
+
+Whenever possible, applications should be designed to accept & store user input as discrete text fields, rather than blocks of HTML.  This allows user input to be fully escaped via `htmlspecialchars` or `htmlentities`.  In cases where HTML user input is required (e.g. rich text editors like [TinyMCE](https://www.tiny.cloud/)), a library designed specifically to filter out risky HTML is highly recommended.  For example, [HTML Purifier](http://htmlpurifier.org/docs) could be used as follows:
+
+```php
+<?php
+
+/**
+ * @psalm-taint-escape html
+ * @psalm-taint-escape has_quotes
+ */
+function sanitizeHTML($html){
+    $purifier = new HTMLPurifier();
+    return $purifier->purify($html);
+}
+```
+
+## Specializing taints in functions
+
+For functions, methods and classes you can use the `@psalm-taint-specialize` annotation.
+
+```php
+<?php
+
+function takesInput(string $s) : string {
+    error_log("Got input");
+    return $s;
+}
+
+echo htmlentities(takesInput($_GET["name"]));
+echo takesInput("hello"); // Psalm detects tainted HTML here
+```
+
+Adding a `@psalm-taint-specialize` annotation solves the problem, by telling Psalm that each invocation of the function should be treated separately.
+
+```php
+<?php
+
+/**
+ * @psalm-taint-specialize
+ */
+function takesInput(string $s) : string {
+    error_log("Got input");
+    return $s;
+}
+
+echo htmlentities(takesInput($_GET["name"]));
+echo takesInput("hello"); // No error
+```
+
+A specialized function or method will still track tainted input:
+
+```php
+<?php
+
+/**
+ * @psalm-taint-specialize
+ */
+function takesInput(string $s) : string {
+    return $s;
+}
+
+echo takesInput($_GET["name"]); // Psalm detects tainted input
+echo takesInput("hello"); // No error
+```
+
+Here we’re telling Psalm that a function’s taintedness is wholly dependent on the input to the function.
+
+If you're familiar with [immutability in Psalm](https://psalm.dev/articles/immutability-and-beyond) then this general idea should be familiar, since a pure function is one where the output is wholly dependent on its input. Unsurprisingly, all functions marked `@psalm-pure` _also_ specialize the taintedness of their output based on input:
+
+```php
+<?php
+
+/**
+ * @psalm-pure
+ */
+function takesInput(string $s) : string {
+    return $s;
+}
+
+echo htmlentities(takesInput($_GET["name"]));
+echo takesInput("hello"); // No error
+```
+
+Since each invocation is treated separately, a sink the input reaches through a specialized function – in its body or in a function it calls – is reported for every call that passes tainted input to it:
+
+```php
+<?php
+
+/**
+ * @psalm-taint-specialize
+ */
+function run(string $command) : void {
+    exec($command); // Reported twice: once for each call below
+}
+
+run($_GET["first"]);
+run($_GET["second"]);
+```
+
+Psalm also infers the purity of functions without a purity annotation, so an unannotated function is specialized too when it turns out to be pure, as would be the first `takesInput` above without the `error_log` call. Since a method could be overridden by an impure one, this only applies to methods that cannot be overridden: `private` or `final` methods, and methods of `final` classes.
+
+## Specializing taints in classes
+
+Just as taints can be specialized in function calls, tainted properties can also be specialized to a given class.
+
+```php
+<?php
+
+class User {
+    public string $name;
+
+    public function __construct(string $name) {
+        $this->name = $name;
+    }
+}
+
+/**
+ * @psalm-taint-specialize
+ */
+function echoUserName(User $user) {
+    echo $user->name; // Error, detected tainted input
+}
+
+$user1 = new User("Keith");
+$user2 = new User($_GET["name"]);
+
+echoUserName($user1);
+```
+
+Adding `@psalm-taint-specialize` to the class fixes the issue.
+
+```php
+<?php
+
+/**
+ * @psalm-taint-specialize
+ */
+class User {
+    public string $name;
+
+    public function __construct(string $name) {
+        $this->name = $name;
+    }
+}
+
+/**
+ * @psalm-taint-specialize
+ */
+function echoUserName(User $user) {
+    echo $user->name; // No error
+}
+
+$user1 = new User("Keith");
+$user2 = new User($_GET["name"]);
+
+echoUserName($user1);
+```
+
+Each instance then holds its own taints, which only follow the variables the instance is assigned to. So Psalm makes sure the instance doesn't change once constructed, as the change wouldn't reach the other variables holding the same instance: its properties are readonly, and its methods can't write them. Nor can its methods write other objects, static properties or global variables, from which another instance could read back what this one wrote. To get a changed instance, create a new one, for instance by cloning it:
+
+```php
+<?php
+
+/**
+ * @psalm-taint-specialize
+ */
+class User {
+    public function __construct(public string $name) {}
+
+    public function withName(string $name): static {
+        $new = clone $this;
+        $new->name = $name;
+        return $new;
+    }
+}
+```
+
+The classes that extend a class with `@psalm-taint-specialize` are specialized too, and held to the same rules: Psalm reports an [ImmutableDependency](../running_psalm/issues/ImmutableDependency.md) issue for those that don't have the annotation themselves.
+
+And, because it’s form of purity enforcement, `@psalm-immutable` can also be used:
+
+```php
+<?php
+
+/**
+ * @psalm-immutable
+ */
+class User {
+    public string $name;
+
+    public function __construct(string $name) {
+        $this->name = $name;
+    }
+}
+
+/**
+ * @psalm-taint-specialize
+ */
+function echoUserName(User $user) {
+    echo $user->name; // No error
+}
+
+$user1 = new User("Keith");
+$user2 = new User($_GET["name"]);
+
+echoUserName($user1);
+```
+
+## Suppressing taint issues
+
+A taint issue is reported at the sink, not where the tainted value is passed to it, so a docblock can't suppress it by its own name. `@psalm-suppress TaintedInput` stops tracking taints in the function or statement it annotates, and the `<issueHandlers>` of the config suppress a specific issue:
+
+```php
+<?php
+
+/** @psalm-taint-sink header $value */
+function sendHeader(string $value): void {}
+
+function a(): void {
+    /** @psalm-suppress TaintedHeader */
+    sendHeader($_GET['h']); // TaintedHeader
+}
+
+function b(): void {
+    /** @psalm-suppress TaintedInput */
+    sendHeader($_GET['h']); // suppressed
+}
+```
+
+```xml
+<issueHandlers>
+    <TaintedHeader errorLevel="suppress"/> <!-- suppressed everywhere -->
+</issueHandlers>
+```
+
+## Avoiding files in taint paths
+
+You can also tell Psalm that you’re not interested in any taint paths that flow through certain files or directories by specifying them in your Psalm config:
+
+```xml
+    <taintAnalysis>
+        <ignoreFiles>
+            <directory name="tests"/>
+        </ignoreFiles>
+    </taintAnalysis>
+```

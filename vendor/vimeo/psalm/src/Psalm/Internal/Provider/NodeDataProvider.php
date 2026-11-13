@@ -1,0 +1,219 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Internal\Provider;
+
+use Override;
+use PhpParser\Node;
+use PhpParser\Node\Expr;
+use PhpParser\Node\Expr\FuncCall;
+use PhpParser\Node\Expr\MethodCall;
+use PhpParser\Node\Expr\New_;
+use PhpParser\Node\Expr\StaticCall;
+use PhpParser\Node\Name;
+use PhpParser\Node\Stmt\Return_;
+use PhpParser\NodeAbstract;
+use Psalm\NodeTypeProvider;
+use Psalm\Storage\Assertion;
+use Psalm\Storage\Possibilities;
+use Psalm\Type\Union;
+use SplObjectStorage;
+
+/**
+ * @internal
+ */
+final class NodeDataProvider implements NodeTypeProvider
+{
+    /** @var SplObjectStorage<Node, Union> */
+    private SplObjectStorage $node_types;
+
+    /**
+     * @var SplObjectStorage<Node,list<non-empty-array<string, non-empty-list<non-empty-list<Assertion>>>>|null>
+     */
+    private SplObjectStorage $node_assertions;
+
+    /** @var SplObjectStorage<Node, array<int, Possibilities>> */
+    private SplObjectStorage $node_if_true_assertions;
+
+    /** @var SplObjectStorage<Node, array<int, Possibilities>> */
+    private SplObjectStorage $node_if_false_assertions;
+
+    /** @var SplObjectStorage<Expr, list<string>> */
+    private SplObjectStorage $node_literal_prefixes;
+
+    /**
+     * Expressions analysed already, whose analysis is not repeated (see markEvaluated()), with how many times
+     * they were marked
+     *
+     * @var SplObjectStorage<Expr, positive-int>
+     */
+    private SplObjectStorage $evaluated;
+
+    public bool $cache_assertions = true;
+
+    /**
+     * @psalm-capabilities read-props
+     */
+    public function __construct()
+    {
+        $this->node_types = new SplObjectStorage();
+        $this->node_assertions = new SplObjectStorage();
+        $this->node_if_true_assertions = new SplObjectStorage();
+        $this->node_if_false_assertions = new SplObjectStorage();
+        $this->node_literal_prefixes = new SplObjectStorage();
+        $this->evaluated = new SplObjectStorage();
+    }
+
+    /**
+     * @param Expr|Name|Return_ $node
+     */
+    #[Override]
+    public function setType(NodeAbstract $node, Union $type): void
+    {
+        $this->node_types[$node] = $type;
+    }
+
+    /**
+     * @param Expr|Name|Return_ $node
+     * @psalm-capabilities read-props
+     */
+    #[Override]
+    public function getType(NodeAbstract $node): ?Union
+    {
+        return $this->node_types[$node] ?? null;
+    }
+
+    /**
+     * @param list<non-empty-array<string, non-empty-list<non-empty-list<Assertion>>>>|null $assertions
+     */
+    public function setAssertions(Expr $node, ?array $assertions): void
+    {
+        if (!$this->cache_assertions) {
+            return;
+        }
+
+        $this->node_assertions[$node] = $assertions;
+    }
+
+    /**
+     * @return list<non-empty-array<string, non-empty-list<non-empty-list<Assertion>>>>|null
+     * @psalm-capabilities read-props
+     */
+    public function getAssertions(Expr $node): ?array
+    {
+        if (!$this->cache_assertions) {
+            return null;
+        }
+
+        return $this->node_assertions[$node] ?? null;
+    }
+
+    /**
+     * @param FuncCall|MethodCall|StaticCall|New_ $node
+     * @param array<int, Possibilities>  $assertions
+     */
+    public function setIfTrueAssertions(Expr $node, array $assertions): void
+    {
+        $this->node_if_true_assertions[$node] = $assertions;
+    }
+
+    /**
+     * @param Expr\FuncCall|MethodCall|StaticCall|New_ $node
+     * @return array<int, Possibilities>|null
+     * @psalm-capabilities read-props
+     */
+    public function getIfTrueAssertions(Expr $node): ?array
+    {
+        return $this->node_if_true_assertions[$node] ?? null;
+    }
+
+    /**
+     * @param FuncCall|MethodCall|StaticCall|New_ $node
+     * @param array<int, Possibilities>  $assertions
+     */
+    public function setIfFalseAssertions(Expr $node, array $assertions): void
+    {
+        $this->node_if_false_assertions[$node] = $assertions;
+    }
+
+    /**
+     * @param FuncCall|MethodCall|StaticCall|New_ $node
+     * @return array<int, Possibilities>|null
+     * @psalm-capabilities read-props
+     */
+    public function getIfFalseAssertions(Expr $node): ?array
+    {
+        return $this->node_if_false_assertions[$node] ?? null;
+    }
+
+    /**
+     * The literal strings a string concatenation or interpolation can start with (see
+     * ConcatAnalyzer::getLiteralPrefixes())
+     *
+     * @param list<string> $prefixes
+     */
+    public function setLiteralPrefixes(Expr $node, array $prefixes): void
+    {
+        $this->node_literal_prefixes[$node] = $prefixes;
+    }
+
+    /**
+     * @return list<string>|null
+     * @psalm-capabilities read-props
+     */
+    public function getLiteralPrefixes(Expr $node): ?array
+    {
+        return $this->node_literal_prefixes[$node] ?? null;
+    }
+
+    /**
+     * Until unmarkEvaluated(), ExpressionAnalyzer::analyze() keeps the type of these expressions instead of
+     * analysing them again: their side effects happen once
+     *
+     * @param list<Expr> $nodes
+     */
+    public function markEvaluated(array $nodes): void
+    {
+        foreach ($nodes as $node) {
+            $this->evaluated[$node] = ($this->evaluated[$node] ?? 0) + 1;
+        }
+    }
+
+    /**
+     * @param list<Expr> $nodes
+     */
+    public function unmarkEvaluated(array $nodes): void
+    {
+        foreach ($nodes as $node) {
+            $count = $this->evaluated[$node] ?? 0;
+
+            if ($count > 1) {
+                $this->evaluated[$node] = $count - 1;
+            } else {
+                unset($this->evaluated[$node]);
+            }
+        }
+    }
+
+    /**
+     * @psalm-capabilities read-props
+     */
+    public function isEvaluated(Expr $node): bool
+    {
+        return $this->evaluated->count() !== 0
+            && isset($this->evaluated[$node], $this->node_types[$node]);
+    }
+
+    public function isPureCompatible(Expr $node): bool
+    {
+        $node_type = $this->getType($node);
+
+        return ($node_type && $node_type->reference_free) || $node->getAttribute('pure', false);
+    }
+
+    public function clearNodeOfTypeAndAssertions(Expr $node): void
+    {
+        unset($this->node_types[$node], $this->node_assertions[$node], $this->node_literal_prefixes[$node]);
+    }
+}

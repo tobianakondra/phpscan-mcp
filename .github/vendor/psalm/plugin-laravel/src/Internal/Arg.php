@@ -1,0 +1,111 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\LaravelPlugin\Internal;
+
+use PhpParser\Node\Expr;
+use PhpParser\Node\Identifier;
+use Psalm\StatementsSource;
+use Psalm\Type\Union;
+
+/**
+ * Tiny accessors for `getCallArgs()` lists from {@see \Psalm\Plugin\EventHandler\Event\FunctionReturnTypeProviderEvent}
+ * and {@see \Psalm\Plugin\EventHandler\Event\MethodReturnTypeProviderEvent}.
+ *
+ * Use the helper when a handler reads a single argument node or its inferred
+ * type by index. When a handler passes the whole arg list down to a resolver,
+ * or branches on more than missing-vs-present (e.g. count-aware empty checks
+ * with literal-null handling), inline the access — the helper has no answer
+ * for those shapes and would only obscure the intent.
+ *
+ * The class name shadows {@see \PhpParser\Node\Arg}. When a handler also imports
+ * the PhpParser symbol (e.g. as a parameter type), import this helper aliased
+ * as `ArgUtil` to keep both names usable.
+ *
+ * @internal
+ */
+final class Arg
+{
+    /**
+     * Return the AST expression of the argument at $index, or null if the
+     * index is out of range.
+     *
+     * @param list<\PhpParser\Node\Arg> $args
+     * @psalm-mutation-free
+     */
+    public static function nodeAt(array $args, int $index): ?Expr
+    {
+        return $args[$index]->value ?? null;
+    }
+
+    /**
+     * Resolve one parameter's Arg node whether the call used positional or named arguments.
+     *
+     * PHP requires every positional argument to precede any named one, so a non-named node already
+     * at $index is authoritative; otherwise the parameter can only have been supplied by name, in
+     * whatever order — `Route::view(view: 'welcome', uri: '/x')` must not read '/x' as the view
+     * name just because $paramName's usual slot is 1.
+     *
+     * $paramName is compared lowercased, so callers pass it that way.
+     *
+     * Not annotated mutation-free: `Identifier::toLowerString()` is not, and Psalm 6 rejects the
+     * annotation on any caller of a method that lacks it.
+     *
+     * @param list<\PhpParser\Node\Arg> $args
+     */
+    public static function byNameOrPosition(array $args, int $index, string $paramName): ?\PhpParser\Node\Arg
+    {
+        if (isset($args[$index]) && $args[$index]->name === null) {
+            return $args[$index];
+        }
+
+        foreach ($args as $arg) {
+            if ($arg->name !== null && $arg->name->toLowerString() === $paramName) {
+                return $arg;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * The Arg bound to a parameter: by exact name when named, else by position among the leading positional args.
+     *
+     * Unlike {@see self::byNameOrPosition()} the name is compared as written, not lowercased.
+     *
+     * @param list<\PhpParser\Node\Arg> $args
+     * @psalm-mutation-free
+     */
+    public static function boundTo(array $args, string $name, int $position): ?\PhpParser\Node\Arg
+    {
+        foreach ($args as $offset => $arg) {
+            if ($arg->name instanceof Identifier ? $arg->name->name === $name : $offset === $position) {
+                return $arg;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Return the inferred Psalm type of the argument at $index, or null if
+     * the argument is missing or its type is unknown.
+     *
+     * Both null cases collapse intentionally: callers that need to distinguish
+     * "no arg" from "arg of unknown type" should fetch the node via
+     * {@see self::nodeAt()} and call `getNodeTypeProvider()->getType()` themselves.
+     *
+     * @param list<\PhpParser\Node\Arg> $args
+     */
+    public static function typeAt(array $args, StatementsSource $source, int $index): ?Union
+    {
+        $node = $args[$index]->value ?? null;
+
+        if ($node === null) {
+            return null;
+        }
+
+        return $source->getNodeTypeProvider()->getType($node);
+    }
+}

@@ -1,0 +1,16 @@
+<?php
+
+namespace Illuminate\Database\Eloquent\Relations;
+
+/**
+ * @template TRelatedModel of \Illuminate\Database\Eloquent\Model
+ * Covariant TDeclaringModel — required by #913 (see Relation.phpstub for the rationale).
+ * @template-covariant TDeclaringModel of \Illuminate\Database\Eloquent\Model
+ * @template-extends HasOneOrMany<TRelatedModel, TDeclaringModel, \Illuminate\Database\Eloquent\Collection<int, TRelatedModel>>
+ * @mixin \Illuminate\Database\Eloquent\Builder<TRelatedModel>
+ */
+class HasMany extends HasOneOrMany
+{
+    /** @return \Traversable<int, TRelatedModel> */
+    public function getResults() {}
+}

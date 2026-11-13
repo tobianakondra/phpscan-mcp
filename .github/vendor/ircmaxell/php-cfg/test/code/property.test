@@ -1,0 +1,85 @@
+<?php
+class A {
+    public $prop = 1;
+    private $prop2 = 1+1;
+    private readonly $prop3;
+    private readonly $prop4;
+    private readonly static $prop5;
+    static $prop6;
+    protected $prop7;
+    
+    #[ConstAttr]
+    #[FooAttribute(null)]
+    private string $foo5;
+
+    #[NameOfAttribute]
+    private const FOO = 'foo';
+}
+-----
+Block#1
+    Stmt_Class
+        name: LITERAL('A')
+        stmts: Block#2
+    Terminal_Return
+
+Block#2
+    Stmt_Property
+        flags: public
+        declaredType: mixed
+        name: LITERAL('prop')
+        defaultVar: LITERAL(1)
+        defaultBlock: Block#3
+    Stmt_Property
+        flags: private
+        declaredType: mixed
+        name: LITERAL('prop2')
+        defaultVar: Var#1
+        defaultBlock: Block#4
+    Stmt_Property
+        flags: readonly|private
+        declaredType: mixed
+        name: LITERAL('prop3')
+    Stmt_Property
+        flags: readonly|private
+        declaredType: mixed
+        name: LITERAL('prop4')
+    Stmt_Property
+        flags: readonly|static|private
+        declaredType: mixed
+        name: LITERAL('prop5')
+    Stmt_Property
+        flags: static|public
+        declaredType: mixed
+        name: LITERAL('prop6')
+    Stmt_Property
+        flags: protected
+        declaredType: mixed
+        name: LITERAL('prop7')
+    Expr_ConstFetch
+        name: LITERAL('null')
+        result: Var#2
+    Stmt_Property
+        attrGroup[0]:
+            attr[0]:
+                name: LITERAL('ConstAttr')
+        attrGroup[1]:
+            attr[0]:
+                name: LITERAL('FooAttribute')
+                args[0]: Var#2
+        flags: private
+        declaredType: string
+        name: LITERAL('foo5')
+    Terminal_Const
+        name: LITERAL('FOO')
+        value: LITERAL('foo')
+        valueBlock: Block#5
+
+Block#3
+
+Block#4
+    Expr_BinaryOp_Plus
+        left: LITERAL(1)
+        right: LITERAL(1)
+        result: Var#1
+
+Block#5

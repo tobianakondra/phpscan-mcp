@@ -1,0 +1,151 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Internal\Analyzer\Statements\Expression\BinaryOp;
+
+use PhpParser;
+use Psalm\Context;
+use Psalm\Internal\Analyzer\Statements\Expression\BinaryOpAnalyzer;
+use Psalm\Internal\Analyzer\StatementsAnalyzer;
+use Psalm\Internal\Type\IntMask;
+use Psalm\Type;
+use Psalm\Type\Atomic\TFloat;
+use Psalm\Type\Atomic\TInt;
+use Psalm\Type\Union;
+
+/**
+ * @internal
+ */
+final class NonComparisonOpAnalyzer
+{
+    public static function analyze(
+        StatementsAnalyzer $statements_analyzer,
+        PhpParser\Node\Expr\BinaryOp $stmt,
+        Context $context,
+    ): void {
+        $stmt_left_type = $statements_analyzer->node_data->getType($stmt->left);
+        $stmt_right_type = $statements_analyzer->node_data->getType($stmt->right);
+
+        if (!$stmt_left_type || !$stmt_right_type) {
+            return;
+        }
+
+        if (($stmt instanceof PhpParser\Node\Expr\BinaryOp\BitwiseOr
+                || $stmt instanceof PhpParser\Node\Expr\BinaryOp\BitwiseXor
+                || $stmt instanceof PhpParser\Node\Expr\BinaryOp\BitwiseAnd
+            )
+            && $stmt_left_type->hasString()
+            && $stmt_right_type->hasString()
+        ) {
+            $stmt_type = Type::getString();
+
+            $statements_analyzer->node_data->setType($stmt, $stmt_type);
+            BinaryOpAnalyzer::addDataFlow(
+                $statements_analyzer,
+                $stmt,
+                $stmt->left,
+                $stmt->right,
+                'nondivop',
+            );
+
+            return;
+        }
+
+        if ($stmt instanceof PhpParser\Node\Expr\BinaryOp\Plus
+            || $stmt instanceof PhpParser\Node\Expr\BinaryOp\Minus
+            || $stmt instanceof PhpParser\Node\Expr\BinaryOp\Mod
+            || $stmt instanceof PhpParser\Node\Expr\BinaryOp\Mul
+            || $stmt instanceof PhpParser\Node\Expr\BinaryOp\Pow
+            || $stmt instanceof PhpParser\Node\Expr\BinaryOp\BitwiseOr
+            || $stmt instanceof PhpParser\Node\Expr\BinaryOp\BitwiseXor
+            || $stmt instanceof PhpParser\Node\Expr\BinaryOp\BitwiseAnd
+            || $stmt instanceof PhpParser\Node\Expr\BinaryOp\ShiftLeft
+            || $stmt instanceof PhpParser\Node\Expr\BinaryOp\ShiftRight
+        ) {
+            $int_mask_bits = IntMask::getBitwiseOpBits($stmt, $stmt_left_type, $stmt_right_type);
+
+            $result_type = null;
+
+            if ($int_mask_bits === null || !IntMask::isTooCostlyPairwise($stmt_left_type, $stmt_right_type)) {
+                ArithmeticOpAnalyzer::analyze(
+                    $statements_analyzer,
+                    $statements_analyzer->node_data,
+                    $stmt->left,
+                    $stmt->right,
+                    $stmt,
+                    $result_type,
+                    $context,
+                );
+            }
+
+            if ($int_mask_bits !== null) {
+                // also when the literals are not combined pair by pair, e.g. in loops
+                $result_type = ($result_type && $result_type->allIntLiterals()
+                    ? $result_type
+                    : IntMask::getType($int_mask_bits)
+                )->setProperties(['int_mask_bits' => $int_mask_bits]);
+            }
+
+            if (!$result_type) {
+                $result_type = new Union([new TInt(), new TFloat()]);
+            }
+
+            $statements_analyzer->node_data->setType($stmt, $result_type);
+
+            BinaryOpAnalyzer::addDataFlow(
+                $statements_analyzer,
+                $stmt,
+                $stmt->left,
+                $stmt->right,
+                'nondivop',
+            );
+
+            return;
+        }
+
+        if ($stmt instanceof PhpParser\Node\Expr\BinaryOp\LogicalXor) {
+            if ($stmt_left_type->hasBool() || $stmt_right_type->hasBool()) {
+                $statements_analyzer->node_data->setType($stmt, Type::getBool());
+            }
+
+            BinaryOpAnalyzer::addDataFlow(
+                $statements_analyzer,
+                $stmt,
+                $stmt->left,
+                $stmt->right,
+                'xor',
+            );
+
+            return;
+        }
+
+        if ($stmt instanceof PhpParser\Node\Expr\BinaryOp\Div) {
+            ArithmeticOpAnalyzer::analyze(
+                $statements_analyzer,
+                $statements_analyzer->node_data,
+                $stmt->left,
+                $stmt->right,
+                $stmt,
+                $result_type,
+                $context,
+            );
+
+            if (!$result_type) {
+                $result_type = new Union([new TInt(), new TFloat()]);
+            }
+
+            $statements_analyzer->node_data->setType($stmt, $result_type);
+
+            BinaryOpAnalyzer::addDataFlow(
+                $statements_analyzer,
+                $stmt,
+                $stmt->left,
+                $stmt->right,
+                'div',
+            );
+
+            return;
+        }
+    }
+}

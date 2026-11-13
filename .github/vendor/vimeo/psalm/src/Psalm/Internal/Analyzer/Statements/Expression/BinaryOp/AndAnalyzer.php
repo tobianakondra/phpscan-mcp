@@ -1,0 +1,290 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Internal\Analyzer\Statements\Expression\BinaryOp;
+
+use PhpParser;
+use Psalm\CodeLocation;
+use Psalm\Context;
+use Psalm\Internal\Algebra;
+use Psalm\Internal\Algebra\FormulaGenerator;
+use Psalm\Internal\Analyzer\Statements\Block\IfConditionalAnalyzer;
+use Psalm\Internal\Analyzer\Statements\Block\IfElseAnalyzer;
+use Psalm\Internal\Analyzer\Statements\ExpressionAnalyzer;
+use Psalm\Internal\Analyzer\StatementsAnalyzer;
+use Psalm\Internal\Clause;
+use Psalm\Node\Stmt\VirtualExpression;
+use Psalm\Node\Stmt\VirtualIf;
+use Psalm\Type;
+use Psalm\Type\Reconciler;
+
+use function array_diff_key;
+use function array_filter;
+use function array_map;
+use function array_merge;
+use function array_values;
+use function count;
+use function in_array;
+use function spl_object_id;
+use function str_starts_with;
+
+/**
+ * @internal
+ */
+final class AndAnalyzer
+{
+    public static function analyze(
+        StatementsAnalyzer $statements_analyzer,
+        PhpParser\Node\Expr\BinaryOp $stmt,
+        Context $context,
+        bool $from_stmt = false,
+    ): bool {
+        if ($from_stmt) {
+            $fake_if_stmt = new VirtualIf(
+                $stmt->left,
+                [
+                    'stmts' => [
+                        new VirtualExpression(
+                            $stmt->right,
+                        ),
+                    ],
+                ],
+                $stmt->getAttributes(),
+            );
+
+            return IfElseAnalyzer::analyze($statements_analyzer, $fake_if_stmt, $context) !== false;
+        }
+
+        $pre_referenced_var_ids = $context->cond_referenced_var_ids;
+
+        $pre_assigned_var_ids = $context->assigned_var_ids;
+
+        $left_context = clone $context;
+
+        $left_context->cond_referenced_var_ids = [];
+        $left_context->assigned_var_ids = [];
+
+        /** @var list<string> $left_context->reconciled_expression_clauses */
+        $left_context->reconciled_expression_clauses = [];
+
+        if (ExpressionAnalyzer::analyze($statements_analyzer, $stmt->left, $left_context) === false) {
+            return false;
+        }
+
+        IfConditionalAnalyzer::handleParadoxicalCondition($statements_analyzer, $stmt->left);
+
+        $codebase = $statements_analyzer->getCodebase();
+
+        $left_cond_id = spl_object_id($stmt->left);
+
+        $left_clauses = FormulaGenerator::getFormula(
+            $left_cond_id,
+            $left_cond_id,
+            $stmt->left,
+            $context->self,
+            $statements_analyzer,
+            $codebase,
+        );
+
+        foreach ($left_context->vars_in_scope as $var_id => $type) {
+            if (isset($left_context->assigned_var_ids[$var_id])) {
+                $context->vars_in_scope[$var_id] = $type;
+            }
+        }
+
+        /** @var array<string, bool> */
+        $left_referenced_var_ids = $left_context->cond_referenced_var_ids;
+        $context->cond_referenced_var_ids = array_merge($pre_referenced_var_ids, $left_referenced_var_ids);
+
+        $left_assigned_var_ids = array_diff_key($left_context->assigned_var_ids, $pre_assigned_var_ids);
+
+        $left_referenced_var_ids = self::removeAssignedVarIds($left_referenced_var_ids, $left_assigned_var_ids);
+
+        $context_clauses = array_merge($left_context->clauses, $left_clauses);
+
+        if ($left_context->reconciled_expression_clauses) {
+            $reconciled_expression_clauses = $left_context->reconciled_expression_clauses;
+
+            $context_clauses = array_values(
+                array_filter(
+                    $context_clauses,
+                    static fn(Clause $c): bool => !in_array($c->hash, $reconciled_expression_clauses, true),
+                ),
+            );
+
+            if (count($context_clauses) === 1
+                && $context_clauses[0]->wedge
+                && !$context_clauses[0]->possibilities
+            ) {
+                $context_clauses = [];
+            }
+        }
+
+        $simplified_clauses = Algebra::simplifyCNF($context_clauses);
+
+        $active_left_assertions = [];
+
+        $left_type_assertions = Algebra::getTruthsFromFormula(
+            $simplified_clauses,
+            $left_cond_id,
+            $left_referenced_var_ids,
+            $active_left_assertions,
+        );
+
+        $changed_var_ids = [];
+
+        if ($left_type_assertions) {
+            $right_context = clone $context;
+            // what the left side guards (function_exists(), class_exists(), defined()...) holds for the right one
+            $right_context->updateChecks($left_context);
+            $right_context->phantom_classes += $left_context->phantom_classes;
+            $right_context->phantom_functions += $left_context->phantom_functions;
+            // while in an and, we allow scope to boil over to support
+            // statements of the form if ($x && $x->foo())
+            [$right_context->vars_in_scope, $right_context->references_in_scope] = Reconciler::reconcileKeyedTypes(
+                $left_type_assertions,
+                $active_left_assertions,
+                $right_context->vars_in_scope,
+                $context->references_in_scope,
+                $changed_var_ids,
+                $left_referenced_var_ids,
+                $statements_analyzer,
+                $statements_analyzer->getTemplateTypeMap() ?: [],
+                $context->inside_loop,
+                new CodeLocation($statements_analyzer->getSource(), $stmt->left),
+                $context->inside_negation,
+            );
+        } else {
+            $right_context = clone $left_context;
+        }
+
+        $partitioned_clauses = Context::removeReconciledClauses(
+            [...$left_context->clauses, ...$left_clauses],
+            $changed_var_ids,
+        );
+
+        $right_context->clauses = $partitioned_clauses[0];
+
+        if (ExpressionAnalyzer::analyze($statements_analyzer, $stmt->right, $right_context) === false) {
+            return false;
+        }
+
+        IfConditionalAnalyzer::handleParadoxicalCondition($statements_analyzer, $stmt->right);
+
+        $context->cond_referenced_var_ids = array_merge(
+            $right_context->cond_referenced_var_ids,
+            $left_context->cond_referenced_var_ids,
+        );
+
+        if ($context->inside_conditional) {
+            $context->updateChecks($right_context);
+            $context->phantom_classes += $right_context->phantom_classes;
+            $context->phantom_functions += $right_context->phantom_functions;
+
+            // where both sides hold, so does a file_exists() check of either, unless it was negated
+            $context->phantom_files = [
+                ...$context->phantom_files,
+                ...array_diff_key($left_context->phantom_files, $left_context->negated_phantom_files),
+                ...array_diff_key($right_context->phantom_files, $right_context->negated_phantom_files),
+            ];
+
+            $context->vars_possibly_in_scope = array_merge(
+                $right_context->vars_possibly_in_scope,
+                $left_context->vars_possibly_in_scope,
+            );
+
+            $context->assigned_var_ids = array_merge(
+                $left_context->assigned_var_ids,
+                $right_context->assigned_var_ids,
+            );
+        }
+
+        if ($context->if_body_context && !$context->inside_negation) {
+            $if_body_context = $context->if_body_context;
+            $context->vars_in_scope = $right_context->vars_in_scope;
+            $if_body_context->vars_in_scope = [
+                ...$if_body_context->vars_in_scope,
+                ...$context->vars_in_scope,
+            ];
+
+            $if_body_context->cond_referenced_var_ids = [
+                ...$if_body_context->cond_referenced_var_ids,
+                ...$context->cond_referenced_var_ids,
+            ];
+
+            $if_body_context->assigned_var_ids = [
+                ...$if_body_context->assigned_var_ids,
+                ...$context->assigned_var_ids,
+            ];
+
+            // clauses simplification derived from the reconciled ones (a nullsafe call's receiver) are applied too
+            $if_body_context->reconciled_expression_clauses = [
+                ...$if_body_context->reconciled_expression_clauses,
+                ...array_map(
+                    /** @return string|int */
+                    static fn(Clause $c) => $c->hash,
+                    [
+                        ...$partitioned_clauses[1],
+                        ...Context::removeReconciledClauses($simplified_clauses, $changed_var_ids)[1],
+                    ],
+                ),
+            ];
+
+            $if_body_context->vars_possibly_in_scope = [
+                ...$if_body_context->vars_possibly_in_scope,
+                ...$context->vars_possibly_in_scope,
+            ];
+
+            $if_body_context->updateChecks($context);
+            $if_body_context->phantom_classes += $context->phantom_classes;
+            $if_body_context->phantom_functions += $context->phantom_functions;
+            $if_body_context->phantom_files = [
+                ...$if_body_context->phantom_files,
+                ...array_diff_key($context->phantom_files, $context->negated_phantom_files),
+            ];
+        } else {
+            $context->vars_in_scope = $left_context->vars_in_scope;
+
+            // the right operand is skipped when the left one is false
+            foreach ($right_context->assigned_var_ids as $var_id => $assigned_offset) {
+                if ((!isset($left_context->assigned_var_ids[$var_id])
+                        || $left_context->assigned_var_ids[$var_id] !== $assigned_offset)
+                    && isset($context->vars_in_scope[$var_id], $right_context->vars_in_scope[$var_id])
+                ) {
+                    $context->vars_in_scope[$var_id] = Type::combineUnionTypes(
+                        $context->vars_in_scope[$var_id],
+                        $right_context->vars_in_scope[$var_id],
+                    );
+                }
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Drops the assigned variables and the keys nested in them, which the left side already narrowed.
+     *
+     * @param array<string, bool> $referenced_var_ids
+     * @param array<string, int> $assigned_var_ids
+     * @return array<string, bool>
+     * @psalm-pure
+     */
+    private static function removeAssignedVarIds(array $referenced_var_ids, array $assigned_var_ids): array
+    {
+        foreach ($referenced_var_ids as $referenced_var_id => $_) {
+            foreach ($assigned_var_ids as $assigned_var_id => $__) {
+                if ($referenced_var_id === $assigned_var_id
+                    || str_starts_with($referenced_var_id, $assigned_var_id . '[')
+                    || str_starts_with($referenced_var_id, $assigned_var_id . '->')
+                ) {
+                    unset($referenced_var_ids[$referenced_var_id]);
+                    break;
+                }
+            }
+        }
+
+        return $referenced_var_ids;
+    }
+}

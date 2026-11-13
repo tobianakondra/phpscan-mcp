@@ -1,0 +1,89 @@
+<?php
+
+namespace Illuminate\Mail;
+
+use Illuminate\Contracts\Mail\Mailable as MailableContract;
+use Illuminate\Contracts\Support\Renderable;
+
+class Mailable implements MailableContract, Renderable
+{
+    /*
+     * Only the address is a header sink. Display names are CR/LF-stripped by Symfony's Address, and the
+     * subject is RFC 2047-encoded by UnstructuredHeader when Symfony serializes the message, so neither can inject a header (#1958).
+     * An address can: a quoted local part or domain literal carrying CRLF reaches the header verbatim
+     * unless Laravel's Message::ensureAddressIsSafe() (12.60+/13.10+) or symfony/mime 7.4.12/8.0.12+
+     * (CVE-2026-45067) rejects it; supported 12.x releases below 12.60 have neither guard.
+     */
+    /**
+     * Set the sender of the message.
+     *
+     * @param  object|array|string  $address
+     * @param  string|null  $name
+     * @return $this
+     *
+     * @psalm-taint-sink header $address
+     */
+    public function from($address, $name = null) {}
+
+    /**
+     * Set the recipients of the message.
+     *
+     * @param  object|array|string  $address
+     * @param  string|null  $name
+     * @return $this
+     *
+     * @psalm-taint-sink header $address
+     */
+    public function to($address, $name = null) {}
+
+    /**
+     * Set the cc recipients of the message.
+     *
+     * @param  object|array|string  $address
+     * @param  string|null  $name
+     * @return $this
+     *
+     * @psalm-taint-sink header $address
+     */
+    public function cc($address, $name = null) {}
+
+    /**
+     * Set the bcc recipients of the message.
+     *
+     * @param  object|array|string  $address
+     * @param  string|null  $name
+     * @return $this
+     *
+     * @psalm-taint-sink header $address
+     */
+    public function bcc($address, $name = null) {}
+
+    /**
+     * Set the "reply to" address of the message.
+     *
+     * @param  object|array|string  $address
+     * @param  string|null  $name
+     * @return $this
+     *
+     * @psalm-taint-sink header $address
+     */
+    public function replyTo($address, $name = null) {}
+
+    /**
+     * Set the subject of the message.
+     *
+     * @param  string  $subject
+     * @return $this
+     */
+    public function subject($subject) {}
+
+    /**
+     * Set the rendered HTML content for the message.
+     *
+     * @param  string  $html
+     * @return $this
+     *
+     * @psalm-taint-sink html $html
+     */
+    public function html($html) {}
+}

@@ -1,0 +1,52 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Storage\Assertion;
+
+use Override;
+use Psalm\Storage\Assertion;
+use Psalm\Storage\UnserializeMemoryUsageSuppressionTrait;
+
+/**
+ * @psalm-immutable
+ * @api
+ */
+final class IsNotIsset extends Assertion
+{
+    use UnserializeMemoryUsageSuppressionTrait;
+    /**
+     * @psalm-pure
+     */
+    #[Override]
+    public function getNegation(): Assertion
+    {
+        return new IsIsset();
+    }
+
+    /**
+     * @psalm-pure
+     */
+    #[Override]
+    public function isNegation(): bool
+    {
+        return true;
+    }
+
+    /**
+     * @psalm-pure
+     */
+    public function __toString(): string
+    {
+        return '!isset';
+    }
+
+    /**
+     * @psalm-pure
+     */
+    #[Override]
+    public function isNegationOf(Assertion $assertion): bool
+    {
+        return $assertion instanceof IsNotIsset;
+    }
+}

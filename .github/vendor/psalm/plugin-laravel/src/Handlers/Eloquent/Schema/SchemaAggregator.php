@@ -1,0 +1,1127 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\LaravelPlugin\Handlers\Eloquent\Schema;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+use PhpParser;
+use PhpParser\NodeFinder;
+
+final class SchemaAggregator
+{
+    /**
+     * @psalm-var list<lowercase-string>
+     * @see \Illuminate\Database\Schema\Blueprint
+     */
+    private const METHODS_USE_HARDCODED_COLUMN_NAME = [
+        'datetimes',
+        'timestamps',
+        'timestampstz',
+        'nullabletimestamps',
+        'nullabletimestampstz',
+        'droptimestamps',
+        'droptimestampstz',
+        'dropremembertoken',
+        'remembertoken',
+    ];
+
+    /**
+     * @psalm-var array<lowercase-string, non-empty-string>
+     * @see \Illuminate\Database\Schema\Blueprint
+     */
+    private const METHODS_HAVE_DEFAULT_COLUMN_NAME = [
+        'id' => 'id',
+        'dropsoftdeletes' => 'deleted_at',
+        'dropsoftdeletesdatetime' => 'deleted_at',
+        'dropsoftdeletestz' => 'deleted_at',
+        'softdeletes' => 'deleted_at',
+        'softdeletesdatetime' => 'deleted_at',
+        'softdeletestz' => 'deleted_at',
+        'uuid' => 'uuid',
+        'ulid' => 'ulid',
+        'ipaddress' => 'ip_address',
+        'macaddress' => 'mac_address',
+    ];
+
+    /**
+     * Blueprint methods that produce unsigned integers (non-negative-int).
+     *
+     * @psalm-var list<lowercase-string>
+     */
+    private const UNSIGNED_INT_METHODS = [
+        'bigincrements',
+        'foreignid',
+        'id',
+        'increments',
+        'integerincrements',
+        'mediumincrements',
+        'smallincrements',
+        'tinyincrements',
+        'unsignedbiginteger',
+        'unsignedinteger',
+        'unsignedmediuminteger',
+        'unsignedsmallinteger',
+        'unsignedtinyinteger',
+    ];
+
+    /** @var array<string, SchemaTable> */
+    public array $tables = [];
+
+    /** @psalm-external-mutation-free */
+    public function setTable(string $name, SchemaTable $table): void
+    {
+        $this->tables[$name] = $table;
+    }
+
+    /**
+     * @param array<int, PhpParser\Node\Stmt> $stmts
+     */
+    public function addStatements(array $stmts): void
+    {
+        $nodeFinder = new NodeFinder();
+
+        $classes = $nodeFinder->findInstanceOf($stmts, PhpParser\Node\Stmt\Class_::class);
+
+        foreach ($classes as $stmt) {
+            $this->addClassStatements($stmt->stmts);
+        }
+    }
+
+    /**
+     * Process all class methods except down() to catch Schema calls in helper methods.
+     *
+     * Migrations often delegate Schema calls to private helper methods called from up().
+     * By processing all methods except down(), we capture these delegated calls.
+     * This matches Larastan's behavior. See https://github.com/psalm/psalm-plugin-laravel/issues/507
+     *
+     * @param array<int, PhpParser\Node\Stmt> $stmts
+     */
+    private function addClassStatements(array $stmts): void
+    {
+        foreach ($stmts as $stmt) {
+            if (
+                $stmt instanceof PhpParser\Node\Stmt\ClassMethod
+                && $stmt->name->toLowerString() !== 'down'
+                && \is_array($stmt->stmts)
+            ) {
+                $this->addMethodStatements($stmt->stmts);
+            }
+        }
+    }
+
+    /**
+     * @param array<array-key, \PhpParser\Node\Stmt> $stmts
+     */
+    private function addMethodStatements(array $stmts): void
+    {
+        // Names of local variables currently holding a Schema builder instance
+        // (e.g. `$schema = Schema::connection(...)`), scoped to this method only.
+        /** @var array<string, true> $schema_vars */
+        $schema_vars = [];
+
+        // Flatten nested block structures (if/else, try/catch, foreach, etc.)
+        // so Schema calls inside conditionals are not missed.
+        foreach (self::flattenStatements($stmts) as $stmt) {
+            // A foreach loop variable rebinds the name each iteration
+            // (e.g. `foreach ($tables as $schema)`), so any tracked builder
+            // under that name no longer holds a schema builder afterward.
+            if ($stmt instanceof PhpParser\Node\Stmt\Foreach_) {
+                if ($stmt->valueVar instanceof PhpParser\Node\Expr\Variable && \is_string($stmt->valueVar->name)) {
+                    unset($schema_vars[$stmt->valueVar->name]);
+                }
+
+                continue;
+            }
+
+            if (!$stmt instanceof PhpParser\Node\Stmt\Expression) {
+                continue;
+            }
+
+            $this->trackSchemaVariable($stmt->expr, $schema_vars);
+
+            $schema_call = $this->extractSchemaCall($stmt->expr, $schema_vars);
+            if ($schema_call === null || !$schema_call->name instanceof PhpParser\Node\Identifier) {
+                continue;
+            }
+
+            switch ($schema_call->name->name) {
+                case 'create':
+                    $this->alterTable($schema_call, creating: true);
+                    break;
+
+                case 'table':
+                    $this->alterTable($schema_call, creating: false);
+                    break;
+
+                case 'drop':
+                case 'dropIfExists':
+                    $this->dropTable($schema_call);
+                    break;
+
+                case 'dropColumns':
+                    $this->dropColumnsFromTable($schema_call);
+                    break;
+
+                case 'rename':
+                    $this->renameTable($schema_call);
+            }
+        }
+    }
+
+    /**
+     * Track (or untrack) a local variable holding a Schema builder instance.
+     *
+     * Only `$var = <SchemaClass>::connection(...)` marks a variable as tracked — this
+     * mirrors the connection-chained form already handled by extractSchemaCall() and
+     * keeps the false-positive surface small (e.g. `$schema = Schema::make(...)` in
+     * Filament's unrelated `Filament\Schemas\Schema` is never tracked).
+     *
+     * Any other assignment to a previously-tracked name (a new value, a reference
+     * bind, or a compound assignment) untracks it: the variable no longer reliably
+     * holds a schema builder.
+     *
+     * @param array<string, true> $schema_vars
+     */
+    private function trackSchemaVariable(PhpParser\Node\Expr $expr, array &$schema_vars): void
+    {
+        if (
+            ($expr instanceof PhpParser\Node\Expr\AssignRef || $expr instanceof PhpParser\Node\Expr\AssignOp)
+            && $expr->var instanceof PhpParser\Node\Expr\Variable
+            && \is_string($expr->var->name)
+        ) {
+            unset($schema_vars[$expr->var->name]);
+
+            return;
+        }
+
+        if (
+            !$expr instanceof PhpParser\Node\Expr\Assign
+            || !$expr->var instanceof PhpParser\Node\Expr\Variable
+            || !\is_string($expr->var->name)
+        ) {
+            return;
+        }
+
+        $var_name = $expr->var->name;
+
+        if ($this->isSchemaConnectionCall($expr->expr)) {
+            $schema_vars[$var_name] = true;
+        } else {
+            unset($schema_vars[$var_name]);
+        }
+    }
+
+    /**
+     * Whether an expression is `<SchemaClass>::connection(...)`.
+     */
+    private function isSchemaConnectionCall(PhpParser\Node\Expr $expr): bool
+    {
+        return $expr instanceof PhpParser\Node\Expr\StaticCall
+            && $expr->class instanceof PhpParser\Node\Name
+            && $expr->name instanceof PhpParser\Node\Identifier
+            && $expr->name->name === 'connection'
+            && $this->isSchemaClass($expr->class->getAttribute('resolvedName'));
+    }
+
+    /**
+     * Extract a Schema facade call from an expression, if present.
+     *
+     * Handles three forms:
+     * - Direct:   Schema::create('users', ...)
+     * - Chained:  Schema::connection('mysql')->create('users', ...)
+     * - Variable: $schema = Schema::connection('mysql'); $schema->create('users', ...)
+     *
+     * Only single-level chaining via connection() is detected.
+     * Deeper chains like Schema::connection()->connection()->create() are not supported
+     * because they are invalid at runtime.
+     *
+     * @param array<string, true> $schema_vars variables tracked as holding a schema builder
+     */
+    private function extractSchemaCall(PhpParser\Node\Expr $expr, array $schema_vars): PhpParser\Node\Expr\StaticCall|PhpParser\Node\Expr\MethodCall|null
+    {
+        // Direct Schema facade call: Schema::create(...), Schema::table(...), etc.
+        if (
+            $expr instanceof PhpParser\Node\Expr\StaticCall
+            && $expr->class instanceof PhpParser\Node\Name
+            && $expr->name instanceof PhpParser\Node\Identifier
+            && $this->isSchemaClass($expr->class->getAttribute('resolvedName'))
+        ) {
+            return $expr;
+        }
+
+        // Connection-chained call: Schema::connection('mysql')->create(...), etc.
+        // The outer expression is a MethodCall whose var is a StaticCall on Schema.
+        if (
+            $expr instanceof PhpParser\Node\Expr\MethodCall
+            && $expr->name instanceof PhpParser\Node\Identifier
+            && $expr->var instanceof PhpParser\Node\Expr\StaticCall
+            && $expr->var->class instanceof PhpParser\Node\Name
+            && $expr->var->name instanceof PhpParser\Node\Identifier
+            && $expr->var->name->name === 'connection'
+            && $this->isSchemaClass($expr->var->class->getAttribute('resolvedName'))
+        ) {
+            return $expr;
+        }
+
+        // Variable-held call: $schema->create(...), where $schema was tracked
+        // by trackSchemaVariable() as `$schema = <SchemaClass>::connection(...)`.
+        if (
+            $expr instanceof PhpParser\Node\Expr\MethodCall
+            && $expr->name instanceof PhpParser\Node\Identifier
+            && $expr->var instanceof PhpParser\Node\Expr\Variable
+            && \is_string($expr->var->name)
+            && isset($schema_vars[$expr->var->name])
+        ) {
+            return $expr;
+        }
+
+        return null;
+    }
+
+    private function alterTable(
+        PhpParser\Node\Expr\StaticCall|PhpParser\Node\Expr\MethodCall $call,
+        bool $creating,
+    ): void {
+        if (!isset($call->args[0]) || !$call->args[0] instanceof PhpParser\Node\Arg) {
+            return;
+        }
+
+        $table_name = $this->resolveStringArgument($call->args[0]->value);
+        if ($table_name === null) {
+            return;
+        }
+
+        if (
+            !isset($call->args[1])
+            || !$call->args[1] instanceof PhpParser\Node\Arg
+            || !$call->args[1]->value instanceof PhpParser\Node\Expr\Closure
+            || \count($call->args[1]->value->params) < 1
+            || ($call->args[1]->value->params[0]->type instanceof PhpParser\Node\Name
+                && $call->args[1]->value->params[0]->type->getAttribute('resolvedName') !== Blueprint::class)
+        ) {
+            return;
+        }
+
+        // Schema::create() always starts fresh — a second create replaces the table.
+        // Schema::table() may reference a table created in a migration not seen by
+        // the aggregator (e.g., squashed into an SQL dump or published from a package),
+        // so auto-create if missing. Only done after validating the closure argument
+        // to avoid registering empty tables from unparsable calls.
+        if ($creating || !isset($this->tables[$table_name])) {
+            $this->tables[$table_name] = new SchemaTable();
+        }
+
+        $update_closure = $call->args[1]->value;
+
+        if (
+            $call->args[1]->value->params[0]->var instanceof PhpParser\Node\Expr\Variable
+            && \is_string($call->args[1]->value->params[0]->var->name)
+        ) {
+            $call_arg_name = $call->args[1]->value->params[0]->var->name;
+
+            $this->processColumnUpdates($table_name, $call_arg_name, $update_closure->stmts);
+        }
+    }
+
+    private function dropTable(PhpParser\Node\Expr\StaticCall|PhpParser\Node\Expr\MethodCall $call): void
+    {
+        if (!isset($call->args[0]) || !$call->args[0] instanceof PhpParser\Node\Arg) {
+            return;
+        }
+
+        $table_name = $this->resolveStringArgument($call->args[0]->value);
+        if ($table_name === null) {
+            return;
+        }
+
+        unset($this->tables[$table_name]);
+    }
+
+    /**
+     * Handle Schema::dropColumns($table, $columns) — drops columns without a closure.
+     */
+    private function dropColumnsFromTable(PhpParser\Node\Expr\StaticCall|PhpParser\Node\Expr\MethodCall $call): void
+    {
+        if (
+            !isset($call->args[0], $call->args[1])
+            || !$call->args[0] instanceof PhpParser\Node\Arg
+            || !$call->args[1] instanceof PhpParser\Node\Arg
+        ) {
+            return;
+        }
+
+        $table_name = $this->resolveStringArgument($call->args[0]->value);
+        if ($table_name === null) {
+            return;
+        }
+
+        if (!isset($this->tables[$table_name])) {
+            return;
+        }
+
+        $table = $this->tables[$table_name];
+        $columns_arg = $call->args[1]->value;
+
+        if ($columns_arg instanceof PhpParser\Node\Expr\Array_) {
+            foreach ($columns_arg->items as $item) {
+                $item_name = $this->resolveStringArgument($item->value);
+                if ($item_name !== null) {
+                    $table->dropColumn($item_name);
+                }
+            }
+        } else {
+            $column_name = $this->resolveStringArgument($columns_arg);
+            if ($column_name !== null) {
+                $table->dropColumn($column_name);
+            }
+        }
+    }
+
+    private function renameTable(PhpParser\Node\Expr\StaticCall|PhpParser\Node\Expr\MethodCall $call): void
+    {
+        if (
+            !isset($call->args[0], $call->args[1])
+            || !$call->args[0] instanceof PhpParser\Node\Arg
+            || !$call->args[1] instanceof PhpParser\Node\Arg
+        ) {
+            return;
+        }
+
+        $old_table_name = $this->resolveStringArgument($call->args[0]->value);
+        $new_table_name = $this->resolveStringArgument($call->args[1]->value);
+        if ($old_table_name === null || $new_table_name === null) {
+            return;
+        }
+
+        if (!isset($this->tables[$old_table_name])) {
+            return;
+        }
+
+        $table = $this->tables[$old_table_name];
+
+        unset($this->tables[$old_table_name]);
+
+        // Skip if the target already exists — the rename is inside a conditional
+        // (e.g., `if (Schema::hasTable('old'))`) that wouldn't have executed when
+        // the table was already created under the new name.
+        if (!isset($this->tables[$new_table_name])) {
+            $this->tables[$new_table_name] = $table;
+        }
+    }
+
+    /**
+     * @param array<array-key, PhpParser\Node\Stmt> $stmts
+     */
+    private function processColumnUpdates(string $table_name, string $call_arg_name, array $stmts): void
+    {
+        if (!isset($this->tables[$table_name])) {
+            return;
+        }
+
+        $table = $this->tables[$table_name];
+
+        // Flatten nested block structures so Blueprint calls inside
+        // conditionals (e.g., if (!Schema::hasColumn(...))) are discovered.
+        foreach (self::flattenStatements($stmts) as $stmt) {
+            $is_named_method_call = $stmt instanceof PhpParser\Node\Stmt\Expression
+                && $stmt->expr instanceof PhpParser\Node\Expr\MethodCall
+                && $stmt->expr->name instanceof PhpParser\Node\Identifier;
+
+            if (!$is_named_method_call) {
+                continue;
+            }
+
+            $root_var = $stmt->expr;
+
+            $first_method_call = $root_var;
+
+            $nullable = false;
+            /** @var SchemaColumnDefault|null $default */
+            $default = null;
+            $unsigned = false;
+
+            while ($root_var instanceof PhpParser\Node\Expr\MethodCall) {
+                if ($root_var->name instanceof PhpParser\Node\Identifier) {
+                    if ($root_var->name->name === 'nullable') {
+                        $nullable = true;
+
+                        /**
+                         * Possible cases:
+                         * ->nullable()
+                         * ->nullable(false)
+                         * ->nullable(true)
+                         *
+                         * Process this ->nullable(false)
+                         */
+                        if ($root_var->args !== []) {
+                            $first_argument_of_nullable = $root_var->args[0];
+                            if (
+                                $first_argument_of_nullable instanceof PhpParser\Node\Arg
+                                && $first_argument_of_nullable->value instanceof PhpParser\Node\Expr\ConstFetch
+                                && $first_argument_of_nullable->value->name->getParts() === ['false']
+                            ) {
+                                $nullable = false;
+                            }
+                        }
+                    }
+
+                    if (
+                        $root_var->name->name === 'default'
+                        && isset($root_var->args[0])
+                        && $root_var->args[0] instanceof PhpParser\Node\Arg
+                    ) {
+                        $default = $this->resolveDefaultValue($root_var->args[0]->value);
+                    }
+
+                    if ($root_var->name->name === 'unsigned') {
+                        $unsigned = true;
+                    }
+                }
+
+                $first_method_call = $root_var;
+                $root_var = $root_var->var;
+            } // while
+
+            $is_first_method_named_method = $root_var instanceof PhpParser\Node\Expr\Variable
+                && $root_var->name === $call_arg_name
+                && $first_method_call->name instanceof PhpParser\Node\Identifier;
+
+            if (!$is_first_method_named_method) {
+                continue;
+            }
+
+            $first_arg = $first_method_call->args[0]->value ?? null;
+            $second_arg = $first_method_call->args[1]->value ?? null;
+
+            $first_method_name_lc = \strtolower($first_method_call->name->name);
+
+            // Handle methods that always produce the same hardcoded column names,
+            // regardless of arguments (args are precision values, not column names).
+            if (\in_array($first_method_name_lc, self::METHODS_USE_HARDCODED_COLUMN_NAME, true)) {
+                switch ($first_method_name_lc) {
+                    case 'droptimestamps':
+                    case 'droptimestampstz':
+                        $table->dropColumn('created_at');
+                        $table->dropColumn('updated_at');
+                        break;
+
+                    case 'remembertoken':
+                        $table->setColumn(new SchemaColumn('remember_token', 'string', $nullable));
+                        break;
+
+                    case 'dropremembertoken':
+                        $table->dropColumn('remember_token');
+                        break;
+
+                    case 'datetimes':
+                    case 'timestamps':
+                    case 'timestampstz':
+                    case 'nullabletimestamps':
+                    case 'nullabletimestampstz':
+                        $table->setColumn(new SchemaColumn('created_at', 'string', true));
+                        $table->setColumn(new SchemaColumn('updated_at', 'string', true));
+                        break;
+                }
+
+                continue; // foreach
+            }
+
+            // foreignIdFor()/foreignUuidFor()/foreignUlidFor() with class reference: $table->foreignIdFor(User::class).
+            // Handled before name resolution because `User::class` is a class constant fetch that would
+            // otherwise resolve to the FQCN string and be mistaken for a column name.
+            // foreignUuidFor()/foreignUlidFor() take only a model (class name or instance), never a column name
+            // first, so any other first argument must register nothing instead of a bogus column.
+            $is_always_string_foreign_for = $first_method_name_lc === 'foreignuuidfor'
+                || $first_method_name_lc === 'foreignulidfor';
+
+            if (
+                $is_always_string_foreign_for
+                || (
+                    $first_arg instanceof PhpParser\Node\Expr\ClassConstFetch
+                    && $first_method_name_lc === 'foreignidfor'
+                )
+            ) {
+                $column = $this->resolveForeignKeyColumn(
+                    $first_arg,
+                    $second_arg,
+                    $nullable,
+                    $default,
+                    always_string: $is_always_string_foreign_for,
+                );
+                if ($column instanceof SchemaColumn) {
+                    $table->setColumn($column);
+                }
+
+                continue;
+            }
+
+            if ($first_method_call->args === []) {
+                if (\array_key_exists($first_method_name_lc, self::METHODS_HAVE_DEFAULT_COLUMN_NAME)) {
+                    $column_name = self::METHODS_HAVE_DEFAULT_COLUMN_NAME[$first_method_name_lc];
+                } else {
+                    continue; // unknown type [method call without args] :/
+                }
+            } elseif ($first_arg instanceof PhpParser\Node\Expr\Array_) {
+                // Handle dropColumn/removeColumn with array argument: $table->dropColumn(['col1', 'col2'])
+                if (\in_array($first_method_name_lc, ['dropcolumn', 'removecolumn'], true)) {
+                    foreach ($first_arg->items as $item) {
+                        $item_name = $this->resolveStringArgument($item->value);
+
+                        if ($item_name !== null) {
+                            $table->dropColumn($item_name);
+                        }
+                    }
+                }
+
+                continue;
+            } else {
+                $resolved_column_name = $first_arg instanceof PhpParser\Node\Expr
+                    ? $this->resolveStringArgument($first_arg)
+                    : null;
+
+                if ($resolved_column_name === null) {
+                    continue; // unknown type [method call with unknown argument type] :/
+                }
+
+                $column_name = $resolved_column_name;
+            }
+
+            $second_arg_array = null;
+
+            if ($second_arg instanceof PhpParser\Node\Expr\Array_) {
+                $second_arg_array = [];
+
+                foreach ($second_arg->items as $array_item) {
+                    if ($array_item->value instanceof PhpParser\Node\Scalar\String_) {
+                        $second_arg_array[] = $array_item->value->value;
+                    }
+                }
+            }
+
+            // addColumn('type', 'name') → remap to the resolved type method and re-dispatch
+            if (
+                $first_method_name_lc === 'addcolumn'
+                && $first_arg instanceof PhpParser\Node\Scalar\String_
+                && $second_arg instanceof PhpParser\Node\Expr
+            ) {
+                $added_column_name = $this->resolveStringArgument($second_arg);
+
+                // An unresolvable name must not fall through: the type string would be registered as the column name.
+                if ($added_column_name === null) {
+                    continue;
+                }
+
+                $first_method_name_lc = \strtolower($first_arg->value);
+                $column_name = $added_column_name;
+                $second_arg = null;
+                $second_arg_array = null;
+            }
+
+            $is_unsigned = $unsigned || \in_array($first_method_name_lc, self::UNSIGNED_INT_METHODS, true);
+
+            switch ($first_method_name_lc) {
+                case 'biginteger':
+                case 'bigincrements':
+                case 'unsignedtinyinteger':
+                case 'unsignedsmallinteger':
+                case 'unsignedmediuminteger':
+                case 'unsignedinteger':
+                case 'unsignedbiginteger':
+                case 'tinyinteger':
+                case 'tinyincrements':
+                case 'smallinteger':
+                case 'smallincrements':
+                case 'mediuminteger':
+                case 'mediumincrements':
+                case 'id':
+                case 'integerincrements':
+                case 'integer':
+                case 'increments':
+                case 'foreignid':
+                    $table->setColumn(new SchemaColumn($column_name, 'int', $nullable, default: $default, unsigned: $is_unsigned));
+                    break;
+
+                case 'foreignidfor':
+                    // foreignIdFor() accepts a class-string as first arg (e.g. foreignIdFor('App\Models\User')).
+                    // If the string contains a namespace separator, it's a class name, not a column name —
+                    // skip it to avoid registering a bogus column. We can only resolve class-const refs above.
+                    if (\str_contains($column_name, '\\')) {
+                        break;
+                    }
+
+                    $table->setColumn(new SchemaColumn($column_name, 'int', $nullable, default: $default, unsigned: true));
+                    break;
+
+                case 'binary':
+                case 'foreignulid':
+
+                case 'char':
+                case 'date':
+                case 'datetime':
+                case 'datetimetz':
+                case 'uuid':
+                case 'ulid':
+                case 'timestamp':
+                case 'time':
+                case 'tinytext':
+                case 'text':
+                case 'string':
+                case 'multilinestring':
+                case 'mediumtext':
+                case 'macaddress':
+                case 'longtext':
+                case 'linestring':
+                case 'jsonb':
+                case 'json':
+                case 'ipaddress':
+                case 'foreignuuid':
+                case 'tsvector':
+                    $table->setColumn(new SchemaColumn($column_name, 'string', $nullable, default: $default));
+                    break;
+
+                case 'boolean':
+                    $table->setColumn(new SchemaColumn($column_name, 'bool', $nullable, default: $default));
+                    break;
+
+                case 'vector':
+                    $table->setColumn(new SchemaColumn($column_name, 'array', $nullable, default: $default));
+                    break;
+
+                case 'rawcolumn':
+                case 'polygon':
+                case 'point':
+                case 'multipolygonz':
+                case 'multipolygon':
+                case 'multipoint':
+                case 'geometrycollection':
+                case 'geography':
+                case 'geometry':
+                case 'computed':
+                    // addColumn is handled above the switch via variable remapping
+                default:
+                    // Unknown Blueprint methods (e.g. custom macros) — register as mixed
+                    // so the column is visible to static analysis with a conservative type
+                    $table->setColumn(new SchemaColumn($column_name, 'mixed', $nullable, default: $default));
+                    break;
+
+                case 'double':
+                case 'unsigneddecimal':
+                case 'float':
+                case 'unsignedfloat':
+                case 'unsigneddouble':
+                case 'decimal':
+                    $table->setColumn(new SchemaColumn($column_name, 'float', $nullable, default: $default));
+                    break;
+
+                case 'removecolumn':
+                case 'dropconstrainedforeignid':
+                case 'dropsoftdeletestz':
+                case 'dropsoftdeletesdatetime':
+                case 'dropsoftdeletes':
+                case 'dropifexists':
+                case 'dropcolumn':
+                case 'drop':
+                    $table->dropColumn($column_name);
+                    break;
+
+                case 'after':
+                    if (
+                        $second_arg instanceof PhpParser\Node\Expr\Closure
+                        && \count($second_arg->params) >= 1
+                        && $second_arg->params[0]->var instanceof PhpParser\Node\Expr\Variable
+                        && \is_string($second_arg->params[0]->var->name)
+                    ) {
+                        $this->processColumnUpdates($table_name, $second_arg->params[0]->var->name, $second_arg->stmts);
+                    }
+
+                    break;
+
+                case 'dropforeign':
+                case 'dropforeignidfor':
+                case 'dropconstrainedforeignidfor':
+                case 'dropfulltext':
+                case 'dropindex':
+                case 'dropprimary':
+                case 'dropunique':
+                case 'fulltext':
+                case 'unique':
+                case 'spatialindex':
+                case 'vectorindex':
+                case 'rawindex':
+                case 'renameindex':
+                case 'primary':
+                case 'index':
+                case 'foreign':
+                case 'dropspatialindex':
+                    // Table-level property methods — these don't create columns.
+                    // Without this, $table->engine('InnoDB') would register 'InnoDB' as a column.
+                case 'engine':
+                case 'charset':
+                case 'collation':
+                case 'comment':
+                    break;
+
+                case 'dropmorphs':
+                    $table->dropColumn($column_name . '_type');
+                    $table->dropColumn($column_name . '_id');
+                    break;
+
+                case 'enum':
+                    $table->setColumn(new SchemaColumn($column_name, SchemaColumn::TYPE_ENUM, $nullable, $second_arg_array ?? [], default: $default));
+                    break;
+
+                case 'numericmorphs':
+                case 'morphs': // @todo support UUID and ULID types
+                    $table->setColumn(new SchemaColumn($column_name . '_type', 'string', $nullable));
+                    $table->setColumn(new SchemaColumn($column_name . '_id', 'int', $nullable, unsigned: true));
+                    break;
+
+                case 'nullablenumericmorphs':
+                case 'nullablemorphs': // @todo support UUID and ULID types
+                    $table->setColumn(new SchemaColumn($column_name . '_type', 'string', true));
+                    $table->setColumn(new SchemaColumn($column_name . '_id', 'int', true, unsigned: true));
+                    break;
+
+                case 'uuidmorphs':
+                case 'ulidmorphs':
+                    $table->setColumn(new SchemaColumn($column_name . '_type', 'string', $nullable));
+                    $table->setColumn(new SchemaColumn($column_name . '_id', 'string', $nullable));
+                    break;
+
+                case 'nullableuuidmorphs':
+                case 'nullableulidmorphs':
+                    $table->setColumn(new SchemaColumn($column_name . '_type', 'string', true));
+                    $table->setColumn(new SchemaColumn($column_name . '_id', 'string', true));
+                    break;
+
+                case 'rename':
+                    // $table->rename('new_name') - renames the table itself
+                    $new_table_name = $column_name;
+                    unset($this->tables[$table_name]);
+
+                    // Skip if target already exists (same logic as renameTable)
+                    if (!isset($this->tables[$new_table_name])) {
+                        $this->tables[$new_table_name] = $table;
+                    } else {
+                        $table = $this->tables[$new_table_name];
+                    }
+
+                    $table_name = $new_table_name;
+
+                    break;
+
+                case 'renamecolumn':
+                    $new_column_name = $second_arg instanceof PhpParser\Node\Expr
+                        ? $this->resolveStringArgument($second_arg)
+                        : null;
+
+                    if ($new_column_name !== null) {
+                        $table->renameColumn($column_name, $new_column_name);
+                    }
+
+                    break;
+
+                case 'set':
+                    $table->setColumn(new SchemaColumn($column_name, SchemaColumn::TYPE_SET, $nullable, $second_arg_array ?? [], default: $default));
+                    break;
+
+                case 'year':
+                case 'timetz':
+                case 'timestamptz':
+                case 'softdeletesdatetime':
+                case 'softdeletestz':
+                case 'softdeletes':
+                    $table->setColumn(new SchemaColumn($column_name, 'string', true, default: $default));
+                    break;
+            }
+        }
+    }
+
+    /**
+     * Recursively collect all statements from nested block structures
+     * (if/elseif/else, try/catch/finally, foreach, for, while, do-while, switch).
+     *
+     * Does NOT recurse into closures or function bodies — those have their own
+     * scope and are handled separately (e.g., the ->after() closure case).
+     *
+     * @param array<array-key, PhpParser\Node\Stmt> $stmts
+     * @return list<PhpParser\Node\Stmt>
+     * @psalm-mutation-free
+     */
+    private static function flattenStatements(array $stmts): array
+    {
+        $result = [];
+
+        foreach ($stmts as $stmt) {
+            $result[] = $stmt;
+
+            // Recurse into block structures that may contain Schema/Blueprint calls
+            $nested_blocks = match (true) {
+                $stmt instanceof PhpParser\Node\Stmt\If_ => [
+                    $stmt->stmts,
+                    ...\array_map(static fn(PhpParser\Node\Stmt\ElseIf_ $e): array => $e->stmts, $stmt->elseifs),
+                    ...($stmt->else instanceof \PhpParser\Node\Stmt\Else_ ? [$stmt->else->stmts] : []),
+                ],
+                $stmt instanceof PhpParser\Node\Stmt\TryCatch => [
+                    $stmt->stmts,
+                    ...\array_map(static fn(PhpParser\Node\Stmt\Catch_ $c): array => $c->stmts, $stmt->catches),
+                    ...($stmt->finally instanceof \PhpParser\Node\Stmt\Finally_ ? [$stmt->finally->stmts] : []),
+                ],
+                $stmt instanceof PhpParser\Node\Stmt\Foreach_,
+                $stmt instanceof PhpParser\Node\Stmt\For_,
+                $stmt instanceof PhpParser\Node\Stmt\While_,
+                $stmt instanceof PhpParser\Node\Stmt\Do_ => [$stmt->stmts],
+                $stmt instanceof PhpParser\Node\Stmt\Switch_ => \array_map(
+                    static fn(PhpParser\Node\Stmt\Case_ $c): array => $c->stmts,
+                    $stmt->cases,
+                ),
+                default => [],
+            };
+
+            foreach ($nested_blocks as $block) {
+                \array_push($result, ...self::flattenStatements($block));
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Check if a class name refers to the Schema facade or a subclass of it.
+     * Handles the FQCN, the root-namespace 'Schema' alias, and custom subclasses.
+     *
+     * Note: is_a() with allow_string=true may trigger autoloading (a side effect),
+     * so this method is not truly pure, but the side effect is harmless.
+     * Psalm requires @psalm-pure here (MissingPureAnnotation) for security analysis.
+     * @psalm-pure
+     */
+    private function isSchemaClass(mixed $class_name): bool
+    {
+        if (!\is_string($class_name)) {
+            return false;
+        }
+
+        // Fast-path for the two common cases: avoids is_a() autoloading overhead
+        // for 99% of migrations that use the standard facade or root-namespace alias.
+        if ($class_name === Schema::class || $class_name === 'Schema') {
+            return true;
+        }
+
+        // Fall back to subclass check for custom Schema facades.
+        // is_a() with allow_string=true may trigger autoloading, which is acceptable
+        // here — same pattern as resolveForeignKeyColumn() using reflection.
+        try {
+            return \is_a($class_name, Schema::class, true);
+        } catch (\Exception) {
+            // is_a() with allow_string=true may trigger autoloading; broken autoloaders
+            // can throw RuntimeException or similar. \Error types (fatal autoloading failures)
+            // are not caught — those indicate a genuinely broken environment.
+            return false;
+        }
+    }
+
+    private function isNullLiteral(PhpParser\Node\Expr $expr): bool
+    {
+        return $expr instanceof PhpParser\Node\Expr\ConstFetch && $expr->name->toLowerString() === 'null';
+    }
+
+    /**
+     * Resolve a table or column name from a call argument expression.
+     * Supports string literals ('users') and class constant fetches (User::TABLE).
+     */
+    private function resolveStringArgument(PhpParser\Node\Expr $expr): ?string
+    {
+        if ($expr instanceof PhpParser\Node\Scalar\String_) {
+            return $expr->value;
+        }
+
+        if ($expr instanceof PhpParser\Node\Expr\ClassConstFetch) {
+            return $this->resolveClassConstantString($expr);
+        }
+
+        return null;
+    }
+
+    /**
+     * Resolve a class constant fetch (e.g. User::TABLE) to its string value.
+     * Returns null if the class or constant cannot be resolved or isn't a string.
+     *
+     * Uses constant() which requires the class to be autoloadable — acceptable here
+     * because the Laravel app is booted via Testbench before schema aggregation runs.
+     * Same autoloading pattern as resolveForeignKeyColumn() which uses reflection.
+     */
+    private function resolveClassConstantString(PhpParser\Node\Expr\ClassConstFetch $node): ?string
+    {
+        if (!$node->class instanceof PhpParser\Node\Name || !$node->name instanceof PhpParser\Node\Identifier) {
+            return null;
+        }
+
+        $class_name = $node->class->getAttribute('resolvedName');
+        if (!\is_string($class_name) || $class_name === '') {
+            return null;
+        }
+
+        // constant() throws \Error when the class doesn't exist (autoloading fails)
+        // and \ValueError when the constant doesn't exist (PHP 8.0+).
+        // Broken autoloaders may also throw \Exception subclasses.
+        // Unlike is_a() which returns false for missing classes, constant() always
+        // throws on failure — so \Throwable is the correct catch scope here.
+        try {
+            /** @var scalar|array<array-key, mixed>|null — constant() returns mixed, but class constants are always scalar, array, or null */
+            $value = \constant($class_name . '::' . $node->name->name);
+        } catch (\Throwable) {
+            return null;
+        }
+
+        return \is_string($value) ? $value : null;
+    }
+
+    private function resolveDefaultValue(PhpParser\Node\Expr $expr): SchemaColumnDefault
+    {
+        if ($expr instanceof PhpParser\Node\Scalar\String_) {
+            return SchemaColumnDefault::resolved($expr->value);
+        }
+
+        if ($expr instanceof PhpParser\Node\Scalar\LNumber) {
+            return SchemaColumnDefault::resolved($expr->value);
+        }
+
+        if ($expr instanceof PhpParser\Node\Scalar\DNumber) {
+            return SchemaColumnDefault::resolved($expr->value);
+        }
+
+        if ($expr instanceof PhpParser\Node\Expr\ConstFetch) {
+            $parts = $expr->name->getParts();
+
+            if ($parts === ['true'] || $parts === ['TRUE']) {
+                return SchemaColumnDefault::resolved(true);
+            }
+
+            if ($parts === ['false'] || $parts === ['FALSE']) {
+                return SchemaColumnDefault::resolved(false);
+            }
+
+            if ($parts === ['null'] || $parts === ['NULL']) {
+                return SchemaColumnDefault::resolved(null);
+            }
+
+            return SchemaColumnDefault::unresolvable();
+        }
+
+        if ($expr instanceof PhpParser\Node\Expr\UnaryMinus) {
+            if ($expr->expr instanceof PhpParser\Node\Scalar\LNumber) {
+                return SchemaColumnDefault::resolved(-$expr->expr->value);
+            }
+
+            if ($expr->expr instanceof PhpParser\Node\Scalar\DNumber) {
+                return SchemaColumnDefault::resolved(-$expr->expr->value);
+            }
+        }
+
+        // new Expression('...'), variables, function calls → not statically resolvable
+        return SchemaColumnDefault::unresolvable();
+    }
+
+    /**
+     * Resolve a SchemaColumn for foreignIdFor()/foreignUuidFor()/foreignUlidFor() when called
+     * with a class reference.
+     *
+     * foreignIdFor(User::class) resolves to 'user_id' (based on model's foreign key convention).
+     * For foreignIdFor() the column type is determined by looking up the referenced model's primary
+     * key in the already-parsed schema: if the PK is a string (e.g., uuid/ulid), the FK column is
+     * also a string; otherwise it defaults to unsigned int. foreignUuidFor()/foreignUlidFor() pass
+     * $always_string and always produce a string column.
+     */
+    private function resolveForeignKeyColumn(
+        ?PhpParser\Node\Expr $first_arg,
+        ?PhpParser\Node\Expr $second_arg,
+        bool $nullable,
+        ?SchemaColumnDefault $default,
+        bool $always_string = false,
+    ): ?SchemaColumn {
+        if (!$first_arg instanceof PhpParser\Node\Expr\ClassConstFetch) {
+            return null;
+        }
+
+        if (
+            !$first_arg->class instanceof PhpParser\Node\Name
+            || !$first_arg->name instanceof PhpParser\Node\Identifier
+            || $first_arg->name->name !== 'class'
+        ) {
+            return null;
+        }
+
+        $class_name = $first_arg->class->getAttribute('resolvedName');
+
+        if (!\is_string($class_name)) {
+            return null;
+        }
+
+        // The schema is built at plugin init, before Psalm populates its storage, so only the
+        // autoloader can answer here. A class whose load raises (a deprecation, under Psalm's error
+        // handler) must drop this one column, not escape to Plugin::__invoke() and disable the whole
+        // plugin (#1652).
+        try {
+            // A misspelled or missing class throws ReflectionException, caught below.
+            /** @psalm-suppress ArgumentTypeCoercion */
+            $reflection = new \ReflectionClass($class_name);
+            if (!$reflection->isSubclassOf(Model::class)) {
+                return null;
+            }
+
+            $instance = $reflection->newInstanceWithoutConstructor();
+        } catch (\Throwable) {
+            return null;
+        }
+
+        // Column name: omitted (or literal null) uses the model's foreign key convention. An explicit
+        // argument that can't be resolved statically (self::X, variable, call) names an unknown column,
+        // so register nothing rather than overwrite the conventional column with the wrong type.
+        if (!$second_arg instanceof \PhpParser\Node\Expr || $this->isNullLiteral($second_arg)) {
+            $column_name = $instance->getForeignKey();
+        } else {
+            $column_name = $this->resolveStringArgument($second_arg);
+
+            if ($column_name === null || $column_name === '') {
+                return null;
+            }
+        }
+
+        // foreignUuidFor()/foreignUlidFor() always create a string column, whatever the PK type.
+        if ($always_string) {
+            return new SchemaColumn($column_name, 'string', $nullable, default: $default);
+        }
+
+        // Resolve type from the referenced model's primary key in the parsed schema.
+        // If the PK column is a string (uuid, ulid, etc.), the FK should also be string.
+        $referenced_table = $this->tables[$instance->getTable()] ?? null;
+        $key_name = $this->asNonEmptyString($instance->getKeyName());
+        $pk_column = $key_name !== null
+            ? $referenced_table?->columns[$key_name] ?? null
+            : null;
+
+        if ($pk_column !== null && $pk_column->type === 'string') {
+            return new SchemaColumn($column_name, 'string', $nullable, default: $default);
+        }
+
+        // Default: unsigned int — either the PK is actually an int, or the referenced
+        // table hasn't been parsed yet (migration ordering). We can't safely call
+        // getKeyType() because newInstanceWithoutConstructor() skips trait initialization.
+        return new SchemaColumn($column_name, 'int', $nullable, default: $default, unsigned: true);
+    }
+
+    /**
+     * Laravel documents getKeyName() as string, but its untyped backing property is null/empty
+     * in real keyless models. The mixed boundary normalizes that false contract without suppression.
+     *
+     * @return non-empty-string|null
+     * @psalm-pure
+     */
+    private function asNonEmptyString(mixed $value): ?string
+    {
+        return \is_string($value) && $value !== '' ? $value : null;
+    }
+}

@@ -1,0 +1,766 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Internal\Type;
+
+use InvalidArgumentException;
+use Psalm\Codebase;
+use Psalm\Internal\Type\Comparator\TypeComparisonResult;
+use Psalm\Internal\Type\Comparator\UnionTypeComparator;
+use Psalm\Internal\TypeVisitor\ConditionalSubjectReplacer;
+use Psalm\Internal\TypeVisitor\ContainsStaticVisitor;
+use Psalm\Type;
+use Psalm\Type\Atomic;
+use Psalm\Type\Atomic\TArray;
+use Psalm\Type\Atomic\TClassString;
+use Psalm\Type\Atomic\TConditional;
+use Psalm\Type\Atomic\TInt;
+use Psalm\Type\Atomic\TIntersection;
+use Psalm\Type\Atomic\TIterable;
+use Psalm\Type\Atomic\TKeyOf;
+use Psalm\Type\Atomic\TKeyedArray;
+use Psalm\Type\Atomic\TLiteralInt;
+use Psalm\Type\Atomic\TLiteralString;
+use Psalm\Type\Atomic\TMixed;
+use Psalm\Type\Atomic\TNamedObject;
+use Psalm\Type\Atomic\TNonEmptyArray;
+use Psalm\Type\Atomic\TObject;
+use Psalm\Type\Atomic\TObjectWithProperties;
+use Psalm\Type\Atomic\TPropertiesOf;
+use Psalm\Type\Atomic\TTemplateIndexedAccess;
+use Psalm\Type\Atomic\TTemplateKeyOf;
+use Psalm\Type\Atomic\TTemplateParam;
+use Psalm\Type\Atomic\TTemplateParamClass;
+use Psalm\Type\Atomic\TTemplatePropertiesOf;
+use Psalm\Type\Atomic\TTemplateValueOf;
+use Psalm\Type\Atomic\TTypeVariable;
+use Psalm\Type\Atomic\TValueOf;
+use Psalm\Type\Union;
+use UnexpectedValueException;
+
+use function array_merge;
+use function array_shift;
+use function array_values;
+use function assert;
+use function str_starts_with;
+
+/**
+ * @internal
+ */
+final class TemplateInferredTypeReplacer
+{
+    /**
+     * This replaces template types in unions with the inferred types they should be
+     *
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public static function replace(
+        Union $union,
+        TemplateResult $template_result,
+        ?Codebase $codebase,
+    ): Union {
+        $new_types = [];
+
+        $is_mixed = false;
+
+        $inferred_lower_bounds = $template_result->lower_bounds ?: [];
+
+        $types = [];
+
+        foreach ($union->getAtomicTypes() as $key => $atomic_type) {
+            $should_set = true;
+
+            if ($atomic_type instanceof TConditional && $codebase) {
+                $atomic_type = self::expandStaticOfCall($codebase, $atomic_type, $template_result);
+            }
+
+            $atomic_type = $atomic_type->replaceTemplateTypesWithArgTypes($template_result, $codebase);
+
+            if ($atomic_type instanceof TTemplateParam) {
+                $template_type = self::replaceTemplateParam(
+                    $codebase,
+                    $atomic_type,
+                    $inferred_lower_bounds,
+                    $key,
+                );
+
+                if ($template_type) {
+                    $should_set = false;
+
+                    foreach ($template_type->getAtomicTypes() as $template_type_part) {
+                        if ($template_type_part instanceof TMixed) {
+                            $is_mixed = true;
+                        }
+
+                        $new_types[] = $template_type_part;
+                    }
+                }
+            } elseif ($atomic_type instanceof TTemplateParamClass) {
+                $template_type = isset($inferred_lower_bounds[$atomic_type->param_name][$atomic_type->defining_class])
+                    ? TemplateStandinTypeReplacer::getMostSpecificTypeFromBounds(
+                        $inferred_lower_bounds[$atomic_type->param_name][$atomic_type->defining_class],
+                        $codebase,
+                    )
+                    : null;
+
+                $class_template_type = null;
+
+                if ($template_type) {
+                    foreach ($template_type->getAtomicTypes() as $template_type_part) {
+                        if ($template_type_part instanceof TMixed
+                            || $template_type_part instanceof TObject
+                        ) {
+                            $class_template_type = new TClassString();
+                        } elseif ($template_type_part instanceof TNamedObject) {
+                            $class_template_type = new TClassString(
+                                $template_type_part->value,
+                                $template_type_part,
+                            );
+                        } elseif ($template_type_part instanceof TTemplateParam) {
+                            $first_atomic_type = $template_type_part->as->getSingleAtomic();
+
+                            $class_template_type = new TTemplateParamClass(
+                                $template_type_part->param_name,
+                                $template_type_part->as->getId(),
+                                $first_atomic_type instanceof TNamedObject ? $first_atomic_type : null,
+                                $template_type_part->defining_class,
+                            );
+                        }
+                    }
+                }
+
+                if ($class_template_type) {
+                    $should_set = false;
+                    $new_types[] = $class_template_type;
+                }
+            } elseif ($atomic_type instanceof TTemplateIndexedAccess) {
+                $should_set = false;
+
+                $template_type = null;
+
+                if (isset($inferred_lower_bounds[$atomic_type->array_param_name][$atomic_type->defining_class])
+                    && !empty($inferred_lower_bounds[$atomic_type->offset_param_name])
+                ) {
+                    $array_template_type
+                        = TemplateStandinTypeReplacer::getMostSpecificTypeFromBounds(
+                            $inferred_lower_bounds[$atomic_type->array_param_name][$atomic_type->defining_class],
+                            $codebase,
+                        );
+
+                    $offset_template_type
+                        = TemplateStandinTypeReplacer::getMostSpecificTypeFromBounds(
+                            array_values($inferred_lower_bounds[$atomic_type->offset_param_name])[0],
+                            $codebase,
+                        );
+
+                    if ($array_template_type->isSingle()
+                        && $offset_template_type->isSingle()
+                        && !$array_template_type->isMixed()
+                        && !$offset_template_type->isMixed()
+                    ) {
+                        $array_template_type = $array_template_type->getSingleAtomic();
+                        $offset_template_type = $offset_template_type->getSingleAtomic();
+
+                        if ($array_template_type instanceof TKeyedArray
+                            && ($offset_template_type instanceof TLiteralString
+                                || $offset_template_type instanceof TLiteralInt)
+                            && isset($array_template_type->properties[$offset_template_type->value])
+                        ) {
+                            $template_type = $array_template_type->properties[$offset_template_type->value];
+                        }
+                    }
+                }
+
+                if ($template_type) {
+                    foreach ($template_type->getAtomicTypes() as $template_type_part) {
+                        if ($template_type_part instanceof TMixed) {
+                            $is_mixed = true;
+                        }
+
+                        $new_types[] = $template_type_part;
+                    }
+                } else {
+                    $new_types[] = new TMixed();
+                }
+            } elseif ($atomic_type instanceof TTemplateKeyOf
+                || $atomic_type instanceof TTemplateValueOf
+            ) {
+                $new_type = self::replaceTemplateKeyOfValueOf(
+                    $codebase,
+                    $atomic_type,
+                    $inferred_lower_bounds,
+                );
+
+                if ($new_type) {
+                    $should_set = false;
+                    $new_types[] = $new_type;
+                }
+            } elseif ($atomic_type instanceof TTemplatePropertiesOf) {
+                $new_type = self::replaceTemplatePropertiesOf(
+                    $codebase,
+                    $atomic_type,
+                    $inferred_lower_bounds,
+                );
+
+                if ($new_type) {
+                    $should_set = false;
+                    $new_types[] = $new_type;
+                }
+            } elseif ($atomic_type instanceof TIntersection) {
+                $intersected_types = [];
+
+                foreach ($atomic_type->types as $intersected_type) {
+                    $intersected_types[] = self::replace($intersected_type, $template_result, $codebase);
+                }
+
+                $atomic_type = $atomic_type->setTypes($intersected_types);
+            } elseif ($atomic_type instanceof TConditional
+                && $codebase
+            ) {
+                /** @psalm-suppress ImpureMethodCall */
+                $class_template_type = self::replaceConditional(
+                    $template_result,
+                    $codebase,
+                    $atomic_type,
+                    $inferred_lower_bounds,
+                );
+
+                $should_set = false;
+
+                foreach ($class_template_type->getAtomicTypes() as $class_template_atomic_type) {
+                    $new_types[] = $class_template_atomic_type;
+                }
+            }
+            if ($should_set) {
+                $types []= $atomic_type;
+            }
+        }
+
+        if ($is_mixed) {
+            if (!$new_types) {
+                throw new UnexpectedValueException('This array should be full');
+            }
+
+            return $union->getBuilder()->setTypes(
+                TypeCombiner::combine(
+                    $new_types,
+                    $codebase,
+                )->getAtomicTypes(),
+            )->freeze();
+        }
+
+        $atomic_types = [...$types, ...$new_types];
+        if (!$atomic_types) {
+            throw new UnexpectedValueException('This array should be full');
+        }
+
+        return $union->getBuilder()->setTypes(
+            TypeCombiner::combine(
+                $atomic_types,
+                $codebase,
+            )->getAtomicTypes(),
+        )->freeze();
+    }
+
+    /**
+     * @param array<string, array<string, non-empty-list<TemplateBound>>> $inferred_lower_bounds
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    private static function replaceTemplateParam(
+        ?Codebase $codebase,
+        TTemplateParam $atomic_type,
+        array $inferred_lower_bounds,
+        string $key,
+    ): ?Union {
+        $template_type = null;
+
+        $traversed_type = TemplateStandinTypeReplacer::getRootTemplateType(
+            $inferred_lower_bounds,
+            $atomic_type->param_name,
+            $atomic_type->defining_class,
+            [],
+            $codebase,
+        );
+
+        if ($traversed_type) {
+            $template_type = $traversed_type;
+
+            if ($template_type->isMixed() && !$atomic_type->as->isMixed()) {
+                $template_type = $atomic_type->as;
+            }
+
+            if ($atomic_type->extra_types) {
+                // a type variable cannot carry intersection types: resolve it
+                // through its accumulated bounds so the intersection lands on
+                // the concrete types behind it
+                $resolved_template_types = [];
+
+                foreach ($template_type->getAtomicTypes() as $atomic_template_type) {
+                    $resolved = null;
+
+                    if ($atomic_template_type instanceof TTypeVariable && $atomic_template_type->bounds) {
+                        if ($atomic_template_type->bounds->lower_bounds) {
+                            $resolved = TemplateStandinTypeReplacer::getMostSpecificTypeFromBounds(
+                                $atomic_template_type->bounds->lower_bounds,
+                                $codebase,
+                            );
+                        } elseif ($atomic_template_type->bounds->upper_bounds) {
+                            $resolved = $atomic_template_type->bounds->upper_bounds[0]->type;
+                        }
+                    }
+
+                    if ($resolved) {
+                        foreach ($resolved->getAtomicTypes() as $resolved_atomic_type) {
+                            $resolved_template_types[] = $resolved_atomic_type;
+                        }
+                    } else {
+                        $resolved_template_types[] = $atomic_template_type;
+                    }
+                }
+
+                $template_type = $template_type->getBuilder()->setTypes($resolved_template_types)->freeze();
+
+                $types = [];
+                foreach ($template_type->getAtomicTypes() as $atomic_template_type) {
+                    if ($atomic_template_type instanceof TNamedObject
+                        || $atomic_template_type instanceof TTemplateParam
+                        || $atomic_template_type instanceof TIterable
+                        || $atomic_template_type instanceof TObjectWithProperties
+                    ) {
+                        $types []= $atomic_template_type->setIntersectionTypes(array_merge(
+                            $atomic_type->extra_types,
+                            $atomic_template_type->extra_types,
+                        ));
+                    } elseif ($atomic_template_type instanceof TObject) {
+                        $first_atomic_type = array_shift($atomic_type->extra_types);
+                        assert($first_atomic_type !== null);
+
+                        if ($atomic_type->extra_types) {
+                            $first_atomic_type = $first_atomic_type->setIntersectionTypes($atomic_type->extra_types);
+                        }
+
+                        $types []= $first_atomic_type;
+                    } else {
+                        $types []= $atomic_template_type;
+                    }
+                }
+                $template_type = $template_type->getBuilder()->setTypes($types)->freeze();
+            }
+        } elseif ($codebase) {
+            foreach ($inferred_lower_bounds as $template_type_map) {
+                foreach ($template_type_map as $template_class => $_) {
+                    if (str_starts_with($template_class, 'fn-')) {
+                        continue;
+                    }
+
+                    try {
+                        $classlike_storage = $codebase->classlike_storage_provider->get($template_class);
+
+                        if ($classlike_storage->template_extended_params) {
+                            $defining_class = $atomic_type->defining_class;
+
+                            if (isset($classlike_storage->template_extended_params[$defining_class])) {
+                                $param_map = $classlike_storage->template_extended_params[$defining_class];
+
+                                if (isset($param_map[$key])) {
+                                    $template_name = (string) $param_map[$key];
+                                    if (isset($inferred_lower_bounds[$template_name][$template_class])) {
+                                        $template_type
+                                            = TemplateStandinTypeReplacer::getMostSpecificTypeFromBounds(
+                                                $inferred_lower_bounds[$template_name][$template_class],
+                                                $codebase,
+                                            );
+                                    }
+                                }
+                            }
+                        }
+                    } catch (InvalidArgumentException) {
+                    }
+                }
+            }
+        }
+
+        return $template_type;
+    }
+
+    /**
+     * @param TTemplateKeyOf|TTemplateValueOf $atomic_type
+     * @param array<string, array<string, non-empty-list<TemplateBound>>> $inferred_lower_bounds
+     * @psalm-external-mutation-free
+     */
+    private static function replaceTemplateKeyOfValueOf(
+        ?Codebase $codebase,
+        Atomic $atomic_type,
+        array $inferred_lower_bounds,
+    ): ?Atomic {
+        if (!isset($inferred_lower_bounds[$atomic_type->param_name][$atomic_type->defining_class])) {
+            return null;
+        }
+
+        $template_type = TemplateStandinTypeReplacer::getMostSpecificTypeFromBounds(
+            $inferred_lower_bounds[$atomic_type->param_name][$atomic_type->defining_class],
+            $codebase,
+        );
+
+        if ($atomic_type instanceof TTemplateKeyOf
+            && TKeyOf::isViableTemplateType($template_type)
+        ) {
+            return new TKeyOf($template_type);
+        }
+
+        if ($atomic_type instanceof TTemplateValueOf
+            && TValueOf::isViableTemplateType($template_type)
+        ) {
+            return new TValueOf($template_type);
+        }
+
+        return null;
+    }
+
+    /**
+     * @param array<string, array<string, non-empty-list<TemplateBound>>> $inferred_lower_bounds
+     * @psalm-external-mutation-free
+     */
+    private static function replaceTemplatePropertiesOf(
+        ?Codebase $codebase,
+        TTemplatePropertiesOf $atomic_type,
+        array $inferred_lower_bounds,
+    ): ?Atomic {
+        if (!isset($inferred_lower_bounds[$atomic_type->param_name][$atomic_type->defining_class])) {
+            return null;
+        }
+
+        $template_type = TemplateStandinTypeReplacer::getMostSpecificTypeFromBounds(
+            $inferred_lower_bounds[$atomic_type->param_name][$atomic_type->defining_class],
+            $codebase,
+        );
+
+        $classlike_type = $template_type->getSingleAtomic();
+        if (!$classlike_type instanceof TNamedObject) {
+            return null;
+        }
+
+        return new TPropertiesOf(
+            $classlike_type,
+            $atomic_type->visibility_filter,
+        );
+    }
+
+    /**
+     * @param array<string, array<string, non-empty-list<TemplateBound>>> $inferred_lower_bounds
+     */
+    private static function replaceConditional(
+        TemplateResult $template_result,
+        Codebase $codebase,
+        TConditional &$atomic_type,
+        array $inferred_lower_bounds,
+    ): Union {
+        $template_type = isset($inferred_lower_bounds[$atomic_type->param_name][$atomic_type->defining_class])
+            ? TemplateStandinTypeReplacer::getMostSpecificTypeFromBounds(
+                $inferred_lower_bounds[$atomic_type->param_name][$atomic_type->defining_class],
+                $codebase,
+            )
+            : null;
+
+        $subject_type = $atomic_type->subject_type;
+
+        if ($template_type && $subject_type !== null) {
+            $template_type = TypeExpander::expandUnion(
+                $codebase,
+                self::replace($subject_type, $template_result, $codebase),
+                null,
+                null,
+                null,
+            );
+
+            foreach ($template_type->getAtomicTypes() as $subject_atomic_type) {
+                if ($subject_atomic_type instanceof TTemplateParam
+                    || $subject_atomic_type instanceof TTemplateKeyOf
+                    || $subject_atomic_type instanceof TTemplateValueOf
+                    || $subject_atomic_type instanceof TTemplateIndexedAccess
+                    || $subject_atomic_type instanceof TTemplatePropertiesOf
+                ) {
+                    // still unknown
+                    $template_type = null;
+                    break;
+                }
+            }
+        }
+
+        $if_template_type = null;
+        $else_template_type = null;
+
+        $as_type = $atomic_type->as_type;
+        $conditional_type = $atomic_type->conditional_type;
+        $if_type = $atomic_type->if_type;
+        $else_type = $atomic_type->else_type;
+
+        if ($template_type) {
+            $as_type = self::replace(
+                $as_type,
+                $template_result,
+                $codebase,
+            );
+
+            if ($as_type->isNullable() && $template_type->isVoid()) {
+                $template_type = Type::getNull();
+            }
+
+            if ($subject_type === null
+                && !UnionTypeComparator::isContainedBy($codebase, $template_type, $as_type)
+                && ($bounded_template_type = Type::intersectUnionTypes($template_type, $as_type, $codebase))
+            ) {
+                // a value of the template is of its bound, e.g. a mixed argument for a `T of ?string` param is a
+                // string or null
+                $template_type = $bounded_template_type;
+            }
+
+            $matching_if_types = [];
+            $matching_else_types = [];
+            $is_decidable = true;
+
+            $l = $template_type->getAtomicTypes();
+            foreach (isset($l['mixed']) ? [$l['mixed']] : $l as $candidate_atomic_type) {
+                $candidate = new Union([$candidate_atomic_type]);
+                $comparison_result = new TypeComparisonResult();
+                // an object that is only castable to string is not of a string condition
+                if (UnionTypeComparator::isContainedBy(
+                    $codebase,
+                    $candidate,
+                    $conditional_type,
+                    false,
+                    false,
+                    $comparison_result,
+                    false,
+                    false,
+                )
+                    && !$comparison_result->to_string_cast
+                    && (!$candidate_atomic_type instanceof TInt
+                        || $conditional_type->getId() !== 'float')
+                ) {
+                    $matching_if_types[] = $candidate_atomic_type;
+
+                    continue;
+                }
+
+                $matching_else_types[] = $candidate_atomic_type;
+
+                // no value is of the type `never`
+                if ($conditional_type->isNever()) {
+                    continue;
+                }
+
+                $if_part = Type::intersectUnionTypes(
+                    $candidate,
+                    $conditional_type,
+                    $codebase,
+                    false,
+                    false,
+                );
+
+                if ($if_part === null) {
+                    // only a candidate that can't be of the condition is decidably in the else branch: the
+                    // intersection of some overlapping types is unknown
+                    if (!self::isDisjoint($codebase, $candidate_atomic_type, $conditional_type)) {
+                        $is_decidable = false;
+                    }
+
+                    continue;
+                }
+
+                // the candidate may or may not be of the condition, e.g. a string being a non-empty-string
+                if (UnionTypeComparator::isContainedBy(
+                    $codebase,
+                    $if_part,
+                    $conditional_type,
+                    false,
+                    false,
+                    null,
+                    false,
+                    false,
+                )) {
+                    $matching_if_types = [...$matching_if_types, ...array_values($if_part->getAtomicTypes())];
+                } else {
+                    $is_decidable = false;
+                }
+            }
+
+            $if_candidate_type = $matching_if_types && $is_decidable ? new Union($matching_if_types) : null;
+            $else_candidate_type = $matching_else_types && $is_decidable ? new Union($matching_else_types) : null;
+
+            if ($if_candidate_type) {
+                $if_template_type = self::replaceConditionalBranch(
+                    $codebase,
+                    $atomic_type,
+                    $template_result,
+                    $if_type,
+                    $if_candidate_type,
+                );
+            }
+
+            if ($else_candidate_type
+                && ($subject_type !== null
+                    || UnionTypeComparator::isContainedBy(
+                        $codebase,
+                        $else_candidate_type,
+                        $as_type,
+                        false,
+                        false,
+                        null,
+                        false,
+                        false,
+                    ))
+            ) {
+                $else_template_type = self::replaceConditionalBranch(
+                    $codebase,
+                    $atomic_type,
+                    $template_result,
+                    $else_type,
+                    $else_candidate_type,
+                );
+            }
+        }
+
+        if (!$if_template_type && !$else_template_type) {
+            $if_type = self::replace(
+                $if_type,
+                $template_result,
+                $codebase,
+            );
+
+            $else_type = self::replace(
+                $else_type,
+                $template_result,
+                $codebase,
+            );
+
+            $class_template_type = Type::combineUnionTypes(
+                $if_type,
+                $else_type,
+                $codebase,
+            );
+        } else {
+            $class_template_type = Type::combineUnionTypes(
+                $if_template_type,
+                $else_template_type,
+                $codebase,
+            );
+        }
+
+        $atomic_type = $atomic_type->setTypes(
+            $as_type,
+            $conditional_type,
+            $if_type,
+            $else_type,
+        );
+
+        return $class_template_type;
+    }
+
+    /**
+     * A branch of a conditional type, where the type the condition is on is the candidates of the branch
+     */
+    private static function replaceConditionalBranch(
+        Codebase $codebase,
+        TConditional $conditional,
+        TemplateResult $template_result,
+        Union $branch_type,
+        Union $candidate_type,
+    ): Union {
+        $refined_template_result = clone $template_result;
+
+        if ($conditional->subject_type === null) {
+            $refined_template_result->lower_bounds[$conditional->param_name][$conditional->defining_class] = [
+                new TemplateBound($candidate_type),
+            ];
+        } else {
+            (new ConditionalSubjectReplacer($conditional->subject_type, $candidate_type, $codebase))
+                ->traverse($branch_type);
+        }
+
+        return self::replace($branch_type, $refined_template_result, $codebase);
+    }
+
+    /**
+     * A param conditional with `static` of the call in its constraint and condition, before the bounds, which may hold
+     * the `static` of the caller, are put in them: only when its template is bound by arguments alone (fallbacks and
+     * defaults have no argument offset), as they were checked against the params with that `static`. A bound holding
+     * the declared `static` (a closure param narrowed by an unexpanded hint) is compared with them as declared.
+     *
+     * @psalm-capabilities read-props
+     */
+    private static function expandStaticOfCall(
+        Codebase $codebase,
+        TConditional $conditional,
+        TemplateResult $template_result,
+    ): TConditional {
+        $static_class_type = $template_result->static_class_type;
+        $bounds = $template_result->lower_bounds[$conditional->param_name][$conditional->defining_class] ?? [];
+
+        if ($static_class_type === null || $conditional->subject_type !== null || !$bounds) {
+            return $conditional;
+        }
+
+        foreach ($bounds as $bound) {
+            $static_visitor = new ContainsStaticVisitor(true);
+            $static_visitor->traverse($bound->type);
+
+            if ($bound->arg_offset === null || $static_visitor->matches()) {
+                return $conditional;
+            }
+        }
+
+        $final = $template_result->static_class_is_final;
+
+        /** @psalm-suppress ImpureMethodCall reads codebase storage (constant types may be memoized) */
+        return $conditional->setTypes(
+            TypeExpander::expandStatic($codebase, $conditional->as_type, $static_class_type, $final),
+            TypeExpander::expandStatic($codebase, $conditional->conditional_type, $static_class_type, $final),
+        );
+    }
+
+    /**
+     * Whether no value of $candidate is of $conditional_type
+     */
+    private static function isDisjoint(Codebase $codebase, Atomic $candidate, Union $conditional_type): bool
+    {
+        // the empty array is never a non-empty one, nor the reverse
+        $overlapping_atomic_types = [];
+
+        foreach ($conditional_type->getAtomicTypes() as $conditional_atomic_type) {
+            if (!(self::isEmptyArray($candidate) && self::isNonEmptyArray($conditional_atomic_type))
+                && !(self::isNonEmptyArray($candidate) && self::isEmptyArray($conditional_atomic_type))
+            ) {
+                $overlapping_atomic_types[] = $conditional_atomic_type;
+            }
+        }
+
+        if (!$overlapping_atomic_types) {
+            return true;
+        }
+
+        return !UnionTypeComparator::canExpressionTypesBeIdentical(
+            $codebase,
+            new Union([$candidate]),
+            new Union($overlapping_atomic_types),
+            false,
+        );
+    }
+
+    /**
+     * @psalm-pure
+     */
+    private static function isEmptyArray(Atomic $type): bool
+    {
+        return $type instanceof TArray && $type->isEmptyArray();
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    private static function isNonEmptyArray(Atomic $type): bool
+    {
+        return $type instanceof TNonEmptyArray || ($type instanceof TKeyedArray && $type->isNonEmpty());
+    }
+}

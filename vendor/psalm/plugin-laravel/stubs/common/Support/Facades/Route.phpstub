@@ -1,0 +1,28 @@
+<?php
+
+namespace Illuminate\Support\Facades;
+
+/**
+ * `Illuminate\Support\Facades\Route` declares
+ *   `@method static \Illuminate\Routing\RouteRegistrar middleware(array|string|null $middleware)`
+ * at class level. The runtime resolution (Router::__call → RouteRegistrar) treats the
+ * argument list as variadic strings — `Route::middleware('a', 'b', 'c')` is a valid
+ * Laravel idiom (e.g. invoiceninja `routes/contact.php`).
+ *
+ * The concrete facade method below widens the value type and marks the call as variadic.
+ * FacadeStubPrecedenceHandler removes Laravel's shadowing pseudo-method after population,
+ * so Psalm resolves this native stub signature instead of the narrower vendor annotation.
+ */
+class Route extends Facade
+{
+    /**
+     * Narrowed value type — accepts `array<array-key, string|null>`. See the rationale
+     * on the concrete method in `stubs/common/Routing/RouteRegistrar.phpstub`.
+     *
+     * @param string|array<array-key, string|null>|null $middleware
+     * @return \Illuminate\Routing\RouteRegistrar
+     *
+     * @psalm-variadic
+     */
+    public static function middleware($middleware = null) {}
+}

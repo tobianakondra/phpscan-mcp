@@ -1,0 +1,3394 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm;
+
+use Amp\Sync\Channel;
+use AssertionError;
+use Exception;
+use InvalidArgumentException;
+use LanguageServerProtocol\Command;
+use LanguageServerProtocol\CompletionItem;
+use LanguageServerProtocol\CompletionItemKind;
+use LanguageServerProtocol\InsertTextFormat;
+use LanguageServerProtocol\ParameterInformation;
+use LanguageServerProtocol\Position;
+use LanguageServerProtocol\Range;
+use LanguageServerProtocol\SignatureInformation;
+use LanguageServerProtocol\TextEdit;
+use PhpParser;
+use PhpParser\Node\Arg;
+use Psalm\CodeLocation\Raw;
+use Psalm\Exception\UnanalyzedFileException;
+use Psalm\Exception\UnpopulatedClasslikeException;
+use Psalm\Internal\Analyzer\ClassLikeAnalyzer;
+use Psalm\Internal\Analyzer\FunctionLikeAnalyzer;
+use Psalm\Internal\Analyzer\NamespaceAnalyzer;
+use Psalm\Internal\Analyzer\ProjectAnalyzer;
+use Psalm\Internal\Analyzer\Statements\Block\ForeachAnalyzer;
+use Psalm\Internal\Analyzer\Statements\Expression\Assignment\InstancePropertyAssignmentAnalyzer;
+use Psalm\Internal\Analyzer\Statements\Expression\Call\Method\NativeClassTaintAnalyzer;
+use Psalm\Internal\Analyzer\Statements\Expression\Fetch\ConstFetchAnalyzer;
+use Psalm\Internal\Analyzer\Statements\Expression\Fetch\VariableFetchAnalyzer;
+use Psalm\Internal\Analyzer\StatementsAnalyzer;
+use Psalm\Internal\Codebase\Analyzer;
+use Psalm\Internal\Codebase\ClassLikes;
+use Psalm\Internal\Codebase\CodeUseGraph;
+use Psalm\Internal\Codebase\Functions;
+use Psalm\Internal\Codebase\InternalCallMapHandler;
+use Psalm\Internal\Codebase\Methods;
+use Psalm\Internal\Codebase\Populator;
+use Psalm\Internal\Codebase\Properties;
+use Psalm\Internal\Codebase\Reflection;
+use Psalm\Internal\Codebase\Scanner;
+use Psalm\Internal\Codebase\TaintFlowGraph;
+use Psalm\Internal\Codebase\TaintStore;
+use Psalm\Internal\DataFlow\DataFlowNode;
+use Psalm\Internal\LanguageServer\PHPMarkdownContent;
+use Psalm\Internal\LanguageServer\Reference;
+use Psalm\Internal\MethodIdentifier;
+use Psalm\Internal\Provider\ClassLikeStorageProvider;
+use Psalm\Internal\Provider\FileProvider;
+use Psalm\Internal\Provider\FileReferenceProvider;
+use Psalm\Internal\Provider\FileStorageProvider;
+use Psalm\Internal\Provider\Providers;
+use Psalm\Internal\Provider\StatementsProvider;
+use Psalm\Internal\Scanner\UnresolvedConstantComponent;
+use Psalm\Internal\Type\Comparator\UnionTypeComparator;
+use Psalm\Internal\TypeVisitor\TypeScanner;
+use Psalm\Issue\CodeIssue;
+use Psalm\Issue\InvalidDocblock;
+use Psalm\Progress\Progress;
+use Psalm\Progress\VoidProgress;
+use Psalm\StatementsSource;
+use Psalm\Storage\ClassLikeStorage;
+use Psalm\Storage\FileStorage;
+use Psalm\Storage\FunctionLikeParameter;
+use Psalm\Storage\FunctionLikeStorage;
+use Psalm\Storage\FunctionStorage;
+use Psalm\Storage\MethodStorage;
+use Psalm\Type\Atomic;
+use Psalm\Type\Atomic\TBool;
+use Psalm\Type\Atomic\TClassConstant;
+use Psalm\Type\Atomic\TIntRange;
+use Psalm\Type\Atomic\TKeyedArray;
+use Psalm\Type\Atomic\TLiteralInt;
+use Psalm\Type\Atomic\TLiteralString;
+use Psalm\Type\Atomic\TNamedObject;
+use Psalm\Type\TaintKind;
+use Psalm\Type\Union;
+use ReflectionProperty;
+use ReflectionType;
+use RuntimeException;
+use UnexpectedValueException;
+
+use function array_combine;
+use function array_diff_key;
+use function array_key_exists;
+use function array_pop;
+use function array_reverse;
+use function array_values;
+use function count;
+use function error_log;
+use function explode;
+use function implode;
+use function in_array;
+use function intdiv;
+use function is_numeric;
+use function is_string;
+use function krsort;
+use function ksort;
+use function ltrim;
+use function min;
+use function preg_match;
+use function preg_replace;
+use function str_contains;
+use function str_ends_with;
+use function str_replace;
+use function str_starts_with;
+use function strlen;
+use function strpos;
+use function strrpos;
+use function strtolower;
+use function substr;
+use function substr_count;
+
+use const PHP_INT_SIZE;
+use const PHP_VERSION_ID;
+
+/**
+ * @api
+ */
+final class Codebase
+{
+    /**
+     * A map of fully-qualified use declarations to the files
+     * that reference them (keyed by filename).
+     *
+     * Separated from the CodeUseGraph because a use import does not
+     * automatically mean a class is actually used.
+     *
+     * @var array<lowercase-string, array<int, CodeLocation>>
+     */
+    public array $use_referencing_locations = [];
+
+    public FileStorageProvider $file_storage_provider;
+
+    public ClassLikeStorageProvider $classlike_storage_provider;
+
+    public bool $collect_references = false;
+
+    public bool $collect_locations = false;
+
+    /**
+     * @var null|'always'|'auto'
+     */
+    public ?string $find_unused_code = null;
+
+    public FileProvider $file_provider;
+
+    public FileReferenceProvider $file_reference_provider;
+
+    public StatementsProvider $statements_provider;
+
+    public readonly Progress $progress;
+
+    /**
+     * @var array<string, Union>
+     */
+    private static array $stubbed_constants = [];
+
+    /**
+     * @var array<string, UnresolvedConstantComponent>
+     */
+    private static array $unresolved_stubbed_constants = [];
+
+    /**
+     * Whether to register autoloaded information
+     */
+    public bool $register_autoload_files = false;
+
+    /**
+     * Whether to log functions just at the file level or globally (for stubs)
+     */
+    public bool $register_stub_files = false;
+
+    public bool $all_functions_global = false;
+
+    public bool $all_constants_global = false;
+
+    public bool $find_unused_variables = false;
+
+    public Scanner $scanner;
+
+    public Analyzer $analyzer;
+
+    public Functions $functions;
+
+    public ClassLikes $classlikes;
+
+    public Methods $methods;
+
+    public Properties $properties;
+
+    public Populator $populator;
+
+    public CodeUseGraph $code_use_graph;
+
+    public ?TaintFlowGraph $taint_flow_graph = null;
+
+    /**
+     * The `new` of each class (lowercase) in the classes scanned: the class making it and the starts of its arguments,
+     * built once they all are (see StringStartScanner)
+     *
+     * @internal
+     * @var array<string, list<array{string, string}>>|null
+     */
+    public ?array $constructor_argument_starts = null;
+
+    /**
+     * The types of the global constants matching each wildcard expanded since the files were last scanned, by name
+     * (see ConstFetchAnalyzer::getGlobalConstTypesByWildcard())
+     *
+     * @internal
+     * @var array<string, array<string, Union>>
+     */
+    public array $global_constant_types_by_wildcard = [];
+
+    public bool $server_mode = false;
+
+    public bool $store_node_types = false;
+
+    /**
+     * Whether or not to infer types from usage. Computationally expensive, so turned off by default
+     */
+    public bool $infer_types_from_usage = false;
+
+    public bool $alter_code = false;
+
+    /**
+     * The issue types Psalter was asked to fix (see shouldFixIssue())
+     *
+     * @internal
+     * @var array<string, bool>
+     */
+    public array $issues_to_fix = [];
+
+    public bool $diff_methods = false;
+
+    /** whether or not we only checked a part of the codebase */
+    public bool $diff_run = false;
+
+    public bool $language_server = false;
+
+    /**
+     * @var array<lowercase-string, string>
+     */
+    public array $methods_to_move = [];
+
+    /**
+     * @var array<lowercase-string, string>
+     */
+    public array $methods_to_rename = [];
+
+    /**
+     * @var array<string, string>
+     */
+    public array $properties_to_move = [];
+
+    /**
+     * @var array<string, string>
+     */
+    public array $properties_to_rename = [];
+
+    /**
+     * @var array<string, string>
+     */
+    public array $class_constants_to_move = [];
+
+    /**
+     * @var array<string, string>
+     */
+    public array $class_constants_to_rename = [];
+
+    /**
+     * @var array<lowercase-string, string>
+     */
+    public array $classes_to_move = [];
+
+    /**
+     * @var array<lowercase-string, string>
+     */
+    public array $call_transforms = [];
+
+    /**
+     * @var array<string, string>
+     */
+    public array $property_transforms = [];
+
+    /**
+     * @var array<string, string>
+     */
+    public array $class_constant_transforms = [];
+
+    /**
+     * @var array<lowercase-string, string>
+     */
+    public array $class_transforms = [];
+
+    public bool $allow_backwards_incompatible_changes = true;
+
+    public int $analysis_php_version_id = PHP_VERSION_ID;
+
+    /** @var 'cli'|'config'|'composer'|'tests'|'runtime' */
+    public string $php_version_source = 'runtime';
+
+    public bool $track_unused_suppressions = false;
+
+    public bool $literal_array_key_check = false;
+
+    /** @internal */
+    public int $taint_count = TaintKind::BUILTIN_TAINT_COUNT;
+
+    /**
+     * @var array<string, int>
+     */
+    private array $taint_map = TaintKind::TAINT_NAMES;
+
+    /**
+     * @internal
+     * @var array<int, string>
+     */
+    public array $custom_taints = [];
+
+    /**
+     * Set (only) while scanning inside a forked worker process: the channel back to the parent, used to
+     * register new custom taints in the parent's single authoritative registry so all workers agree on the
+     * bit assigned to a given taint name. Null in the parent and when scanning single-threaded.
+     *
+     * @var Channel<array{id: int|null, count: int}, string>|null
+     */
+    private ?Channel $taint_registration_channel = null;
+
+    /** @internal */
+    public function __construct(
+        public Config $config,
+        Providers $providers,
+        ?Progress $progress = null,
+    ) {
+        if ($progress === null) {
+            $progress = new VoidProgress();
+        }
+        $this->file_storage_provider = $providers->file_storage_provider;
+        $this->classlike_storage_provider = $providers->classlike_storage_provider;
+        $this->progress = $progress;
+        $this->file_provider = $providers->file_provider;
+        $this->file_reference_provider = $providers->file_reference_provider;
+        $this->statements_provider = $providers->statements_provider;
+        $this->code_use_graph = $providers->file_reference_provider->code_use_graph;
+
+        self::$stubbed_constants = [];
+        self::$unresolved_stubbed_constants = [];
+
+        $reflection = new Reflection($providers->classlike_storage_provider, $this);
+
+        $this->scanner = new Scanner(
+            $this,
+            $config,
+            $providers->file_storage_provider,
+            $providers->file_provider,
+            $reflection,
+            $providers->file_reference_provider,
+            $progress,
+        );
+
+        $this->loadAnalyzer();
+
+        $this->functions = new Functions($providers->file_storage_provider, $reflection);
+
+        $this->classlikes = new ClassLikes(
+            $this->config,
+            $providers->classlike_storage_provider,
+            $providers->file_reference_provider,
+            $this->scanner,
+        );
+
+        $this->properties = new Properties(
+            $providers->classlike_storage_provider,
+            $this->classlikes,
+        );
+
+        $this->methods = new Methods(
+            $providers->classlike_storage_provider,
+            $providers->file_reference_provider,
+            $this->classlikes,
+        );
+
+        $this->populator = new Populator(
+            $providers->classlike_storage_provider,
+            $providers->file_storage_provider,
+            $this->classlikes,
+            $providers->file_reference_provider,
+            $progress,
+        );
+
+        $this->loadAnalyzer();
+    }
+
+    /**
+     * Records a reference to a class from the code described by $context
+     * (or the top-level code of the file of $location).
+     *
+     * @param lowercase-string $fq_class_name_lc
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public function addReferenceToClass(
+        string $fq_class_name_lc,
+        ?CodeLocation $location = null,
+        ?Context $context = null,
+        ?string $file_path = null,
+    ): void {
+        $this->code_use_graph->addReference(
+            CodeUseGraph::classNode($fq_class_name_lc),
+            $context,
+            $location,
+            CodeUseGraph::EDGE_USE,
+            $file_path,
+        );
+    }
+
+    /**
+     * Records a reference to a property. Only reads make the property used,
+     * but writes are still recorded for reference lookups and cache invalidation.
+     *
+     * @param lowercase-string $fq_class_name_lc
+     * @param string $property_name without the leading `$`
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public function addReferenceToProperty(
+        string $fq_class_name_lc,
+        string $property_name,
+        bool $reading,
+        ?CodeLocation $location = null,
+        ?Context $context = null,
+        ?string $file_path = null,
+    ): void {
+        $this->code_use_graph->addReference(
+            CodeUseGraph::propertyNode($fq_class_name_lc, $property_name),
+            $context,
+            $location,
+            $reading ? CodeUseGraph::EDGE_USE : CodeUseGraph::EDGE_WRITE,
+            $file_path,
+        );
+
+        if (!$reading) {
+            // writing to a property of a class still uses the class
+            $this->code_use_graph->addReference(
+                CodeUseGraph::classNode($fq_class_name_lc),
+                $context,
+                $location,
+            );
+        }
+    }
+
+    /**
+     * Records a reference to a function or method, optionally marking its
+     * return value as used too.
+     *
+     * @param lowercase-string $function_id
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public function addReferenceToFunctionLike(
+        string $function_id,
+        ?CodeLocation $location = null,
+        ?Context $context = null,
+        bool $is_return_value_used = false,
+        ?string $file_path = null,
+    ): void {
+        $function_node = CodeUseGraph::functionLikeNode($function_id);
+
+        if ($is_return_value_used) {
+            $return_node = CodeUseGraph::functionLikeReturnNode($function_id);
+            // using the return value implies calling the function
+            $this->code_use_graph->addEdge($return_node, $function_node, CodeUseGraph::EDGE_RETURN);
+            $this->code_use_graph->addReference(
+                $return_node,
+                $context,
+                $location,
+                CodeUseGraph::EDGE_USE,
+                $file_path,
+            );
+        } else {
+            $this->code_use_graph->addReference(
+                $function_node,
+                $context,
+                $location,
+                CodeUseGraph::EDGE_USE,
+                $file_path,
+            );
+        }
+    }
+
+    /**
+     * Records a reference to a method that does not exist (yet), so that the
+     * referencing code is re-analysed if the method gets added.
+     *
+     * @param lowercase-string $method_id
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public function addReferenceToMissingMethod(
+        string $method_id,
+        ?CodeLocation $location = null,
+        ?Context $context = null,
+        ?string $file_path = null,
+    ): void {
+        $this->code_use_graph->addReference(
+            CodeUseGraph::missingMethodNode($method_id),
+            $context,
+            $location,
+            CodeUseGraph::EDGE_USE,
+            $file_path,
+        );
+    }
+
+    /**
+     * Records a reference to a property that does not exist (yet), so that the
+     * referencing code is re-analysed if the property gets added.
+     *
+     * @param lowercase-string $fq_class_name_lc
+     * @param string $property_name without the leading `$`
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public function addReferenceToMissingProperty(
+        string $fq_class_name_lc,
+        string $property_name,
+        ?CodeLocation $location = null,
+        ?Context $context = null,
+        ?string $file_path = null,
+    ): void {
+        $this->code_use_graph->addReference(
+            CodeUseGraph::missingPropertyNode($fq_class_name_lc, $property_name),
+            $context,
+            $location,
+            CodeUseGraph::EDGE_USE,
+            $file_path,
+        );
+    }
+
+    /**
+     * @param lowercase-string $fq_class_name_lc
+     * @param string $const_name case-sensitive constant name
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public function addReferenceToClassConstant(
+        string $fq_class_name_lc,
+        string $const_name,
+        ?CodeLocation $location = null,
+        ?Context $context = null,
+        ?string $file_path = null,
+    ): void {
+        $this->code_use_graph->addReference(
+            CodeUseGraph::classConstantNode($fq_class_name_lc, $const_name),
+            $context,
+            $location,
+            CodeUseGraph::EDGE_USE,
+            $file_path,
+        );
+    }
+
+    /**
+     * Records that the code described by $context resolves a class name
+     * through a `use` import alias of the given file, so that it gets
+     * re-analysed when the import changes.
+     *
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public function addReferenceToUseAlias(
+        string $alias,
+        string $file_path,
+        ?Context $context = null,
+    ): void {
+        $this->code_use_graph->addReference(
+            CodeUseGraph::useAliasNode($alias, $file_path),
+            $context,
+        );
+    }
+
+    /**
+     * Used to register a taint, or to fetch the ID of an already registered taint by its alias.
+     *
+     * A complement, `~(kind|kind)` or `~kind`, is every taint but the kinds listed, including the custom taints and
+     * those not registered yet.
+     *
+     * Returns null and emits an issue if a code location is passed and there are no more taint slots.
+     *
+     * @throws RuntimeException if no code location is passed and there are no more taint slots.
+     * @return ($location is null ? int : int|null)
+     */
+    public function getOrRegisterTaint(string $taint_type, ?CodeLocation $location = null): ?int
+    {
+        if (isset($this->taint_map[$taint_type])) {
+            return $this->taint_map[$taint_type];
+        }
+
+        if (str_starts_with($taint_type, '~')) {
+            return $this->getTaintComplement($taint_type, $location);
+        }
+
+        // When scanning runs in forked worker processes, register new taints in the parent's single
+        // authoritative registry so that every worker resolves a given taint name to the same bit. Workers
+        // assign bits from independent counters, so without this two brand-new taints first seen by
+        // different workers could be given the same bit -- or one taint two different bits -- silently
+        // corrupting the merged storage and the taint findings built from it.
+        if ($this->taint_registration_channel !== null) {
+            return $this->registerTaintViaParent($this->taint_registration_channel, $taint_type, $location);
+        }
+
+        if ($this->taint_count+1 === (PHP_INT_SIZE * 8)) {
+            return $this->reportTaintSlotsExhausted($location);
+        }
+        if ($taint_type[0] === '(') {
+            return $this->reportTaintRegistrationError('Conditional taints cannot be used in this context', $location);
+        }
+        $id = 1 << ($this->taint_count++);
+        $this->custom_taints[$id] = $taint_type;
+        $this->taint_map[$taint_type] = $id;
+        return $id;
+    }
+
+    /**
+     * Set (or clear) the channel used to register taints in the parent process while scanning inside a
+     * forked worker. See {@see self::$taint_registration_channel}.
+     *
+     * @param Channel<array{id: int|null, count: int}, string>|null $channel
+     * @internal
+     * @psalm-external-mutation-free
+     */
+    public function setTaintRegistrationChannel(?Channel $channel): void
+    {
+        $this->taint_registration_channel = $channel;
+    }
+
+    /**
+     * Handle a taint-registration request coming from a forked scanning worker (see {@see
+     * self::registerTaintViaParent()}): register the taint in this parent process's single registry and
+     * return the assigned bit together with the resulting taint count so the worker can mirror it locally.
+     * `id` is null when no taint slots remain.
+     *
+     * @return array{id: int|null, count: int}
+     * @internal
+     */
+    public function registerTaintFromWorker(string $taint_type): array
+    {
+        try {
+            $id = $this->getOrRegisterTaint($taint_type);
+        } catch (RuntimeException) {
+            // No taint slots left (getOrRegisterTaint throws when no location is available); the worker
+            // re-emits the diagnostic against the offending code location.
+            $id = null;
+        }
+
+        return ['id' => $id, 'count' => $this->taint_count];
+    }
+
+    /**
+     * @param Channel<array{id: int|null, count: int}, string> $channel
+     */
+    private function registerTaintViaParent(Channel $channel, string $taint_type, ?CodeLocation $location): ?int
+    {
+        if ($taint_type[0] === '(') {
+            return $this->reportTaintRegistrationError('Conditional taints cannot be used in this context', $location);
+        }
+
+        $channel->send($taint_type);
+        $response = $channel->receive();
+        $this->taint_count = $response['count'];
+
+        if ($response['id'] === null) {
+            return $this->reportTaintSlotsExhausted($location);
+        }
+
+        $this->taint_map[$taint_type] = $response['id'];
+        $this->custom_taints[$response['id']] = $taint_type;
+
+        return $response['id'];
+    }
+
+    private function reportTaintSlotsExhausted(?CodeLocation $location): ?int
+    {
+        $taints = implode(',', $this->custom_taints);
+        $err = "No more taint slots left (using $taints), ";
+        if (PHP_INT_SIZE === 8) {
+            $err .= 'please use fewer custom taints and use some of the built-in taints!';
+        } else {
+            $err .= 'please switch to a 64-bit build of PHP to get 32 more taint slots,'.
+                ' or use fewer custom taints and use some of the built-in taints!';
+        }
+
+        return $this->reportTaintRegistrationError($err, $location);
+    }
+
+    /**
+     * Every taint but the kinds listed by the complement $taint_type (see getOrRegisterTaint())
+     */
+    private function getTaintComplement(string $taint_type, ?CodeLocation $location): ?int
+    {
+        $kinds = substr($taint_type, 1);
+
+        if (str_starts_with($kinds, '(') && str_ends_with($kinds, ')')) {
+            $kinds = substr($kinds, 1, -1);
+        }
+
+        $excluded_taints = 0;
+
+        foreach (explode('|', $kinds) as $kind) {
+            // a complement lists taints, not other complements or conditional taints
+            if ($kind === '' || $kind[0] === '~' || $kind[0] === '(' || str_contains($kind, ')')) {
+                return $this->reportTaintRegistrationError('Invalid taint complement ' . $taint_type, $location);
+            }
+
+            $taint = $this->getOrRegisterTaint($kind, $location);
+
+            if ($taint === null) {
+                return null;
+            }
+
+            $excluded_taints |= $taint;
+        }
+
+        return TaintKind::ALL & ~$excluded_taints;
+    }
+
+    private function reportTaintRegistrationError(string $err, ?CodeLocation $location): ?int
+    {
+        if ($location !== null) {
+            IssueBuffer::maybeAdd(new InvalidDocblock($err, $location));
+            return null;
+        }
+
+        throw new RuntimeException($err);
+    }
+
+    /**
+     * Registers the custom taints psalm.xml declares (`<taintAnalysis><taints>`), and adds each to the aliases of
+     * built-in taints it names. Called before scanning, once the taints of a previous run are restored (see
+     * importCustomTaints()).
+     *
+     * @internal
+     */
+    public function registerConfigTaints(): void
+    {
+        foreach ($this->config->custom_taints as $taint_type => $aliases) {
+            $taint = $this->getOrRegisterTaint($taint_type);
+
+            foreach ($aliases as $alias) {
+                $this->taint_map[$alias] = ($this->taint_map[$alias] ?? 0) | $taint;
+            }
+        }
+    }
+
+    /**
+     * The taints of user input, those of `input`: the built-in kinds (TaintKind::ALL_INPUT), and the custom taints
+     * psalm.xml adds to it. The built-in sources of user input give them, and the types that can't hold user input
+     * remove them (see Union::getTaintsToRemove()).
+     *
+     * @psalm-mutation-free
+     */
+    public function getInputTaints(): int
+    {
+        // the built-in aliases are always registered, this is for Psalm
+        return $this->taint_map['input'] ?? TaintKind::ALL_INPUT;
+    }
+
+    /**
+     * The path along which the taints of the object a method of a builtin class is called on flow into what the
+     * method returns, as taint analysis follows a call of it: `=` for all of it (ArrayObject::getArrayCopy()),
+     * `arrayvalue-fetch` for its elements (ArrayIterator::current(), Generator::current() and Generator::send(), what
+     * the generator yields), `arraykey-fetch` for its keys (ArrayIterator::key(), Generator::key()), `return` for what
+     * a generator returns (Generator::getReturn()). A method of a class extending a builtin class follows the closest
+     * class having such a path for it. Null if the method gives back none of what its object holds: then only its
+     * body or its `@psalm-flow` annotations can return it.
+     *
+     * @param array<int, Union> $arg_types the types of the arguments of the call, by offset: when the method takes the
+     *   key of the element it returns, like ArrayObject::offsetGet(), a literal key restricts the path to that element
+     *   (`arrayvalue-fetch-'key'`), as with `$array['key']`
+     * @return ?non-empty-string
+     */
+    public function getReceiverTaintPath(string|MethodIdentifier $method_id, array $arg_types = []): ?string
+    {
+        return NativeClassTaintAnalyzer::getReturnPath($this, MethodIdentifier::wrap($method_id), $arg_types);
+    }
+
+    /**
+     * Register an alias taint name based on one or more pre-existing taints.
+     *
+     * @throws AssertionError if the passed taint is already registered or if the alias uses some unregistered taints.
+     * @psalm-external-mutation-free
+     */
+    public function registerTaintAlias(string $taint_type, int $alias): int
+    {
+        if (isset($this->taint_map[$taint_type])) {
+            throw new AssertionError("A taint called $taint_type is already registered!");
+        }
+
+        if ($this->taint_count+1 !== (PHP_INT_SIZE * 8)) {
+            $mask = (1 << $this->taint_count) - 1;
+            if ($alias & ~$mask) {
+                throw new AssertionError("The passed alias $alias uses some not yet registered taint slots!");
+            }
+        }
+
+        $this->taint_map[$taint_type] = $alias;
+
+        return $alias;
+    }
+
+    /**
+     * Export the custom (non-builtin) taints registered so far, so they can be persisted across runs.
+     *
+     * Custom taint bits are assigned lazily, in the order taints are first encountered while scanning
+     * docblocks/plugins. Those bits are baked into the cached file/classlike storage. When a subsequent
+     * run reuses that cache, the defining docblocks are not re-parsed, so without restoring this mapping
+     * the same taint name would be assigned a different bit (or none at all), silently breaking the
+     * matching of cached sinks and sources. See {@see self::importCustomTaints()}.
+     *
+     * @return array{count: int, custom: array<int, string>, map: array<string, int>}
+     * @internal
+     * @psalm-mutation-free
+     */
+    public function exportCustomTaints(): array
+    {
+        return [
+            'count' => $this->taint_count,
+            'custom' => $this->custom_taints,
+            'map' => array_diff_key($this->taint_map, TaintKind::TAINT_NAMES),
+        ];
+    }
+
+    /**
+     * Restore the custom taint mapping persisted by a previous run (see {@see self::exportCustomTaints()}),
+     * so that taint bits baked into cached storage keep pointing at the same taint names.
+     *
+     * Must be called before any custom taint is registered in this run (i.e. before scanning), so it is a
+     * no-op if anything custom has already been registered.
+     *
+     * @param array{count: int, custom: array<int, string>, map: array<string, int>} $data
+     * @internal
+     * @psalm-external-mutation-free
+     */
+    public function importCustomTaints(array $data): void
+    {
+        if ($this->custom_taints !== []) {
+            return;
+        }
+
+        $this->taint_count = $data['count'];
+        $this->custom_taints = $data['custom'];
+        // Keep the builtin taints (and any already-registered alias) and add the persisted ones on top.
+        $this->taint_map += $data['map'];
+    }
+
+    /**
+     * @psalm-external-mutation-free
+     */
+    private function loadAnalyzer(): void
+    {
+        $this->analyzer = new Analyzer(
+            $this->config,
+            $this->file_provider,
+            $this->file_storage_provider,
+            $this->progress,
+        );
+    }
+
+    /**
+     * @param array<string> $candidate_files
+     */
+    public function reloadFiles(ProjectAnalyzer $project_analyzer, array $candidate_files, bool $force = false): void
+    {
+        $this->loadAnalyzer();
+
+        if ($force) {
+            FileReferenceProvider::clearCache();
+        }
+
+        $this->file_reference_provider->loadReferenceCache(false);
+
+        FunctionLikeAnalyzer::clearCache();
+        $project_analyzer->clearStatementsForMutations();
+
+        if ($force || !$this->statements_provider->parser_cache_provider) {
+            $diff_files = $candidate_files;
+        } else {
+            $diff_files = [];
+
+            $parser_cache_provider = $this->statements_provider->parser_cache_provider;
+
+            foreach ($candidate_files as $candidate_file_path) {
+                if ($parser_cache_provider->hasChanged(
+                    $candidate_file_path,
+                    $this->file_provider->getContents($candidate_file_path),
+                )) {
+                    $diff_files[] = $candidate_file_path;
+                }
+            }
+        }
+
+        $referenced_files = $project_analyzer->getReferencedFilesFromDiff($diff_files, false);
+
+        foreach ($diff_files as $diff_file_path) {
+            $this->invalidateInformationForFile($diff_file_path);
+        }
+
+        foreach ($referenced_files as $referenced_file_path) {
+            if (in_array($referenced_file_path, $diff_files, true)) {
+                continue;
+            }
+
+            $file_storage = $this->file_storage_provider->get($referenced_file_path);
+
+            foreach ($file_storage->classlikes_in_file as $fq_classlike_name) {
+                $this->classlike_storage_provider->remove($fq_classlike_name);
+                $this->classlikes->removeClassLike($fq_classlike_name);
+            }
+
+            $this->file_storage_provider->remove($referenced_file_path);
+            $this->scanner->removeFile($referenced_file_path);
+        }
+
+        $referenced_files = array_combine($referenced_files, $referenced_files);
+
+        $this->scanner->addFilesToDeepScan($referenced_files);
+        $this->addFilesToAnalyze(array_combine($candidate_files, $candidate_files));
+
+        $this->scanner->scanFiles($this->classlikes);
+
+        $this->file_reference_provider->updateReferenceCache($this, $referenced_files);
+
+        // the classes scanned again may make other `new`
+        $this->constructor_argument_starts = null;
+        $this->populator->populateCodebase();
+        // the files scanned again may declare other constants
+        $this->global_constant_types_by_wildcard = [];
+    }
+
+    /**
+     * @psalm-external-mutation-free
+     */
+    public function enterServerMode(): void
+    {
+        $this->server_mode = true;
+        $this->store_node_types = true;
+    }
+
+    public function collectLocations(): void
+    {
+        $this->collect_locations = true;
+        $this->code_use_graph->collect_locations = true;
+    }
+
+    /**
+     * @param 'always'|'auto' $find_unused_code
+     * @psalm-external-mutation-free
+     */
+    public function reportUnusedCode(string $find_unused_code = 'auto'): void
+    {
+        $this->collect_references = true;
+        $this->find_unused_code = $find_unused_code;
+        $this->find_unused_variables = true;
+    }
+
+    /**
+     * @psalm-external-mutation-free
+     */
+    public function reportUnusedVariables(): void
+    {
+        $this->collect_references = true;
+        $this->find_unused_variables = true;
+    }
+
+    /**
+     * Whether Psalter was asked to fix $issue (`--issues=...`, `all` included) and neither $suppressed_issues nor the
+     * config's issue handlers suppress it: a plugin that declares its type with PluginFixableIssuesInterface adds its
+     * file replacements for it only then.
+     *
+     * @api
+     * @param array<array-key, string> $suppressed_issues
+     */
+    public function shouldFixIssue(CodeIssue $issue, array $suppressed_issues): bool
+    {
+        $issue_type = $issue::getIssueType();
+
+        return $this->alter_code
+            && isset($this->issues_to_fix[$issue_type])
+            && !$this->config->suppressesIssueType($suppressed_issues, $issue_type)
+            && $this->config->getReportingLevelForIssue($issue) !== Config::REPORT_SUPPRESS;
+    }
+
+    /**
+     * @param array<string, string> $files_to_analyze
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public function addFilesToAnalyze(array $files_to_analyze): void
+    {
+        $this->scanner->addFilesToDeepScan($files_to_analyze);
+        $this->analyzer->addFilesToAnalyze($files_to_analyze);
+    }
+
+    /**
+     * Scans all files their related files
+     */
+    public function scanFiles(int $threads = 1): void
+    {
+        // the classes of the global variables of the config are named nowhere else
+        foreach ($this->config->globals as $global_type) {
+            (new TypeScanner($this->scanner, null, []))->traverseArray(
+                Type::parseString($global_type)->getAtomicTypes(),
+            );
+        }
+
+        $has_changes = $this->scanner->scanFiles($this->classlikes, $threads);
+
+        // a taint analysis analyzes the bodies of inherited methods again, for the classes inheriting them (see
+        // InheritedMethodTaints): in a partial run, their files are deep-scanned too
+        while ($this->taint_flow_graph !== null && $this->scanner->queueFilesOfInheritedMethods()) {
+            if ($this->scanner->scanFiles($this->classlikes, $threads)) {
+                $has_changes = true;
+            }
+        }
+
+        if ($has_changes) {
+            // the classes scanned again may make other `new`
+            $this->constructor_argument_starts = null;
+            $this->populator->populateCodebase();
+            // the files scanned again may declare other constants
+            $this->global_constant_types_by_wildcard = [];
+        }
+    }
+
+    /**
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public function getFileContents(string $file_path): string
+    {
+        return $this->file_provider->getContents($file_path);
+    }
+
+    /**
+     * @return list<PhpParser\Node\Stmt>
+     */
+    public function getStatementsForFile(string $file_path, ?Progress $progress = null): array
+    {
+        return $this->statements_provider->getStatementsForFile(
+            $file_path,
+            $this->analysis_php_version_id,
+            $this->diff_methods || $this->diff_run || $this->language_server,
+            $progress ?? $this->progress,
+        );
+    }
+
+    /**
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public function createClassLikeStorage(string $fq_classlike_name): ClassLikeStorage
+    {
+        return $this->classlike_storage_provider->create($fq_classlike_name);
+    }
+
+    public function cacheClassLikeStorage(ClassLikeStorage $classlike_storage, string $file_path): void
+    {
+        if (!$this->classlike_storage_provider->cache) {
+            return;
+        }
+
+        $file_contents = $this->file_provider->getContents($file_path);
+        $this->classlike_storage_provider->cache->writeToCache($classlike_storage, $file_path, $file_contents);
+    }
+
+    public function exhumeClassLikeStorage(string $fq_classlike_name, string $file_path): void
+    {
+        $this->tryExhumeClassLikeStorage($fq_classlike_name, $file_path);
+    }
+
+    /**
+     * @internal
+     * @return bool false if the cache has no storage for the class-like in the file
+     */
+    public function tryExhumeClassLikeStorage(string $fq_classlike_name, string $file_path): bool
+    {
+        $file_contents = $this->file_provider->getContents($file_path);
+        $storage = $this->classlike_storage_provider->exhume(
+            $fq_classlike_name,
+            $file_path,
+            $file_contents,
+        );
+
+        if ($storage === null) {
+            return false;
+        }
+
+        if ($storage->is_trait) {
+            $this->classlikes->addFullyQualifiedTraitName($storage->name, $file_path);
+        } elseif ($storage->is_interface) {
+            $this->classlikes->addFullyQualifiedInterfaceName($storage->name, $file_path);
+        } elseif ($storage->is_enum) {
+            $this->classlikes->addFullyQualifiedEnumName($storage->name, $file_path);
+        } else {
+            $this->classlikes->addFullyQualifiedClassName($storage->name, $file_path);
+        }
+
+        return true;
+    }
+
+    public static function getPsalmTypeFromReflection(?ReflectionType $type): Union
+    {
+        return Reflection::getPsalmTypeFromReflectionType($type);
+    }
+
+    /**
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public function createFileStorageForPath(string $file_path): FileStorage
+    {
+        return $this->file_storage_provider->create($file_path);
+    }
+
+    /**
+     * @return array<string, CodeLocation>
+     * @psalm-mutation-free
+     */
+    public function findReferencesToSymbol(string $symbol): array
+    {
+        if (!$this->collect_locations) {
+            throw new UnexpectedValueException('Should not be checking references');
+        }
+
+        if (str_contains($symbol, '::$')) {
+            return $this->findReferencesToProperty($symbol);
+        }
+
+        if (str_contains($symbol, '::')) {
+            return $this->findReferencesToMethod($symbol)
+                + $this->findReferencesToClassConstant($symbol);
+        }
+
+        return $this->findReferencesToClassLike($symbol);
+    }
+
+    /**
+     * @return array<string, CodeLocation>
+     * @psalm-mutation-free
+     */
+    public function findReferencesToMethod(string $method_id): array
+    {
+        return $this->code_use_graph->getReferenceLocations(
+            CodeUseGraph::functionLikeNode(strtolower($method_id)),
+        );
+    }
+
+    /**
+     * @return array<string, CodeLocation>
+     * @psalm-mutation-free
+     */
+    public function findReferencesToProperty(string $property_id): array
+    {
+        /** @psalm-suppress PossiblyUndefinedIntArrayOffset */
+        [$fq_class_name, $property_name] = explode('::', $property_id);
+
+        return $this->code_use_graph->getReferenceLocations(
+            CodeUseGraph::propertyNode(strtolower($fq_class_name), ltrim($property_name, '$')),
+        );
+    }
+
+    /**
+     * @return CodeLocation[]
+     * @psalm-return array<string, CodeLocation>
+     * @psalm-mutation-free
+     */
+    public function findReferencesToClassLike(string $fq_class_name): array
+    {
+        $fq_class_name_lc = strtolower($fq_class_name);
+        $refs = $this->code_use_graph->getReferenceLocations(
+            CodeUseGraph::classNode($fq_class_name_lc),
+        );
+
+        foreach ($this->use_referencing_locations[$fq_class_name_lc] ?? [] as $location) {
+            $refs[$location->getHash()] = $location;
+        }
+
+        return $refs;
+    }
+
+    /**
+     * @return array<string, CodeLocation>
+     * @psalm-mutation-free
+     */
+    public function findReferencesToClassConstant(string $const_id): array
+    {
+        /** @psalm-suppress PossiblyUndefinedIntArrayOffset */
+        [$fq_class_name, $const_name] = explode('::', $const_id);
+
+        return $this->code_use_graph->getReferenceLocations(
+            CodeUseGraph::classConstantNode(strtolower($fq_class_name), $const_name),
+        );
+    }
+
+    /**
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public function getClosureStorage(string $file_path, string $closure_id): FunctionStorage
+    {
+        $file_storage = $this->file_storage_provider->get($file_path);
+
+        // closures can be returned here
+        if (isset($file_storage->functions[$closure_id])) {
+            return $file_storage->functions[$closure_id];
+        }
+
+        throw new UnexpectedValueException(
+            'Expecting ' . $closure_id . ' to have storage in ' . $file_path,
+        );
+    }
+
+    /**
+     * @psalm-external-mutation-free
+     */
+    public function addGlobalConstantType(string $const_id, Union $type): void
+    {
+        self::$stubbed_constants[$const_id] = $type;
+    }
+
+    /**
+     * @psalm-external-mutation-free
+     */
+    public function getStubbedConstantType(string $const_id): ?Union
+    {
+        return self::$stubbed_constants[$const_id] ?? null;
+    }
+
+    /**
+     * @param array<string, Union> $stubs
+     * @psalm-external-mutation-free
+     */
+    public function addGlobalConstantTypes(array $stubs): void
+    {
+        self::$stubbed_constants += $stubs;
+    }
+
+    /**
+     * @return array<string, Union>
+     * @psalm-external-mutation-free
+     */
+    public function getAllStubbedConstants(): array
+    {
+        return self::$stubbed_constants;
+    }
+
+    /**
+     * The value of a global constant whose type depends on classes, e.g. an enum case, resolved when it is fetched
+     *
+     * @psalm-capabilities read-globals|write-globals
+     */
+    public function addUnresolvedGlobalConstant(string $const_id, UnresolvedConstantComponent $value): void
+    {
+        self::$unresolved_stubbed_constants[$const_id] = $value;
+    }
+
+    /**
+     * @psalm-capabilities read-globals
+     */
+    public function getUnresolvedGlobalConstant(string $const_id): ?UnresolvedConstantComponent
+    {
+        return self::$unresolved_stubbed_constants[$const_id] ?? null;
+    }
+
+    /**
+     * @param array<string, UnresolvedConstantComponent> $values
+     * @psalm-capabilities read-globals|write-globals
+     */
+    public function addUnresolvedGlobalConstants(array $values): void
+    {
+        self::$unresolved_stubbed_constants += $values;
+    }
+
+    /**
+     * @return array<string, UnresolvedConstantComponent>
+     * @psalm-capabilities read-globals
+     */
+    public function getAllUnresolvedGlobalConstants(): array
+    {
+        return self::$unresolved_stubbed_constants;
+    }
+
+    public function fileExists(string $file_path): bool
+    {
+        return $this->file_provider->fileExists($file_path);
+    }
+
+    /**
+     * Check whether a class/interface exists
+     *
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public function classOrInterfaceExists(
+        string $fq_class_name,
+        ?CodeLocation $code_location = null,
+        ?Context $context = null,
+    ): bool {
+        return $this->classlikes->classOrInterfaceExists(
+            $fq_class_name,
+            $code_location,
+            $context,
+        );
+    }
+
+    /**
+     * Check whether a class/interface exists
+     *
+     * @psalm-assert-if-true class-string|interface-string|enum-string $fq_class_name
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public function classOrInterfaceOrEnumExists(
+        string $fq_class_name,
+        ?CodeLocation $code_location = null,
+        ?Context $context = null,
+    ): bool {
+        return $this->classlikes->classOrInterfaceOrEnumExists(
+            $fq_class_name,
+            $code_location,
+            $context,
+        );
+    }
+
+    /** @psalm-mutation-free */
+    public function classExtendsOrImplements(string $fq_class_name, string $possible_parent): bool
+    {
+        return $this->classlikes->classExtends($fq_class_name, $possible_parent)
+            || $this->classlikes->classImplements($fq_class_name, $possible_parent);
+    }
+
+    /**
+     * Determine whether or not a given class exists
+     *
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public function classExists(
+        string $fq_class_name,
+        ?CodeLocation $code_location = null,
+        ?Context $context = null,
+    ): bool {
+        return $this->classlikes->classExists(
+            $fq_class_name,
+            $code_location,
+            $context,
+        );
+    }
+
+    /**
+     * Determine whether or not a class extends a parent
+     *
+     * @throws UnpopulatedClasslikeException when called on unpopulated class
+     * @throws InvalidArgumentException when class does not exist
+     * @psalm-mutation-free
+     */
+    public function classExtends(string $fq_class_name, string $possible_parent): bool
+    {
+        return $this->classlikes->classExtends($fq_class_name, $possible_parent, true);
+    }
+
+    /**
+     * Check whether a class implements an interface
+     *
+     * @psalm-mutation-free
+     */
+    public function classImplements(string $fq_class_name, string $interface): bool
+    {
+        return $this->classlikes->classImplements($fq_class_name, $interface);
+    }
+
+    /**
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public function interfaceExists(
+        string $fq_interface_name,
+        ?CodeLocation $code_location = null,
+        ?Context $context = null,
+    ): bool {
+        return $this->classlikes->interfaceExists(
+            $fq_interface_name,
+            $code_location,
+            $context,
+        );
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function interfaceExtends(string $interface_name, string $possible_parent): bool
+    {
+        return $this->classlikes->interfaceExtends($interface_name, $possible_parent);
+    }
+
+    /**
+     * @return array<string, string> all interfaces extended by $interface_name
+     * @psalm-mutation-free
+     */
+    public function getParentInterfaces(string $fq_interface_name): array
+    {
+        return $this->classlikes->getParentInterfaces(
+            $this->classlikes->getUnAliasedName($fq_interface_name),
+        );
+    }
+
+    /**
+     * Determine whether or not a class has the correct casing
+     *
+     * @psalm-mutation-free
+     */
+    public function classHasCorrectCasing(string $fq_class_name): bool
+    {
+        return $this->classlikes->classHasCorrectCasing($fq_class_name);
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function interfaceHasCorrectCasing(string $fq_interface_name): bool
+    {
+        return $this->classlikes->interfaceHasCorrectCasing($fq_interface_name);
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function traitHasCorrectCasing(string $fq_trait_name): bool
+    {
+        return $this->classlikes->traitHasCorrectCasing($fq_trait_name);
+    }
+
+    /**
+     * Given a function id, return the function like storage for
+     * a method, closure, or function.
+     *
+     * @param non-empty-string $function_id
+     * @return FunctionStorage|MethodStorage
+     */
+    public function getFunctionLikeStorage(
+        StatementsAnalyzer $statements_analyzer,
+        string $function_id,
+    ): FunctionLikeStorage {
+        $doesMethodExist =
+            MethodIdentifier::isValidMethodIdReference($function_id)
+            && $this->methodExists($function_id);
+
+        if ($doesMethodExist) {
+            $method_id = MethodIdentifier::wrap($function_id);
+
+            $declaring_method_id = $this->methods->getDeclaringMethodId($method_id);
+
+            if (!$declaring_method_id) {
+                throw new UnexpectedValueException('Declaring method for ' . $method_id . ' cannot be found');
+            }
+
+            return $this->methods->getStorage($declaring_method_id);
+        }
+
+        return $this->functions->getStorage($statements_analyzer, strtolower($function_id));
+    }
+
+    /**
+     * Whether or not a given property exists
+     */
+    public function propertyExists(
+        string $property_id,
+        bool $read_mode,
+        ?StatementsSource $source = null,
+        ?Context $context = null,
+        ?CodeLocation $code_location = null,
+    ): bool {
+        return $this->properties->propertyExists(
+            $this,
+            $property_id,
+            $read_mode,
+            $source,
+            $context,
+            $code_location,
+        );
+    }
+
+    /**
+     * Whether or not a given method exists
+     */
+    public function methodExists(
+        string|MethodIdentifier $method_id,
+        string|MethodIdentifier|null $calling_method_id = null,
+        ?CodeLocation $code_location = null,
+        ?StatementsSource $source = null,
+        ?string $source_file_path = null,
+        bool $use_method_existence_provider = true,
+        bool $is_used = true,
+        bool $with_pseudo = false,
+    ): bool {
+        return $this->methods->methodExists(
+            $this,
+            MethodIdentifier::wrap($method_id),
+            $calling_method_id !== null
+                ? (is_string($calling_method_id)
+                    ? strtolower($calling_method_id)
+                    : strtolower((string) $calling_method_id)
+                )
+                : null,
+            $code_location,
+            $source,
+            $source_file_path,
+            $use_method_existence_provider,
+            $is_used,
+            $with_pseudo,
+        );
+    }
+
+    /**
+     * @return array<int, FunctionLikeParameter>
+     */
+    public function getMethodParams(string|MethodIdentifier $method_id): array
+    {
+        return $this->methods->getMethodParams(MethodIdentifier::wrap($method_id));
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function isVariadic(string|MethodIdentifier $method_id): bool
+    {
+        return $this->methods->isVariadic(MethodIdentifier::wrap($method_id));
+    }
+
+    /**
+     * @param  list<Arg> $call_args
+     */
+    public function getMethodReturnType(
+        string|MethodIdentifier $method_id,
+        ?string &$self_class,
+        array $call_args = [],
+    ): ?Union {
+        return $this->methods->getMethodReturnType(
+            $this,
+            MethodIdentifier::wrap($method_id),
+            $self_class,
+            null,
+            $call_args,
+        );
+    }
+
+    /**
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public function getMethodReturnsByRef(string|MethodIdentifier $method_id): bool
+    {
+        return $this->methods->getMethodReturnsByRef(MethodIdentifier::wrap($method_id));
+    }
+
+    /**
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public function getMethodReturnTypeLocation(
+        string|MethodIdentifier $method_id,
+        ?CodeLocation &$defined_location = null,
+    ): ?CodeLocation {
+        return $this->methods->getMethodReturnTypeLocation(
+            MethodIdentifier::wrap($method_id),
+            $defined_location,
+        );
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function getDeclaringMethodId(string|MethodIdentifier $method_id): ?string
+    {
+        $new_method_id = $this->methods->getDeclaringMethodId(MethodIdentifier::wrap($method_id));
+
+        return $new_method_id ? (string) $new_method_id : null;
+    }
+
+    /**
+     * Get the class this method appears in (vs is declared in, which could give a trait)
+     *
+     * @psalm-mutation-free
+     */
+    public function getAppearingMethodId(string|MethodIdentifier $method_id): ?string
+    {
+        $new_method_id = $this->methods->getAppearingMethodId(MethodIdentifier::wrap($method_id));
+
+        return $new_method_id ? (string) $new_method_id : null;
+    }
+
+    /**
+     * @return array<string, MethodIdentifier>
+     * @psalm-mutation-free
+     */
+    public function getOverriddenMethodIds(string|MethodIdentifier $method_id): array
+    {
+        return $this->methods->getOverriddenMethodIds(MethodIdentifier::wrap($method_id));
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function getCasedMethodId(string|MethodIdentifier $method_id): string
+    {
+        return $this->methods->getCasedMethodId(MethodIdentifier::wrap($method_id));
+    }
+
+    /**
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public function invalidateInformationForFile(string $file_path): void
+    {
+        $this->scanner->removeFile($file_path);
+
+        try {
+            $file_storage = $this->file_storage_provider->get($file_path);
+        } catch (InvalidArgumentException) {
+            return;
+        }
+
+        foreach ($file_storage->classlikes_in_file as $fq_classlike_name) {
+            $this->classlike_storage_provider->remove($fq_classlike_name);
+            $this->classlikes->removeClassLike($fq_classlike_name);
+        }
+
+        $this->file_storage_provider->remove($file_path);
+        $this->global_constant_types_by_wildcard = [];
+    }
+
+    public function getFunctionStorageForSymbol(string $file_path, string $symbol): ?FunctionLikeStorage
+    {
+        if (strpos($symbol, '::')) {
+            $symbol = substr($symbol, 0, -2);
+            /** @psalm-suppress ArgumentTypeCoercion */
+            $method_id = new MethodIdentifier(...explode('::', $symbol));
+
+            $declaring_method_id = $this->methods->getDeclaringMethodId($method_id);
+
+            if (!$declaring_method_id) {
+                return null;
+            }
+
+            return $this->methods->getStorage($declaring_method_id);
+        }
+
+        $function_id = strtolower(substr($symbol, 0, -2));
+        $file_storage = $this->file_storage_provider->get($file_path);
+
+        if (isset($file_storage->functions[$function_id])) {
+            return $file_storage->functions[$function_id];
+        }
+
+        if (!$function_id) {
+            return null;
+        }
+
+        return $this->functions->getStorageForSymbolLookup($function_id, $file_path);
+    }
+
+    /**
+     * Get Markup content from Reference
+     */
+    public function getMarkupContentForSymbolByReference(
+        Reference $reference,
+    ): ?PHPMarkdownContent {
+        //Direct Assignment
+        if (is_numeric($reference->symbol[0])) {
+            return new PHPMarkdownContent(
+                (string) preg_replace(
+                    '/^[^:]*:/',
+                    '',
+                    $reference->symbol,
+                ),
+            );
+        }
+
+        //Class
+        if (strpos($reference->symbol, '::')) {
+            //Class Method
+            if (strpos($reference->symbol, '()')) {
+                $symbol = substr($reference->symbol, 0, -2);
+
+                /** @psalm-suppress ArgumentTypeCoercion */
+                $method_id = new MethodIdentifier(...explode('::', $symbol));
+
+                $declaring_method_id = $this->methods->getDeclaringMethodId(
+                    $method_id,
+                );
+
+                if (!$declaring_method_id) {
+                    return null;
+                }
+
+                $storage = $this->methods->getStorage($declaring_method_id);
+
+                return new PHPMarkdownContent(
+                    $storage->getHoverMarkdown(),
+                    "{$storage->defining_fqcln}::{$storage->cased_name}",
+                    $storage->description,
+                );
+            }
+
+            /** @psalm-suppress PossiblyUndefinedIntArrayOffset */
+            [, $symbol_name] = explode('::', $reference->symbol);
+
+            //Class Property
+            if (str_contains($reference->symbol, '$')) {
+                $property_id = (string) preg_replace('/^\\\\/', '', $reference->symbol);
+                /** @psalm-suppress PossiblyUndefinedIntArrayOffset */
+                [$fq_class_name, $property_name] = explode('::$', $property_id);
+                $class_storage = $this->classlikes->getStorageFor($fq_class_name);
+
+                //Get Real Properties
+                if (isset($class_storage->declaring_property_ids[$property_name])) {
+                    $declaring_property_class = $class_storage->declaring_property_ids[$property_name];
+                    $declaring_class_storage = $this->classlike_storage_provider->get($declaring_property_class);
+
+                    if (isset($declaring_class_storage->properties[$property_name])) {
+                        $storage = $declaring_class_storage->properties[$property_name];
+                        return new PHPMarkdownContent(
+                            "{$storage->getInfo()} {$symbol_name}",
+                            $reference->symbol,
+                            $storage->description,
+                        );
+                    }
+                }
+
+                //Get Docblock properties
+                if (isset($class_storage->pseudo_property_set_types['$'.$property_name])) {
+                    return new PHPMarkdownContent(
+                        'public '.
+                        (string) $class_storage->pseudo_property_set_types['$'.$property_name].' $'.$property_name,
+                        $reference->symbol,
+                    );
+                }
+
+                //Get Docblock properties
+                if (isset($class_storage->pseudo_property_get_types['$'.$property_name])) {
+                    return new PHPMarkdownContent(
+                        'public '.
+                        (string) $class_storage->pseudo_property_get_types['$'.$property_name].' $'.$property_name,
+                        $reference->symbol,
+                    );
+                }
+
+                return null;
+            }
+
+            /** @psalm-suppress PossiblyUndefinedIntArrayOffset */
+            [$fq_classlike_name, $const_name] = explode(
+                '::',
+                $reference->symbol,
+            );
+
+            $class_constants = $this->classlikes->getConstantsForClass(
+                $fq_classlike_name,
+                ReflectionProperty::IS_PRIVATE,
+            );
+
+            if (!isset($class_constants[$const_name])) {
+                return null;
+            }
+
+            //Class Constant
+            return new PHPMarkdownContent(
+                $class_constants[$const_name]->getHoverMarkdown($const_name),
+                $fq_classlike_name . '::' . $const_name,
+                $class_constants[$const_name]->description,
+            );
+        }
+
+        //Procedural Function
+        if (strpos($reference->symbol, '()')) {
+            $function_id = strtolower(substr($reference->symbol, 0, -2));
+            $file_storage = $this->file_storage_provider->get(
+                $reference->file_path,
+            );
+
+            if (isset($file_storage->functions[$function_id])) {
+                $function_storage = $file_storage->functions[$function_id];
+
+                return new PHPMarkdownContent(
+                    $function_storage->getHoverMarkdown(),
+                    $function_id,
+                    $function_storage->description,
+                );
+            }
+
+            if (!$function_id) {
+                return null;
+            }
+
+            $function = $this->functions->getStorageForSymbolLookup($function_id, $reference->file_path);
+
+            return new PHPMarkdownContent(
+                $function->getHoverMarkdown(),
+                $function_id,
+                $function->description,
+            );
+        }
+
+        //Procedural Variable
+        if (str_starts_with($reference->symbol, '$')) {
+            $type = VariableFetchAnalyzer::getGlobalType($reference->symbol, $this->analysis_php_version_id);
+            if (!$type->isMixed()) {
+                return new PHPMarkdownContent(
+                    (string) $type,
+                    $reference->symbol,
+                );
+            }
+        }
+
+        try {
+            $storage = $this->classlike_storage_provider->get(
+                $reference->symbol,
+            );
+            return new PHPMarkdownContent(
+                ($storage->abstract ? 'abstract ' : '') .
+                    'class ' .
+                    $storage->name,
+                $storage->name,
+                $storage->description,
+            );
+        } catch (InvalidArgumentException) {
+            //continue on as normal
+        }
+
+        if (strpos($reference->symbol, '\\')) {
+            $const_name_parts = explode('\\', $reference->symbol);
+            $const_name = array_pop($const_name_parts);
+            $namespace_name = implode('\\', $const_name_parts);
+
+            $namespace_constants = NamespaceAnalyzer::getConstantsForNamespace(
+                $namespace_name,
+                ReflectionProperty::IS_PUBLIC,
+            );
+            //Namespace Constant
+            if (isset($namespace_constants[$const_name])) {
+                $type = $namespace_constants[$const_name];
+                return new PHPMarkdownContent(
+                    $reference->symbol . ' ' . $type,
+                    $reference->symbol,
+                );
+            }
+        } else {
+            $file_storage = $this->file_storage_provider->get(
+                $reference->file_path,
+            );
+            // ?
+            if (isset($file_storage->constants[$reference->symbol])) {
+                return new PHPMarkdownContent(
+                    'const ' .
+                        $reference->symbol .
+                        ' ' .
+                        $file_storage->constants[$reference->symbol],
+                    $reference->symbol,
+                );
+            }
+            $type = ConstFetchAnalyzer::getGlobalConstType(
+                $this,
+                $reference->symbol,
+                $reference->symbol,
+            );
+
+            //Global Constant
+            if ($type) {
+                return new PHPMarkdownContent(
+                    'const ' . $reference->symbol . ' ' . $type,
+                    $reference->symbol,
+                );
+            }
+        }
+
+        return new PHPMarkdownContent($reference->symbol);
+    }
+
+    public function getSymbolLocationByReference(Reference $reference): ?CodeLocation
+    {
+        if (is_numeric($reference->symbol[0])) {
+            $symbol = (string) preg_replace('/:.*/', '', $reference->symbol);
+            $symbol_parts = explode('-', $symbol);
+
+            if (!isset($symbol_parts[0]) || !isset($symbol_parts[1])) {
+                return null;
+            }
+
+            $file_contents = $this->getFileContents($reference->file_path);
+
+            return new Raw(
+                $file_contents,
+                $reference->file_path,
+                $this->config->shortenFileName($reference->file_path),
+                (int) $symbol_parts[0],
+                (int) $symbol_parts[1],
+            );
+        }
+
+        try {
+            if (strpos($reference->symbol, '::')) {
+                if (strpos($reference->symbol, '()')) {
+                    $symbol = substr($reference->symbol, 0, -2);
+
+                    /** @psalm-suppress ArgumentTypeCoercion */
+                    $method_id = new MethodIdentifier(
+                        ...explode('::', $symbol),
+                    );
+
+                    $declaring_method_id = $this->methods->getDeclaringMethodId(
+                        $method_id,
+                    );
+
+                    if (!$declaring_method_id) {
+                        return null;
+                    }
+
+                    $storage = $this->methods->getStorage($declaring_method_id);
+
+                    return $storage->location;
+                }
+
+                if (str_contains($reference->symbol, '$')) {
+                    $storage = $this->properties->getStorage(
+                        $reference->symbol,
+                    );
+
+                    return $storage->location;
+                }
+
+                /** @psalm-suppress PossiblyUndefinedIntArrayOffset */
+                [$fq_classlike_name, $const_name] = explode(
+                    '::',
+                    $reference->symbol,
+                );
+
+                $class_constants = $this->classlikes->getConstantsForClass(
+                    $fq_classlike_name,
+                    ReflectionProperty::IS_PRIVATE,
+                );
+
+                if (!isset($class_constants[$const_name])) {
+                    return null;
+                }
+
+                return $class_constants[$const_name]->location;
+            }
+
+            if (strpos($reference->symbol, '()')) {
+                $file_storage = $this->file_storage_provider->get(
+                    $reference->file_path,
+                );
+
+                $function_id = strtolower(substr($reference->symbol, 0, -2));
+
+                if (isset($file_storage->functions[$function_id])) {
+                    return $file_storage->functions[$function_id]->location;
+                }
+
+                if (!$function_id) {
+                    return null;
+                }
+
+                return $this->functions->getStorageForSymbolLookup($function_id, $reference->file_path)->location;
+            }
+
+            return $this->classlike_storage_provider->get(
+                $reference->symbol,
+            )->location;
+        } catch (UnexpectedValueException $e) {
+            error_log($e->getMessage());
+
+            return null;
+        } catch (InvalidArgumentException) {
+            return null;
+        }
+    }
+
+    /**
+     * @return array{0: string, 1: Range}|null
+     */
+    public function getReferenceAtPosition(string $file_path, Position $position): ?array
+    {
+        $ref = $this->getReferenceAtPositionAsReference($file_path, $position);
+        if ($ref === null) {
+            return null;
+        }
+        return [$ref->symbol, $ref->range];
+    }
+
+    /**
+     * Get Reference from Position
+     */
+    public function getReferenceAtPositionAsReference(
+        string $file_path,
+        Position $position,
+    ): ?Reference {
+        $is_open = $this->file_provider->isOpen($file_path);
+
+        if (!$is_open) {
+            throw new UnanalyzedFileException($file_path . ' is not open');
+        }
+
+        $file_contents = $this->getFileContents($file_path);
+
+        $offset = $position->toOffset($file_contents);
+
+        $reference_maps = $this->analyzer->getMapsForFile($file_path);
+
+        $reference_start_pos = null;
+        $reference_end_pos = null;
+        $symbol = null;
+
+        foreach ($reference_maps as $reference_map) {
+            ksort($reference_map);
+
+            foreach ($reference_map as $start_pos => [$end_pos, $possible_reference]) {
+                if ($offset < $start_pos) {
+                    break;
+                }
+
+                if ($offset > $end_pos) {
+                    continue;
+                }
+                $reference_start_pos = $start_pos;
+                $reference_end_pos = $end_pos;
+                $symbol = $possible_reference;
+            }
+
+            if ($symbol !== null &&
+                $reference_start_pos !== null &&
+                $reference_end_pos !== null
+            ) {
+                break;
+            }
+        }
+
+        if ($symbol === null || $reference_start_pos === null || $reference_end_pos === null) {
+            return null;
+        }
+
+        $range = new Range(
+            self::getPositionFromOffset($reference_start_pos, $file_contents),
+            self::getPositionFromOffset($reference_end_pos, $file_contents),
+        );
+
+        return new Reference($file_path, $symbol, $range);
+    }
+
+    /**
+     * @return array{0: non-empty-string, 1: int, 2: Range}|null
+     */
+    public function getFunctionArgumentAtPosition(string $file_path, Position $position): ?array
+    {
+        $is_open = $this->file_provider->isOpen($file_path);
+
+        if (!$is_open) {
+            throw new UnanalyzedFileException($file_path . ' is not open');
+        }
+
+        $file_contents = $this->getFileContents($file_path);
+
+        $offset = $position->toOffset($file_contents);
+
+        [, , $argument_map] = $this->analyzer->getMapsForFile($file_path);
+
+        $reference = null;
+        $argument_number = null;
+
+        if (!$argument_map) {
+            return null;
+        }
+
+        ksort($argument_map);
+
+        foreach ($argument_map as $start_pos => [$end_pos, $possible_reference, $possible_argument_number]) {
+            if ($offset < $start_pos) {
+                break;
+            }
+
+            if ($offset > $end_pos) {
+                continue;
+            }
+
+            $reference = $possible_reference;
+            $argument_number = $possible_argument_number;
+        }
+
+        if ($reference === null || $argument_number === null) {
+            return null;
+        }
+
+        $range = new Range(
+            self::getPositionFromOffset($start_pos, $file_contents),
+            self::getPositionFromOffset($end_pos, $file_contents),
+        );
+
+        return [$reference, $argument_number, $range];
+    }
+
+    /**
+     * @param  non-empty-string $function_symbol
+     */
+    public function getSignatureInformation(
+        string $function_symbol,
+        ?string $file_path = null,
+    ): ?SignatureInformation {
+        $signature_label = '';
+        $signature_documentation = null;
+        if (str_contains($function_symbol, '::')) {
+            /** @psalm-suppress ArgumentTypeCoercion */
+            $method_id = new MethodIdentifier(...explode('::', $function_symbol));
+
+            $declaring_method_id = $this->methods->getDeclaringMethodId($method_id);
+
+            if ($declaring_method_id === null) {
+                return null;
+            }
+
+            $method_storage = $this->methods->getStorage($declaring_method_id);
+            $params = $method_storage->params;
+            $signature_label = $method_storage->cased_name;
+            $signature_documentation = $method_storage->description;
+        } else {
+            try {
+                if ($file_path) {
+                    $function_storage = $this->functions->getStorage(
+                        null,
+                        strtolower($function_symbol),
+                        $file_path,
+                        $file_path,
+                    );
+                } else {
+                    $function_storage = $this->functions->getStorage(null, strtolower($function_symbol));
+                }
+                $params = $function_storage->params;
+                $signature_label = $function_storage->cased_name;
+                $signature_documentation = $function_storage->description;
+            } catch (Exception) {
+                if (InternalCallMapHandler::inCallMap($function_symbol)) {
+                    $callables = InternalCallMapHandler::getCallablesFromCallMap($function_symbol);
+
+                    if (!$callables || !isset($callables[0]->params)) {
+                        return null;
+                    }
+
+                    $params = $callables[0]->params;
+                } else {
+                    return null;
+                }
+            }
+        }
+
+        $signature_label .= '(';
+        $parameters = [];
+
+        foreach ($params as $i => $param) {
+            $parameter_label = ($param->type ?: 'mixed') . ' $' . $param->name;
+            $parameters[] = new ParameterInformation(
+                [
+                    strlen($signature_label),
+                    strlen($signature_label) + strlen($parameter_label),
+                ],
+                $param->description ?? null,
+            );
+
+            $signature_label .= $parameter_label;
+
+            if ($i < (count($params) - 1)) {
+                $signature_label .= ', ';
+            }
+        }
+
+        $signature_label .= ')';
+
+        return new SignatureInformation(
+            $signature_label,
+            $parameters,
+            $signature_documentation,
+        );
+    }
+
+    /**
+     * @return array{0: string, 1: '->'|'::'|'['|'symbol', 2: int}|null
+     */
+    public function getCompletionDataAtPosition(string $file_path, Position $position): ?array
+    {
+        $is_open = $this->file_provider->isOpen($file_path);
+
+        if (!$is_open) {
+            throw new UnanalyzedFileException($file_path . ' is not open');
+        }
+
+        $file_contents = $this->getFileContents($file_path);
+
+        $offset = $position->toOffset($file_contents);
+
+        $literal_part = $this->getBeginedLiteralPart($file_path, $position);
+        $begin_literal_offset = $offset - strlen($literal_part);
+
+        [$reference_map, $type_map] = $this->analyzer->getMapsForFile($file_path);
+
+        if (!$reference_map && !$type_map) {
+            return null;
+        }
+
+        krsort($type_map);
+
+        foreach ($type_map as $start_pos => [$end_pos_excluding_whitespace, $possible_type]) {
+            if ($offset < $start_pos) {
+                continue;
+            }
+
+            /** @psalm-suppress PossiblyUndefinedIntArrayOffset */
+            $num_whitespace_bytes = preg_match('/\G\s+/', $file_contents, $matches, 0, $end_pos_excluding_whitespace)
+                ? strlen($matches[0])
+                : 0;
+            $end_pos = $end_pos_excluding_whitespace + $num_whitespace_bytes;
+
+            if ($offset - $end_pos === 1) {
+                $candidate_gap = substr($file_contents, $end_pos, 1);
+
+                if ($candidate_gap === '[') {
+                    $gap = $candidate_gap;
+                    $recent_type = $possible_type;
+
+                    if ($recent_type === 'mixed') {
+                        return null;
+                    }
+
+                    return [$recent_type, $gap, $offset];
+                }
+            }
+
+            if ($begin_literal_offset - $end_pos === 2) {
+                $candidate_gap = substr($file_contents, $end_pos, 2);
+
+                if ($candidate_gap === '->' || $candidate_gap === '::') {
+                    $gap = $candidate_gap;
+                    $recent_type = $possible_type;
+
+                    if ($recent_type === 'mixed') {
+                        return null;
+                    }
+
+                    return [$recent_type, $gap, $offset];
+                }
+            }
+        }
+
+        foreach ($reference_map as $start_pos => [$end_pos, $possible_reference]) {
+            if ($offset < $start_pos) {
+                continue;
+            }
+            // If the reference precedes a "::" then treat it as a class reference.
+            if ($offset - $end_pos === 2 && substr($file_contents, $end_pos, 2) === '::') {
+                return [$possible_reference, '::', $offset];
+            }
+
+            if ($offset <= $end_pos && substr($file_contents, $begin_literal_offset - 2, 2) === '::') {
+                $class_name = explode('::', $possible_reference)[0];
+                return [$class_name, '::', $offset];
+            }
+
+            // Only continue for references that are partial / don't exist.
+            if ($possible_reference[0] !== '*') {
+                continue;
+            }
+
+            if ($offset - $end_pos === 0) {
+                $recent_type = $possible_reference;
+
+                return [$recent_type, 'symbol', $offset];
+            }
+        }
+
+        return null;
+    }
+
+    public function getBeginedLiteralPart(string $file_path, Position $position): string
+    {
+        $is_open = $this->file_provider->isOpen($file_path);
+
+        if (!$is_open) {
+            throw new UnanalyzedFileException($file_path . ' is not open');
+        }
+
+        $file_contents = $this->getFileContents($file_path);
+
+        $offset = $position->toOffset($file_contents);
+
+        preg_match('/\$?\w+$/', substr($file_contents, 0, $offset), $matches);
+
+        return $matches[0] ?? '';
+    }
+
+    public function getTypeContextAtPosition(string $file_path, Position $position): ?Union
+    {
+        $file_contents = $this->getFileContents($file_path);
+        $offset = $position->toOffset($file_contents);
+
+        [$reference_map, $type_map, $argument_map] = $this->analyzer->getMapsForFile($file_path);
+        if (!$reference_map && !$type_map && !$argument_map) {
+            return null;
+        }
+        foreach ($argument_map as $start_pos => [$end_pos, $function, $argument_num]) {
+            if ($offset < $start_pos || $offset > $end_pos) {
+                continue;
+            }
+            // First parameter to a function-like
+            $function_storage = $this->getFunctionStorageForSymbol($file_path, $function . '()');
+            if (!$function_storage || !$function_storage->params || !isset($function_storage->params[$argument_num])) {
+                return null;
+            }
+
+            return $function_storage->params[$argument_num]->type;
+        }
+
+        return null;
+    }
+
+    /**
+     * @param list<int> $allow_visibilities
+     * @param list<string> $ignore_fq_class_names
+     * @return list<CompletionItem>
+     */
+    public function getCompletionItemsForClassishThing(
+        string $type_string,
+        string $gap,
+        bool $snippets_supported = false,
+        ?array $allow_visibilities = null,
+        array $ignore_fq_class_names = [],
+    ): array {
+        if ($allow_visibilities === null) {
+            $allow_visibilities = [
+                ClassLikeAnalyzer::VISIBILITY_PUBLIC,
+                ClassLikeAnalyzer::VISIBILITY_PROTECTED,
+                ClassLikeAnalyzer::VISIBILITY_PRIVATE,
+            ];
+        }
+        $allow_visibilities[] = null;
+
+        $completion_items = [];
+
+        $type = Type::parseString($type_string);
+
+        foreach ($type->getAtomicTypes() as $atomic_type) {
+            if ($atomic_type instanceof TNamedObject) {
+                try {
+                    $class_storage = $this->classlike_storage_provider->get($atomic_type->value);
+
+                    $method_storages = [];
+                    foreach ($class_storage->declaring_method_ids as $declaring_method_id) {
+                        try {
+                            $method_storages[] = $this->methods->getStorage($declaring_method_id);
+                        } catch (UnexpectedValueException $e) {
+                            error_log($e->getMessage());
+                        }
+                    }
+                    if ($gap === '->') {
+                        $method_storages += $class_storage->pseudo_methods;
+                    }
+                    if ($gap === '::') {
+                        $method_storages += $class_storage->pseudo_static_methods;
+                    }
+
+                    $had = [];
+                    foreach ($method_storages as $method_storage) {
+                        if (!in_array($method_storage->visibility, $allow_visibilities)) {
+                            continue;
+                        }
+                        if ($method_storage->cased_name !== null) {
+                            if (array_key_exists($method_storage->cased_name, $had)) {
+                                continue;
+                            }
+                            $had[$method_storage->cased_name] = true;
+                        }
+                        if ($method_storage->is_static || $gap === '->') {
+                            $completion_item = new CompletionItem(
+                                $method_storage->cased_name,
+                                CompletionItemKind::METHOD,
+                                $method_storage->getCompletionSignature(),
+                                $method_storage->description,
+                                (string)$method_storage->visibility,
+                                $method_storage->cased_name,
+                                $method_storage->cased_name,
+                                null,
+                                null,
+                                new Command('Trigger parameter hints', 'editor.action.triggerParameterHints'),
+                                null,
+                                2,
+                            );
+
+                            if ($snippets_supported && count($method_storage->params) > 0) {
+                                $completion_item->insertText .= '($0)';
+                                $completion_item->insertTextFormat =
+                                    InsertTextFormat::SNIPPET;
+                            } else {
+                                $completion_item->insertText .= '()';
+                            }
+
+                            $completion_items[] = $completion_item;
+                        }
+                    }
+
+                    if ($gap === '->') {
+                        $pseudo_property_types = [];
+                        foreach ($class_storage->pseudo_property_get_types as $property_name => $type) {
+                            $pseudo_property_types[$property_name] = new CompletionItem(
+                                str_replace('$', '', $property_name),
+                                CompletionItemKind::PROPERTY,
+                                $type->__toString(),
+                                null,
+                                '1', //sort text
+                                str_replace('$', '', $property_name),
+                                str_replace('$', '', $property_name),
+                            );
+                        }
+
+                        foreach ($class_storage->pseudo_property_set_types as $property_name => $type) {
+                            $pseudo_property_types[$property_name] = new CompletionItem(
+                                str_replace('$', '', $property_name),
+                                CompletionItemKind::PROPERTY,
+                                $type->__toString(),
+                                null,
+                                '1',
+                                str_replace('$', '', $property_name),
+                                str_replace('$', '', $property_name),
+                            );
+                        }
+
+                        $completion_items = [...$completion_items, ...array_values($pseudo_property_types)];
+                    }
+
+                    foreach ($class_storage->declaring_property_ids as $property_name => $declaring_class) {
+                        try {
+                            $property_storage = $this->properties->getStorage(
+                                $declaring_class . '::$' . $property_name,
+                            );
+                        } catch (UnexpectedValueException $e) {
+                            error_log($e->getMessage());
+                            continue;
+                        }
+
+                        if (!in_array($property_storage->visibility, $allow_visibilities)) {
+                            continue;
+                        }
+                        if ($property_storage->is_static === ($gap === '::')) {
+                            $completion_items[] = new CompletionItem(
+                                $property_name,
+                                CompletionItemKind::PROPERTY,
+                                $property_storage->getInfo(),
+                                $property_storage->description,
+                                (string)$property_storage->visibility,
+                                $property_name,
+                                ($gap === '::' ? '$' : '') . $property_name,
+                            );
+                        }
+                    }
+
+                    foreach ($class_storage->constants as $const_name => $const) {
+                        $completion_items[] = new CompletionItem(
+                            $const_name,
+                            CompletionItemKind::VARIABLE,
+                            'const ' . $const_name,
+                            $const->description,
+                            null,
+                            $const_name,
+                            $const_name,
+                        );
+                    }
+
+                    if ($gap === '->') {
+                        foreach ($class_storage->namedMixins as $mixin) {
+                            if (in_array($mixin->value, $ignore_fq_class_names)) {
+                                continue;
+                            }
+                            $mixin_completion_items = $this->getCompletionItemsForClassishThing(
+                                $mixin->value,
+                                $gap,
+                                $snippets_supported,
+                                [ClassLikeAnalyzer::VISIBILITY_PUBLIC],
+                                [$type_string, ...$ignore_fq_class_names],
+                            );
+                            $completion_items = [...$completion_items, ...$mixin_completion_items];
+                        }
+                    }
+                } catch (Exception $e) {
+                    error_log($e->getMessage());
+                    continue;
+                }
+            }
+        }
+
+        return $completion_items;
+    }
+
+    /**
+     * @param list<CompletionItem> $items
+     * @return list<CompletionItem>
+     * @deprecated to be removed in Psalm 6
+     * @api fix deprecation problem "PossiblyUnusedMethod: Cannot find any calls to method"
+     * @psalm-mutation-free
+     */
+    public function filterCompletionItemsByBeginLiteralPart(array $items, string $literal_part): array
+    {
+        if (!$literal_part) {
+            return $items;
+        }
+
+        $res = [];
+        foreach ($items as $item) {
+            if ($item->insertText && str_starts_with($item->insertText, $literal_part)) {
+                $res[] = $item;
+            }
+        }
+
+        return $res;
+    }
+
+    /**
+     * @return list<CompletionItem>
+     */
+    public function getCompletionItemsForPartialSymbol(
+        string $type_string,
+        int $offset,
+        string $file_path,
+    ): array {
+        $fq_suggestion = false;
+
+        if (($type_string[1] ?? '') === '\\') {
+            $fq_suggestion = true;
+        }
+
+        $matching_classlike_names = $this->classlikes->getMatchingClassLikeNames($type_string);
+
+        $completion_items = [];
+
+        $file_storage = $this->file_storage_provider->get($file_path);
+
+        $aliases = null;
+
+        foreach ($file_storage->classlikes_in_file as $fq_class_name => $_) {
+            try {
+                $class_storage = $this->classlike_storage_provider->get($fq_class_name);
+            } catch (Exception) {
+                continue;
+            }
+
+            if (!$class_storage->stmt_location) {
+                continue;
+            }
+
+            if ($offset > $class_storage->stmt_location->raw_file_start
+                && $offset < $class_storage->stmt_location->raw_file_end
+            ) {
+                $aliases = $class_storage->aliases;
+                break;
+            }
+        }
+
+        if (!$aliases) {
+            foreach ($file_storage->namespace_aliases as $namespace_start => $namespace_aliases) {
+                if ($namespace_start < $offset) {
+                    $aliases = $namespace_aliases;
+                    break;
+                }
+            }
+
+            if (!$aliases) {
+                $aliases = $file_storage->aliases;
+            }
+        }
+
+        foreach ($matching_classlike_names as $fq_class_name) {
+            $extra_edits = [];
+
+            $insertion_text = Type::getStringFromFQCLN(
+                $fq_class_name,
+                $aliases && $aliases->namespace ? $aliases->namespace : null,
+                $aliases->uses_flipped ?? [],
+                null,
+            );
+
+            if ($aliases
+                && !$fq_suggestion
+                && $aliases->namespace
+                && $insertion_text === '\\' . $fq_class_name
+                && $aliases->namespace_first_stmt_start
+            ) {
+                $file_contents = $this->getFileContents($file_path);
+
+                $class_name = (string) preg_replace('/^.*\\\/', '', $fq_class_name, 1);
+
+                if ($aliases->uses_end) {
+                    $position = self::getPositionFromOffset($aliases->uses_end, $file_contents);
+                    $extra_edits[] = new TextEdit(
+                        new Range(
+                            $position,
+                            $position,
+                        ),
+                        "\n" . 'use ' . $fq_class_name . ';',
+                    );
+                } else {
+                    $position = self::getPositionFromOffset($aliases->namespace_first_stmt_start, $file_contents);
+                    $extra_edits[] = new TextEdit(
+                        new Range(
+                            $position,
+                            $position,
+                        ),
+                        'use ' . $fq_class_name . ';' . "\n" . "\n",
+                    );
+                }
+
+                $insertion_text = $class_name;
+            }
+
+            try {
+                $class_storage = $this->classlike_storage_provider->get($fq_class_name);
+                $description = $class_storage->description;
+            } catch (Exception) {
+                $description = null;
+            }
+
+            $completion_items[] = new CompletionItem(
+                $fq_class_name,
+                CompletionItemKind::CLASS_,
+                null,
+                $description,
+                null,
+                $fq_class_name,
+                $insertion_text,
+                null,
+                $extra_edits,
+            );
+        }
+
+        $functions = $this->functions->getMatchingFunctionNames($type_string, $offset, $file_path, $this);
+
+        $namespace_map = [];
+        if ($aliases) {
+            $namespace_map += $aliases->uses_flipped;
+            if ($aliases->namespace) {
+                $namespace_map[$aliases->namespace] = '';
+            }
+        }
+
+        // Sort the map by longest first, so we replace most specific
+        // used namespaces first.
+        ksort($namespace_map);
+        $namespace_map = array_reverse($namespace_map);
+
+        foreach ($functions as $function_lowercase => $function) {
+            // Transform FQFN relative to all uses namespaces
+            $function_name = $function->cased_name;
+            if (!$function_name) {
+                continue;
+            }
+            $in_namespace_map = false;
+            foreach ($namespace_map as $namespace_name => $namespace_alias) {
+                if (str_starts_with($function_lowercase, $namespace_name . '\\')) {
+                    $function_name = $namespace_alias . '\\' . substr($function_name, strlen($namespace_name) + 1);
+                    $in_namespace_map = true;
+                }
+            }
+            // If the function is not use'd, and it's not a global function
+            // prepend it with a backslash.
+            if (!$in_namespace_map && str_contains($function_name, '\\')) {
+                $function_name = '\\' . $function_name;
+            }
+            $completion_items[] = new CompletionItem(
+                $function_name,
+                CompletionItemKind::FUNCTION,
+                $function->getCompletionSignature(),
+                $function->description,
+                null,
+                $function_name,
+                $function_name . (count($function->params) !== 0 ? '($0)' : '()'),
+                null,
+                null,
+                new Command('Trigger parameter hints', 'editor.action.triggerParameterHints'),
+                null,
+                2,
+            );
+        }
+
+        return $completion_items;
+    }
+
+    /**
+     * @return list<CompletionItem>
+     * @psalm-capabilities read-props
+     */
+    public function getCompletionItemsForType(Union $type): array
+    {
+        $completion_items = [];
+        foreach ($type->getAtomicTypes() as $atomic_type) {
+            if ($atomic_type instanceof TBool) {
+                $bools = (string) $atomic_type === 'bool' ? ['true', 'false'] : [(string) $atomic_type];
+                foreach ($bools as $property_name) {
+                    $completion_items[] = new CompletionItem(
+                        $property_name,
+                        CompletionItemKind::VALUE,
+                        'bool',
+                        null,
+                        null,
+                        null,
+                        $property_name,
+                    );
+                }
+            } elseif ($atomic_type instanceof TLiteralString) {
+                $completion_items[] = new CompletionItem(
+                    $atomic_type->value,
+                    CompletionItemKind::VALUE,
+                    $atomic_type->getId(),
+                    null,
+                    null,
+                    null,
+                    "'$atomic_type->value'",
+                );
+            } elseif ($atomic_type instanceof TLiteralInt) {
+                $completion_items[] = new CompletionItem(
+                    (string) $atomic_type->value,
+                    CompletionItemKind::VALUE,
+                    $atomic_type->getId(),
+                    null,
+                    null,
+                    null,
+                    (string) $atomic_type->value,
+                );
+            } elseif ($atomic_type instanceof TClassConstant) {
+                $const = $atomic_type->fq_classlike_name . '::' . $atomic_type->const_name;
+                $completion_items[] = new CompletionItem(
+                    $const,
+                    CompletionItemKind::VALUE,
+                    $atomic_type->getId(),
+                    null,
+                    null,
+                    null,
+                    $const,
+                );
+            }
+        }
+        return $completion_items;
+    }
+
+    /**
+     * @return list<CompletionItem>
+     */
+    public function getCompletionItemsForArrayKeys(
+        string $type_string,
+    ): array {
+        $completion_items = [];
+        $type = Type::parseString($type_string);
+        foreach ($type->getAtomicTypes() as $atomic_type) {
+            if ($atomic_type instanceof TKeyedArray) {
+                foreach ($atomic_type->properties as $property_name => $property) {
+                    $completion_items[] = new CompletionItem(
+                        (string) $property_name,
+                        CompletionItemKind::PROPERTY,
+                        (string) $property,
+                        null,
+                        null,
+                        null,
+                        "'$property_name'",
+                    );
+                }
+            }
+        }
+        return $completion_items;
+    }
+
+    /**
+     * @psalm-pure
+     */
+    private static function getPositionFromOffset(int $offset, string $file_contents): Position
+    {
+        $file_contents = substr($file_contents, 0, $offset);
+
+        $offsetLength = $offset - strlen($file_contents);
+
+        //PHP 8.0: Argument #3 ($offset) must be contained in argument #1 ($haystack)
+        if (($textlen = strlen($file_contents)) < $offsetLength) {
+            $offsetLength = $textlen;
+        }
+
+        $before_newline_count = strrpos($file_contents, "\n", $offsetLength);
+
+        return new Position(
+            substr_count($file_contents, "\n"),
+            $offset - (int)$before_newline_count - 1,
+        );
+    }
+
+    /**
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public function addTemporaryFileChanges(string $file_path, string $new_content, ?int $version = null): void
+    {
+        $this->file_provider->addTemporaryFileChanges($file_path, $new_content, $version);
+    }
+
+    /**
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public function removeTemporaryFileChanges(string $file_path): void
+    {
+        $this->file_provider->removeTemporaryFileChanges($file_path);
+    }
+
+    /**
+     * Checks if type is a subtype of other
+     *
+     * Given two types, checks if `$input_type` is a subtype of `$container_type`.
+     * If you consider `Union` as a set of types, this will tell you
+     * if `$input_type` is fully contained in `$container_type`,
+     *
+     * $input_type ⊆ $container_type
+     *
+     * Useful for emitting issues like InvalidArgument, where argument at the call site
+     * should be a subset of the function parameter type.
+     */
+    public function isTypeContainedByType(
+        Union $input_type,
+        Union $container_type,
+        bool $ignore_null = false,
+        bool $ignore_false = false,
+        bool $allow_interface_equality = false,
+        bool $allow_float_int_equality = true,
+    ): bool {
+        return UnionTypeComparator::isContainedBy(
+            $this,
+            $input_type,
+            $container_type,
+            $ignore_null,
+            $ignore_false,
+            null,
+            $allow_interface_equality,
+            $allow_float_int_equality,
+        );
+    }
+
+    /**
+     * Checks if type has any part that is a subtype of other
+     *
+     * Given two types, checks if *any part* of `$input_type` is a subtype of `$container_type`.
+     * If you consider `Union` as a set of types, this will tell you if intersection
+     * of `$input_type` with `$container_type` is not empty.
+     *
+     * $input_type ∩ $container_type ≠ ∅ , e.g. they are not disjoint.
+     *
+     * Useful for emitting issues like PossiblyInvalidArgument, where argument at the call
+     * site should be a subtype of the function parameter type, but it's has some types that are
+     * not a subtype of the required type.
+     */
+    public function canTypeBeContainedByType(
+        Union $input_type,
+        Union $container_type,
+    ): bool {
+        return UnionTypeComparator::canBeContainedBy($this, $input_type, $container_type);
+    }
+
+    /**
+     * Extracts key and value types from a traversable object (or iterable)
+     *
+     * Given an iterable type (*but not TArray*) returns a tuple of it's key/value types.
+     * First element of the tuple holds key type, second has the value type.
+     *
+     * Example:
+     * ```php
+     * $codebase->getKeyValueParamsForTraversableObject(Type::parseString('iterable<int,string>'))
+     * //  returns [Union(TInt), Union(TString)]
+     * ```
+     *
+     * @return array{Union, Union}
+     * @psalm-capabilities read-props|write-this-props|write-refs
+     */
+    public function getKeyValueParamsForTraversableObject(Atomic $type): array
+    {
+        $key_type = null;
+        $value_type = null;
+
+        ForeachAnalyzer::getKeyValueParamsForTraversableObject($type, $this, $key_type, $value_type);
+
+        return [
+            $key_type ?? Type::getMixed(),
+            $value_type ?? Type::getMixed(),
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $phantom_classes
+     */
+    public function queueClassLikeForScanning(
+        string $fq_classlike_name,
+        bool $analyze_too = false,
+        bool $store_failure = true,
+        array $phantom_classes = [],
+    ): void {
+        $this->scanner->queueClassLikeForScanning($fq_classlike_name, $analyze_too, $store_failure, $phantom_classes);
+    }
+
+    /**
+     * @param ?int $taints the taints of the source, those of user input (see getInputTaints()) if null
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public function addTaintSource(
+        Union $expr_type,
+        string $taint_id,
+        CodeLocation $code_location,
+        ?int $taints = null,
+    ): Union {
+        if (!$this->taint_flow_graph) {
+            return $expr_type;
+        }
+
+        $source = DataFlowNode::getForTaint(
+            $taint_id,
+            $code_location,
+            $taints ?? $this->getInputTaints(),
+        );
+
+        $this->taint_flow_graph->addSource($source);
+
+        return $expr_type->addParentNodes([$source->id => $source]);
+    }
+
+    /**
+     * Adds a sink and returns it, so addTaintPath() can lead to it (null without taint analysis)
+     *
+     * @param ?int $taints the taints the sink must not be given, those of user input (see getInputTaints()) if null
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public function addTaintSink(
+        string $taint_id,
+        CodeLocation $code_location,
+        ?int $taints = null,
+    ): ?DataFlowNode {
+        if (!$this->taint_flow_graph) {
+            return null;
+        }
+
+        $sink = DataFlowNode::getForTaint(
+            $taint_id,
+            $code_location,
+            $taints ?? $this->getInputTaints(),
+        );
+
+        $this->taint_flow_graph->addSink($sink);
+
+        return $sink;
+    }
+
+    /**
+     * Whether taints are tracked in the statements of $source: false without taint analysis, while they suppress
+     * TaintedInput, or while Psalm re-analyzes them only to collect mutations. Adding paths does nothing then.
+     *
+     * @psalm-mutation-free
+     */
+    public function tracksTaintFlow(StatementsSource $source): bool
+    {
+        return $this->getTaintFlowGraphOf($source) !== null;
+    }
+
+    /**
+     * A taint node for a value at $location (one per label and location). The taints of $value_type flow into it.
+     * To make an expression's value come from the node, use `$type->addParentNodes([$node->id => $node])`.
+     *
+     * @psalm-capabilities read-props|write-props
+     */
+    public function getTaintNode(
+        StatementsSource $source,
+        string $label,
+        CodeLocation $location,
+        ?Union $value_type = null,
+    ): DataFlowNode {
+        $node = DataFlowNode::getForAssignment($label, $location);
+
+        $graph = $this->getTaintFlowGraphOf($source);
+        if ($graph === null || $value_type === null) {
+            return $node;
+        }
+
+        if ($value_type->parent_nodes) {
+            $graph->addNode($node);
+            foreach ($value_type->parent_nodes as $parent_node) {
+                $graph->addPath($parent_node, $node, '=');
+            }
+        } elseif ($graph->addPathsFromNestedParentNodes($node, $value_type, $location)) {
+            $graph->addNode($node);
+        }
+
+        return $node;
+    }
+
+    /**
+     * The taint node of the property `Class::$name`: assignments flow into it, fetches read from it. The property
+     * doesn't need to be declared.
+     *
+     * @psalm-pure
+     */
+    public static function getTaintPropertyNode(string $property_id): DataFlowNode
+    {
+        return DataFlowNode::getForPropertyFetch($property_id);
+    }
+
+    /**
+     * Adds a path from $from to $to that adds $added_taints and removes $removed_taints. Does nothing while
+     * tracksTaintFlow($source) is false.
+     *
+     * $path_type is `=` for a plain copy. For arrays, `arrayvalue-assignment-'key'` stores the value under a key,
+     * `arrayvalue-fetch-'key'` reads only that key, and `arrayvalue-assignment` / `arrayvalue-fetch` match any key.
+     *
+     * @psalm-capabilities read-props|write-props
+     */
+    public function addTaintPath(
+        StatementsSource $source,
+        DataFlowNode $from,
+        DataFlowNode $to,
+        string $path_type = '=',
+        int $added_taints = 0,
+        int $removed_taints = 0,
+    ): void {
+        $graph = $this->getTaintFlowGraphOf($source);
+        if ($graph === null) {
+            return;
+        }
+
+        $graph->addNode($from);
+        $graph->addNode($to);
+        $graph->addPath($from, $to, $path_type, $added_taints, $removed_taints);
+    }
+
+    /**
+     * The taint node of what a call of $function returns: a function (`ns\f`), a method (`Class::method`, the body the
+     * class runs, as a call naming the class does: not the overrides of its subclasses) or a closure. Given the
+     * location of a call, the node of the call there if Psalm tells the calls of the function-like apart (see
+     * `@psalm-taint-specialize`), which its arguments and object given at the same location flow into (see
+     * getTaintArgumentNode() and getTaintReceiverNode()). Null if there is no such function-like.
+     */
+    public function getTaintReturnNode(
+        StatementsSource $source,
+        string|PhpParser\Node\Expr\Closure|PhpParser\Node\Expr\ArrowFunction $function,
+        ?CodeLocation $call_location = null,
+    ): ?DataFlowNode {
+        $body = $this->getTaintBody($source, $function);
+        if ($body === null) {
+            return null;
+        }
+
+        [$cased_function_id, $storage] = $body;
+
+        return DataFlowNode::getForMethodReturn(
+            $cased_function_id,
+            $storage,
+            $this->getTaintSpecializationLocation($source, $storage, $call_location),
+        );
+    }
+
+    /**
+     * The taint node of the parameter at $offset (0 for the first) of $function, for a call at $call_location if
+     * given (see getTaintReturnNode()): what flows into it is what the body gets in that parameter, and reaches its
+     * sinks. Null if there is no such function-like or parameter.
+     */
+    public function getTaintArgumentNode(
+        StatementsSource $source,
+        string|PhpParser\Node\Expr\Closure|PhpParser\Node\Expr\ArrowFunction $function,
+        int $offset,
+        ?CodeLocation $call_location = null,
+    ): ?DataFlowNode {
+        $body = $this->getTaintBody($source, $function);
+        if ($body === null) {
+            return null;
+        }
+
+        [$cased_function_id, $storage] = $body;
+
+        $last_param = $storage->params === [] ? null : $storage->params[count($storage->params) - 1];
+        if ($offset < 0 || (!isset($storage->params[$offset]) && $last_param?->is_variadic !== true)) {
+            return null;
+        }
+
+        return DataFlowNode::getForMethodArgument(
+            $cased_function_id,
+            $offset,
+            $storage,
+            $this->getTaintSpecializationLocation($source, $storage, $call_location),
+        );
+    }
+
+    /**
+     * The taint node of the object a call of $method_id (`Class::method`) at $call_location runs on, if Psalm tracks
+     * the objects of the method apart (see `@psalm-taint-specialize`): what flows into it is the `$this` of the body
+     * for that call, whose return node (see getTaintReturnNode()) then holds what this object gives it. Null for other
+     * methods, whose body takes from what every object of the class holds.
+     */
+    public function getTaintReceiverNode(
+        StatementsSource $source,
+        string $method_id,
+        CodeLocation $call_location,
+    ): ?DataFlowNode {
+        $body = $this->getTaintBody($source, $method_id);
+        if ($body === null) {
+            return null;
+        }
+
+        $storage = $body[1];
+        if (!$storage instanceof MethodStorage || !$storage->specialize_call || $storage->location === null) {
+            return null;
+        }
+
+        return DataFlowNode::getForAssignment(
+            '$this in ' . (string) FunctionLikeAnalyzer::getBodyMethodId($this, MethodIdentifier::wrap($method_id)),
+            $storage->location,
+            DataFlowNode::getSpecializationKey($call_location),
+        );
+    }
+
+    /**
+     * Adds the paths of an assignment of $value to the instance property $property_id (`Class::$name`) of an object of
+     * the class, as `$object->name = $value` does: what the class and the parent classes sharing the property read of
+     * it gets the value, and so does what its subclasses read, as the object may be one of theirs.
+     */
+    public function addTaintPropertyAssignment(
+        StatementsSource $source,
+        DataFlowNode $value,
+        string $property_id,
+    ): void {
+        $parts = explode('::$', $property_id, 2);
+        if (count($parts) !== 2) {
+            throw new InvalidArgumentException('Expecting a property id like Class::$name, got ' . $property_id);
+        }
+
+        $graph = $this->getTaintFlowGraphOf($source);
+        if ($graph === null) {
+            return;
+        }
+
+        $property_node = DataFlowNode::getForPropertyFetch($property_id);
+
+        $graph->addNode($value);
+        $graph->addNode($property_node);
+        $graph->addPath($value, $property_node, 'property-assignment');
+
+        InstancePropertyAssignmentAnalyzer::taintInheritedProperty(
+            $this,
+            $graph,
+            $value,
+            $property_node,
+            $parts[0],
+            $parts[1],
+        );
+    }
+
+    /**
+     * The cased id the taint nodes of the body of $function are keyed by, and its storage (see getTaintReturnNode())
+     *
+     * @return array{string, FunctionLikeStorage}|null
+     */
+    private function getTaintBody(
+        StatementsSource $source,
+        string|PhpParser\Node\Expr\Closure|PhpParser\Node\Expr\ArrowFunction $function,
+    ): ?array {
+        if (!is_string($function)) {
+            $closure_id = strtolower($source->getFilePath())
+                . ':' . $function->getLine()
+                . ':' . (int) $function->getAttribute('startFilePos')
+                . ':-:closure';
+
+            try {
+                return [$closure_id, $this->getClosureStorage($source->getFilePath(), $closure_id)];
+            } catch (UnexpectedValueException) {
+                return null;
+            }
+        }
+
+        if (MethodIdentifier::isValidMethodIdReference($function)) {
+            $method_id = MethodIdentifier::wrap($function);
+            $fq_class_name = $this->classlikes->getUnAliasedName($method_id->fq_class_name);
+            if (!$this->classlike_storage_provider->has($fq_class_name)) {
+                return null;
+            }
+
+            $declaring_method_id = $this->methods->getDeclaringMethodId($method_id);
+
+            return $declaring_method_id === null
+                ? null
+                : [
+                    FunctionLikeAnalyzer::getCasedBodyMethodId($this, $method_id),
+                    $this->methods->getStorage($declaring_method_id),
+                ];
+        }
+
+        $function_id = strtolower(ltrim($function, '\\'));
+        if (!$function_id) {
+            return null;
+        }
+
+        try {
+            $storage = $this->functions->getStorage(
+                null,
+                $function_id,
+                $source->getRootFilePath(),
+                $source->getFilePath(),
+            );
+        } catch (UnexpectedValueException) {
+            return null;
+        }
+
+        return [$storage->cased_name ?? $function, $storage];
+    }
+
+    /**
+     * $call_location if the call there of the function-like of $storage has nodes of its own
+     */
+    private function getTaintSpecializationLocation(
+        StatementsSource $source,
+        FunctionLikeStorage $storage,
+        ?CodeLocation $call_location,
+    ): ?CodeLocation {
+        return $call_location !== null
+            && TaintFlowGraph::isCallSpecialized($this->getTaintFlowGraphOf($source), $this, $storage, $call_location)
+            ? $call_location
+            : null;
+    }
+
+    /**
+     * Adds paths of type $path_type from $write_node into the keyed store $store (a class and a property,
+     * `Store::$data`, which need not exist) under each of the names, as `@psalm-flow ($value) -> Store::$data[$key]`
+     * does from what a call stores: each name is exact (true), or only known to start with what is given (false). See
+     * getTaintStoreNames(). With $value_type, what it holds flows into $write_node first.
+     *
+     * The paths go into the taint graph the statements of $source add theirs to (none while they suppress TaintedInput,
+     * or while Psalm analyzes them again only to collect what they mutate), or into the codebase's for another source.
+     *
+     * @param list<array{bool, string}> $names
+     * @psalm-capabilities read-props|write-props
+     */
+    public function addTaintStoreWrite(
+        StatementsSource $source,
+        string $store,
+        array $names,
+        DataFlowNode $write_node,
+        string $path_type = 'arg',
+        ?Union $value_type = null,
+    ): void {
+        $graph = $this->getTaintFlowGraphOf($source);
+        if ($graph === null) {
+            return;
+        }
+
+        $graph->addNode($write_node);
+        foreach ($value_type?->parent_nodes ?? [] as $parent_node) {
+            $graph->addPath($parent_node, $write_node, $path_type);
+        }
+
+        TaintStore::addWrite($graph, $store, $names, $write_node, $path_type);
+    }
+
+    /**
+     * Adds paths of type $path_type to $read_node from the keyed store $store under each of the names, as
+     * `@psalm-flow Store::$data[$key] -> return` does to what a call returns (see addTaintStoreWrite())
+     *
+     * @param list<array{bool, string}> $names
+     * @psalm-capabilities read-props|write-props
+     */
+    public function addTaintStoreRead(
+        StatementsSource $source,
+        string $store,
+        array $names,
+        DataFlowNode $read_node,
+        string $path_type = 'arg',
+    ): void {
+        $graph = $this->getTaintFlowGraphOf($source);
+        if ($graph === null) {
+            return;
+        }
+
+        $graph->addNode($read_node);
+        TaintStore::addRead($graph, $store, $names, $read_node, $path_type);
+    }
+
+    /**
+     * The names of a keyed store the analysed expression can be, for addTaintStoreWrite() and addTaintStoreRead():
+     * exact for a type of literals or class names, else the start the analysis knows of it; any name without an
+     * expression
+     *
+     * @return list<array{bool, string}>
+     */
+    public function getTaintStoreNames(StatementsSource $source, ?PhpParser\Node\Expr $expr): array
+    {
+        return $source instanceof StatementsAnalyzer ? TaintStore::getNames($source, $expr) : [[false, '']];
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    private function getTaintFlowGraphOf(StatementsSource $source): ?TaintFlowGraph
+    {
+        return $source instanceof StatementsAnalyzer
+            ? $source->getTaintFlowGraphWithSuppressed()
+            : $this->taint_flow_graph;
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function getMinorAnalysisPhpVersion(): int
+    {
+        return self::transformPhpVersionId($this->analysis_php_version_id % 10_000, 100);
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function getMajorAnalysisPhpVersion(): int
+    {
+        return self::transformPhpVersionId($this->analysis_php_version_id, 10_000);
+    }
+
+    /**
+     * @psalm-pure
+     */
+    public static function transformPhpVersionId(int $php_version_id, int $div): int
+    {
+        return intdiv($php_version_id, $div);
+    }
+
+    /**
+     * Renders a php_version_id (e.g. 8_05_00) as a `major.minor` string for messages.
+     *
+     * @psalm-pure
+     */
+    public static function getPhpVersionString(int $php_version_id): string
+    {
+        return self::transformPhpVersionId($php_version_id, 10_000)
+            . '.' . self::transformPhpVersionId($php_version_id % 10_000, 100);
+    }
+
+    /**
+     * Whether a native class-like stubbed with a newer `@since` than the analysed PHP version is
+     * provided by a polyfill the project's composer autoloader can load (e.g. `Stringable` from
+     * symfony/polyfill-php80). Such polyfills are usually never scanned, since the stub already
+     * defines the class, so the autoloader is asked directly.
+     */
+    public function isClassLikePolyfilled(string $fq_classlike_name): bool
+    {
+        return $this->config->getComposerFilePathForClassLike($fq_classlike_name) !== false;
+    }
+
+    /**
+     * The lowest PHP version the code at this point runs on, when a guard raised it above the
+     * analysed one: a PHP_VERSION_ID comparison, or a `*_exists()` check of a newer native symbol.
+     * Null otherwise.
+     *
+     * @psalm-capabilities read-props
+     */
+    public function getGuardedPhpVersionId(?Context $context): ?int
+    {
+        $type = $context?->vars_in_scope[Context::PHP_VERSION_ID_VAR_ID] ?? null;
+
+        if ($type === null) {
+            return null;
+        }
+
+        $min = null;
+        foreach ($type->getAtomicTypes() as $atomic) {
+            if ($atomic instanceof TLiteralInt) {
+                $atomic_min = $atomic->value;
+            } elseif ($atomic instanceof TIntRange && $atomic->min_bound !== null) {
+                $atomic_min = $atomic->min_bound;
+            } else {
+                return null;
+            }
+
+            $min = $min === null ? $atomic_min : min($min, $atomic_min);
+        }
+
+        return $min > $this->analysis_php_version_id ? $min : null;
+    }
+
+    /**
+     * The tail shared by the Undefined* messages reported when a native symbol (introduced in
+     * `$since_php_version_id`) is used on an older analysed PHP version without a polyfill. Prefix
+     * it with the symbol, e.g. "Function foo ". `symfony/polyfill-php<major><minor>` is the polyfill
+     * package for that version (e.g. symfony/polyfill-php81), which ships only some of its symbols.
+     *
+     * @psalm-capabilities read-props
+     */
+    public function getUnavailableSymbolMessageSuffix(int $since_php_version_id): string
+    {
+        $since = self::getPhpVersionString($since_php_version_id);
+
+        return 'is not defined for the analysed PHP version '
+            . self::getPhpVersionString($this->analysis_php_version_id)
+            . ' (it was introduced in PHP ' . $since . '); define a polyfill (symfony/polyfill-php'
+            . str_replace('.', '', $since) . ' ships some of the symbols of that version), or raise the analysed PHP'
+            . ' version';
+    }
+}

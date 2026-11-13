@@ -1,0 +1,507 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Internal\Analyzer\Statements\Block;
+
+use PhpParser;
+use Psalm\CodeLocation;
+use Psalm\Context;
+use Psalm\Internal\Analyzer\ClassLikeAnalyzer;
+use Psalm\Internal\Analyzer\ClassLikeNameOptions;
+use Psalm\Internal\Analyzer\ScopeAnalyzer;
+use Psalm\Internal\Analyzer\StatementsAnalyzer;
+use Psalm\Internal\DataFlow\DataFlowNode;
+use Psalm\Internal\Scope\FinallyScope;
+use Psalm\Issue\InvalidCatch;
+use Psalm\IssueBuffer;
+use Psalm\Type;
+use Psalm\Type\Atomic\TNamedObject;
+use Psalm\Type\Union;
+use UnexpectedValueException;
+
+use function array_intersect_key;
+use function array_map;
+use function array_merge;
+use function in_array;
+use function is_string;
+use function strtolower;
+
+/**
+ * @internal
+ */
+final class TryAnalyzer
+{
+    /**
+     * @return  false|null
+     */
+    public static function analyze(
+        StatementsAnalyzer $statements_analyzer,
+        PhpParser\Node\Stmt\TryCatch $stmt,
+        Context $context,
+    ): ?bool {
+        $catch_actions = [];
+        $all_catches_leave = true;
+
+        $codebase = $statements_analyzer->getCodebase();
+
+        /** @var int $i */
+        foreach ($stmt->catches as $i => $catch) {
+            $catch_actions[$i] = ScopeAnalyzer::getControlActions(
+                $catch->stmts,
+                $statements_analyzer->node_data,
+                [],
+            );
+            $all_catches_leave = $all_catches_leave && !in_array(ScopeAnalyzer::ACTION_NONE, $catch_actions[$i], true);
+        }
+
+        $existing_thrown_exceptions = $context->possibly_thrown_exceptions;
+
+        /**
+         * @var array<string, array<array-key, CodeLocation>> $context->possibly_thrown_exceptions
+         */
+        $context->possibly_thrown_exceptions = [];
+
+        $old_context = clone $context;
+
+        $try_context = clone $context;
+
+        if ($codebase->alter_code && $try_context->branch_point === null) {
+            $try_context->branch_point = (int) $stmt->getAttribute('startFilePos');
+        }
+
+        if ($stmt->finally) {
+            $try_context->finally_scope = new FinallyScope($try_context->vars_in_scope);
+        }
+
+        $assigned_var_ids = $try_context->assigned_var_ids;
+        $context->assigned_var_ids = [];
+
+        $was_inside_try = $context->inside_try;
+        $context->inside_try = true;
+
+        // a try nested in the body leaves through the finally of this one too
+        $outer_finally_scope = $context->finally_scope;
+        $context->finally_scope = $try_context->finally_scope;
+
+        if ($statements_analyzer->analyze($stmt->stmts, $context) === false) {
+            return false;
+        }
+
+        $context->finally_scope = $outer_finally_scope;
+        $context->inside_try = $was_inside_try;
+
+        $context->has_returned = false;
+
+        $try_block_control_actions = ScopeAnalyzer::getControlActions(
+            $stmt->stmts,
+            $statements_analyzer->node_data,
+            [],
+        );
+
+        /** @var array<string, int> */
+        $newly_assigned_var_ids = $context->assigned_var_ids;
+
+        $context->assigned_var_ids = array_merge(
+            $assigned_var_ids,
+            $newly_assigned_var_ids,
+        );
+
+        foreach ($context->vars_in_scope as $var_id => $type) {
+            if (!isset($try_context->vars_in_scope[$var_id])) {
+                $try_context->vars_in_scope[$var_id] = $type;
+
+                $context->vars_in_scope[$var_id] = $type->setPossiblyUndefined(true, true);
+            } else {
+                $try_context->vars_in_scope[$var_id] = Type::combineUnionTypes(
+                    $try_context->vars_in_scope[$var_id],
+                    $type,
+                );
+            }
+        }
+
+        if ($try_context->finally_scope) {
+            foreach ($context->vars_in_scope as $var_id => $type) {
+                $try_context->finally_scope->vars_in_scope[$var_id] = Type::combineUnionTypes(
+                    $try_context->finally_scope->vars_in_scope[$var_id] ?? null,
+                    $type,
+                    $statements_analyzer->getCodebase(),
+                );
+            }
+        }
+
+        $try_context->vars_possibly_in_scope = $context->vars_possibly_in_scope;
+        $try_context->possibly_thrown_exceptions = $context->possibly_thrown_exceptions;
+
+        $try_leaves_loop = $context->loop_scope
+            && $context->loop_scope->final_actions
+            && !in_array(ScopeAnalyzer::ACTION_NONE, $context->loop_scope->final_actions, true);
+
+        if (!$all_catches_leave) {
+            foreach ($newly_assigned_var_ids as $assigned_var_id => $_) {
+                $context->removeVarFromConflictingClauses($assigned_var_id);
+            }
+        } else {
+            foreach ($newly_assigned_var_ids as $assigned_var_id => $_) {
+                $try_context->removeVarFromConflictingClauses($assigned_var_id);
+            }
+        }
+
+        // at this point we have two contexts – $context, in which it is assumed that everything was fine,
+        // and $try_context - which allows all variables to have the union of the values before and after
+        // the try was applied
+        $original_context = clone $try_context;
+
+        $issues_to_suppress = [
+            'RedundantCondition',
+            'RedundantConditionGivenDocblockType',
+            'TypeDoesNotContainNull',
+            'TypeDoesNotContainType',
+        ];
+
+        $definitely_newly_assigned_var_ids = $newly_assigned_var_ids;
+
+        /** @var int $i */
+        // the variables a catch of a try that always exits gave the context: the next catches add to them
+        $vars_set_by_catches = [];
+
+        foreach ($stmt->catches as $i => $catch) {
+            $catch_context = clone $original_context;
+            $catch_context->has_returned = false;
+
+            foreach ($catch_context->vars_in_scope as $var_id => $type) {
+                if (!isset($old_context->vars_in_scope[$var_id])) {
+                    $catch_context->vars_in_scope[$var_id] = $type->setPossiblyUndefined(
+                        $catch_context->vars_in_scope[$var_id]->possibly_undefined,
+                        true,
+                    );
+                } else {
+                    $catch_context->vars_in_scope[$var_id] = Type::combineUnionTypes(
+                        $type,
+                        $old_context->vars_in_scope[$var_id],
+                    );
+                }
+            }
+
+            $fq_catch_classes = [];
+
+            if (!$catch->types) {
+                throw new UnexpectedValueException('Very bad');
+            }
+
+            foreach ($catch->types as $catch_type) {
+                $fq_catch_class = ClassLikeAnalyzer::getFQCLNFromNameObject(
+                    $catch_type,
+                    $statements_analyzer->getAliases(),
+                );
+
+                $fq_catch_class = $codebase->classlikes->getUnAliasedName($fq_catch_class);
+
+                if ($codebase->alter_code && $fq_catch_class) {
+                    $codebase->classlikes->handleClassLikeReferenceInMigration(
+                        $codebase,
+                        $statements_analyzer,
+                        $catch_type,
+                        $fq_catch_class,
+                        $context,
+                    );
+                }
+
+                if ($original_context->check_classes) {
+                    ClassLikeAnalyzer::checkFullyQualifiedClassLikeName(
+                        $statements_analyzer,
+                        $fq_catch_class,
+                        new CodeLocation($statements_analyzer->getSource(), $catch_type, $context->include_location),
+                        $context,
+                        $statements_analyzer->getSuppressedIssues(),
+                        new ClassLikeNameOptions(true, context: $context),
+                    );
+                }
+
+                if (($codebase->classExists($fq_catch_class, null, $context)
+                        && strtolower($fq_catch_class) !== 'exception'
+                        && !($codebase->classExtends($fq_catch_class, 'Exception')
+                            || $codebase->classImplements($fq_catch_class, 'Throwable')))
+                    || ($codebase->interfaceExists($fq_catch_class, null, $context)
+                        && strtolower($fq_catch_class) !== 'throwable'
+                        && !$codebase->interfaceExtends($fq_catch_class, 'Throwable'))
+                ) {
+                    IssueBuffer::maybeAdd(
+                        new InvalidCatch(
+                            'Class/interface ' . $fq_catch_class . ' cannot be caught',
+                            new CodeLocation($statements_analyzer->getSource(), $stmt),
+                            $fq_catch_class,
+                        ),
+                        $statements_analyzer->getSuppressedIssues(),
+                    );
+                }
+
+                $fq_catch_classes[] = $fq_catch_class;
+            }
+
+            if ($catch_context->collect_exceptions) {
+                foreach ($fq_catch_classes as $fq_catch_class) {
+                    $fq_catch_class_lower = strtolower($fq_catch_class);
+
+                    foreach ($catch_context->possibly_thrown_exceptions as $exception_fqcln => $_) {
+                        $exception_fqcln_lower = strtolower($exception_fqcln);
+
+                        if ($exception_fqcln_lower === $fq_catch_class_lower
+                            || ($codebase->classExists($exception_fqcln, null, $context)
+                                && $codebase->classExtendsOrImplements($exception_fqcln, $fq_catch_class))
+                            || ($codebase->interfaceExists($exception_fqcln, null, $context)
+                                && $codebase->interfaceExtends($exception_fqcln, $fq_catch_class))
+                        ) {
+                            unset($original_context->possibly_thrown_exceptions[$exception_fqcln]);
+                            unset($context->possibly_thrown_exceptions[$exception_fqcln]);
+                            unset($catch_context->possibly_thrown_exceptions[$exception_fqcln]);
+                        }
+                    }
+                }
+
+                $catch_context->possibly_thrown_exceptions = [];
+            }
+
+            // discard all clauses because crazy stuff may have happened in try block
+            $catch_context->clauses = [];
+
+            if ($catch->var && is_string($catch->var->name)) {
+                $catch_var_id = '$' . $catch->var->name;
+
+                $catch_context->vars_in_scope[$catch_var_id] = new Union(
+                    array_map(
+                        static fn(string $fq_catch_class): TNamedObject => new TNamedObject(
+                            $fq_catch_class,
+                            false,
+                            false,
+                            strtolower($fq_catch_class) !== 'throwable'
+                                && $codebase->interfaceExists($fq_catch_class, null, $context)
+                                && !$codebase->interfaceExtends($fq_catch_class, 'Throwable')
+                                    ? ['Throwable' => new TNamedObject('Throwable')]
+                                    : [],
+                        ),
+                        $fq_catch_classes,
+                    ),
+                );
+
+                // removes dependent vars from $context
+                $catch_context->removeDescendents(
+                    $catch_var_id,
+                    $catch_context->vars_in_scope[$catch_var_id],
+                    $catch_context->vars_in_scope[$catch_var_id],
+                    $statements_analyzer,
+                );
+
+                $catch_context->vars_possibly_in_scope[$catch_var_id] = true;
+
+                $location = new CodeLocation($statements_analyzer->getSource(), $catch->var);
+
+                if (!$statements_analyzer->hasVariable($catch_var_id)) {
+                    $statements_analyzer->registerVariable(
+                        $catch_var_id,
+                        $location,
+                        $catch_context->branch_point,
+                    );
+                } else {
+                    $statements_analyzer->registerVariableAssignment(
+                        $catch_var_id,
+                        $location,
+                    );
+                }
+
+                if ($statements_analyzer->data_flow_graph) {
+                    $catch_var_node = DataFlowNode::getForAssignment($catch_var_id, $location);
+
+                    $catch_context->vars_in_scope[$catch_var_id] =
+                        $catch_context->vars_in_scope[$catch_var_id]->addParentNodes([
+                            $catch_var_node->id => $catch_var_node,
+                        ])
+                    ;
+
+                    $statements_analyzer->data_flow_graph->addPath(
+                        $catch_var_node,
+                        DataFlowNode::getForVariableUse(),
+                        'variable-use',
+                    );
+                }
+
+                $taint_flow_graph = $statements_analyzer->getTaintFlowGraphWithSuppressed();
+                if ($taint_flow_graph) {
+                    // the analysis does not follow an exception from where it is thrown to where it is caught: what
+                    // it holds (its message, the arguments in its trace) may come from any data, which dumping it
+                    // (print_r(), var_export()) prints. The variable's own node is the source: a node specialized to
+                    // the catch would make the calls on the exception specialized to it, which every call of the
+                    // same method elsewhere reaches through their shared node.
+                    $taint_flow_graph->addSource(
+                        DataFlowNode::getForAssignment($catch_var_id, $location)->setTaints(
+                            $statements_analyzer->getCodebase()->getInputTaints(),
+                        ),
+                    );
+                }
+            }
+
+            $suppressed_issues = $statements_analyzer->getSuppressedIssues();
+
+            foreach ($issues_to_suppress as $issue_to_suppress) {
+                if (!in_array($issue_to_suppress, $suppressed_issues, true)) {
+                    $statements_analyzer->addSuppressedIssues([$issue_to_suppress]);
+                }
+            }
+
+            $old_catch_assigned_var_ids = $catch_context->assigned_var_ids;
+
+            $catch_context->assigned_var_ids = [];
+
+            $statements_analyzer->analyze($catch->stmts, $catch_context);
+
+            // recalculate in case there's a no-return clause
+            $catch_actions[$i] = ScopeAnalyzer::getControlActions(
+                $catch->stmts,
+                $statements_analyzer->node_data,
+                [],
+            );
+
+            foreach ($issues_to_suppress as $issue_to_suppress) {
+                if (!in_array($issue_to_suppress, $suppressed_issues, true)) {
+                    $statements_analyzer->removeSuppressedIssues([$issue_to_suppress]);
+                }
+            }
+
+            /** @var array<string, bool> */
+            $new_catch_assigned_var_ids = $catch_context->assigned_var_ids;
+
+            $catch_context->assigned_var_ids += $old_catch_assigned_var_ids;
+
+            if ($catch_context->collect_exceptions) {
+                $context->mergeExceptions($catch_context);
+            }
+
+            $catch_doesnt_leave_parent_scope = in_array(ScopeAnalyzer::ACTION_NONE, $catch_actions[$i], true);
+
+            if ($catch_doesnt_leave_parent_scope) {
+                $definitely_newly_assigned_var_ids = array_intersect_key(
+                    $new_catch_assigned_var_ids,
+                    $definitely_newly_assigned_var_ids,
+                );
+
+                foreach ($catch_context->vars_in_scope as $var_id => $type) {
+                    if ($try_block_control_actions === [ScopeAnalyzer::ACTION_END]) {
+                        $context->vars_in_scope[$var_id] = isset($vars_set_by_catches[$var_id])
+                            ? Type::combineUnionTypes($context->vars_in_scope[$var_id], $type)
+                            : $type;
+                        $vars_set_by_catches[$var_id] = true;
+                    } elseif (isset($context->vars_in_scope[$var_id])) {
+                        $context->vars_in_scope[$var_id] = Type::combineUnionTypes(
+                            $context->vars_in_scope[$var_id],
+                            $type,
+                        );
+                    }
+                }
+
+                $context->vars_possibly_in_scope = array_merge(
+                    $catch_context->vars_possibly_in_scope,
+                    $context->vars_possibly_in_scope,
+                );
+            } else {
+                if ($stmt->finally) {
+                    $context->vars_possibly_in_scope = array_merge(
+                        $catch_context->vars_possibly_in_scope,
+                        $context->vars_possibly_in_scope,
+                    );
+                }
+            }
+
+            if ($try_context->finally_scope) {
+                foreach ($catch_context->vars_in_scope as $var_id => &$type) {
+                    if (isset($try_context->finally_scope->vars_in_scope[$var_id])) {
+                        if ($try_context->finally_scope->vars_in_scope[$var_id] !== $type) {
+                            $try_context->finally_scope->vars_in_scope[$var_id] = Type::combineUnionTypes(
+                                $try_context->finally_scope->vars_in_scope[$var_id],
+                                $type,
+                                $statements_analyzer->getCodebase(),
+                            );
+                        }
+                    } else {
+                        $try_context->finally_scope->vars_in_scope[$var_id] = $type->setPossiblyUndefined(
+                            true,
+                            true,
+                        );
+                    }
+                }
+                unset($type);
+            }
+        }
+
+        if ($context->loop_scope
+            && !$try_leaves_loop
+            && !in_array(ScopeAnalyzer::ACTION_NONE, $context->loop_scope->final_actions, true)
+        ) {
+            $context->loop_scope->final_actions[] = ScopeAnalyzer::ACTION_NONE;
+        }
+
+        $finally_has_returned = false;
+        if ($stmt->finally) {
+            if ($try_context->finally_scope) {
+                $finally_context = clone $context;
+
+                $finally_context->assigned_var_ids = [];
+                $finally_context->possibly_assigned_var_ids = [];
+
+                $finally_context->vars_in_scope = $try_context->finally_scope->vars_in_scope;
+
+                $statements_analyzer->analyze($stmt->finally->stmts, $finally_context);
+
+                $context->constructor_exits?->applyFinally(
+                    $try_context->finally_scope,
+                    $finally_context->vars_in_scope,
+                    $finally_context->assigned_var_ids,
+                );
+
+                $finally_has_returned = $finally_context->has_returned;
+
+                /** @var string $var_id */
+                foreach ($finally_context->assigned_var_ids as $var_id => $_) {
+                    if (isset($context->vars_in_scope[$var_id])
+                        && isset($finally_context->vars_in_scope[$var_id])
+                    ) {
+                        $possibly_undefined = $context->vars_in_scope[$var_id]->possibly_undefined
+                            && $context->vars_in_scope[$var_id]->possibly_undefined_from_try;
+
+                        // the finally block started from every state the try and the catches can end in
+                        $context->vars_in_scope[$var_id] = $finally_context->vars_in_scope[$var_id];
+
+                        if ($possibly_undefined) {
+                            $context->vars_in_scope[$var_id] = $context->vars_in_scope[$var_id]
+                                ->setPossiblyUndefined(false, false);
+                        }
+                    } elseif (isset($finally_context->vars_in_scope[$var_id])) {
+                        $context->vars_in_scope[$var_id] = $finally_context->vars_in_scope[$var_id];
+                    }
+                }
+            }
+        }
+
+        foreach ($definitely_newly_assigned_var_ids as $var_id => $_) {
+            if (isset($context->vars_in_scope[$var_id])) {
+                if ($context->vars_in_scope[$var_id]->possibly_undefined_from_try) {
+                    $context->vars_in_scope[$var_id] =
+                        $context->vars_in_scope[$var_id]->setPossiblyUndefined(
+                            false,
+                            false,
+                        );
+                }
+            }
+        }
+
+        foreach ($existing_thrown_exceptions as $possibly_thrown_exception => $codelocations) {
+            foreach ($codelocations as $hash => $codelocation) {
+                $context->possibly_thrown_exceptions[$possibly_thrown_exception][$hash] = $codelocation;
+            }
+        }
+
+        $body_has_returned = !in_array(ScopeAnalyzer::ACTION_NONE, $try_block_control_actions, true);
+        $context->has_returned = ($body_has_returned && $all_catches_leave) || $finally_has_returned;
+
+        return null;
+    }
+}

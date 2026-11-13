@@ -1,0 +1,999 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Internal\Analyzer\Statements\Expression\Fetch;
+
+use PhpParser;
+use Psalm\CodeLocation;
+use Psalm\Config;
+use Psalm\Context;
+use Psalm\Internal\Analyzer\ClosureAnalyzer;
+use Psalm\Internal\Analyzer\FunctionLikeAnalyzer;
+use Psalm\Internal\Analyzer\Statements\Expression\AssignmentAnalyzer;
+use Psalm\Internal\Analyzer\Statements\ExpressionAnalyzer;
+use Psalm\Internal\Analyzer\Statements\GlobalAnalyzer;
+use Psalm\Internal\Analyzer\StatementsAnalyzer;
+use Psalm\Internal\Codebase\TaintFlowGraph;
+use Psalm\Internal\DataFlow\DataFlowNode;
+use Psalm\Issue\ImpureGlobalVariable;
+use Psalm\Issue\ImpureVariable;
+use Psalm\Issue\InvalidScope;
+use Psalm\Issue\PossiblyUndefinedGlobalVariable;
+use Psalm\Issue\PossiblyUndefinedVariable;
+use Psalm\Issue\UndefinedGlobalVariable;
+use Psalm\Issue\UndefinedVariable;
+use Psalm\IssueBuffer;
+use Psalm\Plugin\EventHandler\Event\AddRemoveTaintsEvent;
+use Psalm\Storage\Capabilities;
+use Psalm\Type;
+use Psalm\Type\Atomic\TArray;
+use Psalm\Type\Atomic\TBool;
+use Psalm\Type\Atomic\TFloat;
+use Psalm\Type\Atomic\TInt;
+use Psalm\Type\Atomic\TIntRange;
+use Psalm\Type\Atomic\TKeyedArray;
+use Psalm\Type\Atomic\TNonEmptyArray;
+use Psalm\Type\Atomic\TNonEmptyString;
+use Psalm\Type\Atomic\TNull;
+use Psalm\Type\Atomic\TString;
+use Psalm\Type\Union;
+
+use function in_array;
+use function is_string;
+use function str_starts_with;
+use function strpbrk;
+
+/**
+ * @internal
+ */
+final class VariableFetchAnalyzer
+{
+    private const SUPER_GLOBALS = [
+        '$GLOBALS',
+        '$_SERVER',
+        '$_GET',
+        '$_POST',
+        '$_FILES',
+        '$_COOKIE',
+        '$_SESSION',
+        '$_REQUEST',
+        '$_ENV',
+        '$http_response_header',
+    ];
+
+    /**
+     * @param bool $from_global - when used in a global keyword
+     * @param bool $assigned_to_reference This is set to true when the expression being analyzed
+     *                                    here is being assigned to another variable by reference.
+     * @psalm-suppress ComplexMethod
+     */
+    public static function analyze(
+        StatementsAnalyzer $statements_analyzer,
+        PhpParser\Node\Expr\Variable $stmt,
+        Context $context,
+        bool $passed_by_reference = false,
+        ?Union $by_ref_type = null,
+        bool $array_assignment = false,
+        bool $from_global = false,
+        bool $assigned_to_reference = false,
+    ): bool {
+        $project_analyzer = $statements_analyzer->getFileAnalyzer()->project_analyzer;
+        $codebase = $statements_analyzer->getCodebase();
+
+        if ($stmt->name === 'this') {
+            if ($statements_analyzer->isStatic()) {
+                return !IssueBuffer::accepts(
+                    new InvalidScope(
+                        'Invalid reference to $this in a static context',
+                        new CodeLocation($statements_analyzer->getSource(), $stmt),
+                    ),
+                    $statements_analyzer->getSuppressedIssues(),
+                );
+            }
+
+            if (!isset($context->vars_in_scope['$this'])) {
+                if (IssueBuffer::accepts(
+                    new InvalidScope(
+                        'Invalid reference to $this in a non-class context',
+                        new CodeLocation($statements_analyzer->getSource(), $stmt),
+                    ),
+                    $statements_analyzer->getSuppressedIssues(),
+                )) {
+                    return false;
+                }
+
+                $context->vars_in_scope['$this'] = Type::getMixed();
+                $context->vars_possibly_in_scope['$this'] = true;
+
+                return true;
+            }
+
+            $statements_analyzer->node_data->setType($stmt, $context->vars_in_scope['$this']);
+
+            if ($codebase->store_node_types
+                    && !$context->collect_initializations
+                    && !$context->collect_mutations
+                && ($stmt_type = $statements_analyzer->node_data->getType($stmt))
+            ) {
+                $codebase->analyzer->addNodeType(
+                    $statements_analyzer->getFilePath(),
+                    $stmt,
+                    $stmt_type->getId(),
+                );
+            }
+
+            // using `$this` needs a capability over its properties: reading or writing them
+            $statements_analyzer->signalMutation(
+                ($context->capabilities & Capabilities::WRITE_THIS_PROPS) !== 0
+                    ? Capabilities::NONE
+                    : Capabilities::READ_PROPS,
+                $context,
+                '$this',
+                ImpureVariable::class,
+                $stmt,
+                Capabilities::READ_PROPS,
+            );
+
+            return true;
+        }
+
+        if (!$context->check_variables) {
+            if (is_string($stmt->name)) {
+                $var_name = '$' . $stmt->name;
+
+                if (!$context->hasVariable($var_name)) {
+                    $context->vars_in_scope[$var_name] = Type::getMixed();
+                    $context->vars_possibly_in_scope[$var_name] = true;
+                    $statements_analyzer->node_data->setType($stmt, Type::getMixed());
+                } else {
+                    $stmt_type = $context->vars_in_scope[$var_name];
+
+                    self::addDataFlowToVariable($statements_analyzer, $stmt, $var_name, $stmt_type, $context);
+
+                    $context->vars_in_scope[$var_name] = $stmt_type;
+                    $statements_analyzer->node_data->setType($stmt, $stmt_type);
+                }
+            } else {
+                $statements_analyzer->node_data->setType($stmt, Type::getMixed());
+            }
+
+            return true;
+        }
+
+        if (is_string($stmt->name) && self::isSuperGlobal('$' . $stmt->name)) {
+            $var_name = '$' . $stmt->name;
+
+            $statements_analyzer->signalMutation(
+                Capabilities::READ_GLOBALS,
+                $context,
+                "superglobal $var_name",
+                ImpureGlobalVariable::class,
+                $stmt,
+            );
+
+            if (isset($context->vars_in_scope[$var_name])) {
+                $type = $context->vars_in_scope[$var_name];
+
+                self::taintVariable($statements_analyzer, $context, $var_name, $type, $stmt);
+
+                $context->vars_in_scope[$var_name] = $type;
+                $statements_analyzer->node_data->setType(
+                    $stmt,
+                    self::getReadSuperGlobalType(
+                        self::taintGlobals($statements_analyzer, $var_name, $type, $array_assignment),
+                        $var_name,
+                        $context,
+                    ),
+                );
+
+                return true;
+            }
+
+            $type = self::getGlobalType($var_name, $codebase->analysis_php_version_id);
+
+            self::taintVariable($statements_analyzer, $context, $var_name, $type, $stmt);
+
+            $statements_analyzer->node_data->setType(
+                $stmt,
+                self::getReadSuperGlobalType(
+                    self::taintGlobals($statements_analyzer, $var_name, $type, $array_assignment),
+                    $var_name,
+                    $context,
+                ),
+            );
+            $context->vars_in_scope[$var_name] = $type;
+            $context->vars_possibly_in_scope[$var_name] = true;
+
+            $codebase->analyzer->addNodeReference(
+                $statements_analyzer->getFilePath(),
+                $stmt,
+                $var_name,
+            );
+
+            return true;
+        }
+
+        if (!is_string($stmt->name)) {
+            $statements_analyzer->signalMutation(
+                Capabilities::READ_PROPS,
+                $context,
+                'unknown variable',
+                ImpureVariable::class,
+                $stmt,
+            );
+
+            $was_inside_general_use = $context->inside_general_use;
+            $context->inside_general_use = true;
+            $expr_result = ExpressionAnalyzer::analyze($statements_analyzer, $stmt->name, $context);
+            $context->inside_general_use = $was_inside_general_use;
+
+            // any variable assigned so far may be the one fetched
+            if ($statements_analyzer->data_flow_graph) {
+                foreach ($context->vars_in_scope as $scope_var_id => $scope_var_type) {
+                    if (!str_starts_with($scope_var_id, '$')
+                        || strpbrk($scope_var_id, '->[:') !== false
+                    ) {
+                        continue;
+                    }
+
+                    foreach ($scope_var_type->parent_nodes as $parent_node) {
+                        $statements_analyzer->data_flow_graph->addPath(
+                            $parent_node,
+                            DataFlowNode::getForVariableUse(),
+                            'variable-use',
+                        );
+                    }
+                }
+            }
+
+            return $expr_result;
+        }
+
+        if ($passed_by_reference && $by_ref_type) {
+            AssignmentAnalyzer::assignByRefParam(
+                $statements_analyzer,
+                $stmt,
+                $by_ref_type,
+                $by_ref_type,
+                $context,
+            );
+
+            return true;
+        }
+
+        $var_name = '$' . $stmt->name;
+
+        if (!$context->hasVariable($var_name)) {
+            if (!isset($context->vars_possibly_in_scope[$var_name])
+                || !$statements_analyzer->getFirstAppearance($var_name)
+            ) {
+                if ($array_assignment || $assigned_to_reference) {
+                    if ($array_assignment) {
+                        // if we're in an array assignment, let's assign the variable because PHP allows it
+                        $stmt_type = Type::getArray();
+                    } else {
+                        // If a variable is assigned by reference to a variable that
+                        // does not exist, they are automatically initialized as `null`
+                        $stmt_type = Type::getNull();
+                    }
+                    $context->vars_in_scope[$var_name] = $stmt_type;
+                    $context->vars_possibly_in_scope[$var_name] = true;
+
+                    // it might have been defined first in another if/else branch
+                    if (!$statements_analyzer->hasVariable($var_name)) {
+                        $statements_analyzer->registerVariable(
+                            $var_name,
+                            new CodeLocation($statements_analyzer, $stmt),
+                            $context->branch_point,
+                        );
+                    }
+
+                    self::taintVariable($statements_analyzer, $context, $var_name, $stmt_type, $stmt);
+                    $statements_analyzer->node_data->setType($stmt, $stmt_type);
+
+                    if ($assigned_to_reference) {
+                        // Since this variable was created by being assigned to as a reference (ie for
+                        // `$a = &$b` this variable is $b), we need to analyze it as an assignment to null.
+                        AssignmentAnalyzer::analyze($statements_analyzer, $stmt, null, $stmt_type, $context, null);
+
+                        // Stop here, we don't want it to be considered possibly undefined like the array case.
+                        return true;
+                    }
+                } elseif (!$context->inside_isset
+                    || $statements_analyzer->getSource() instanceof FunctionLikeAnalyzer
+                ) {
+                    if ($context->is_global || $from_global) {
+                        $exception = new UndefinedGlobalVariable(
+                            'Cannot find referenced variable ' . $var_name . ' in global scope',
+                            new CodeLocation($statements_analyzer->getSource(), $stmt),
+                            $var_name,
+                        );
+                    } else {
+                        $exception = new UndefinedVariable(
+                            'Cannot find referenced variable ' . $var_name,
+                            new CodeLocation($statements_analyzer->getSource(), $stmt),
+                        );
+                    }
+
+                    IssueBuffer::maybeAdd(
+                        $exception,
+                        $statements_analyzer->getSuppressedIssues(),
+                    );
+
+                    $type = Type::getMixed();
+                    self::taintVariable($statements_analyzer, $context, $var_name, $type, $stmt);
+
+                    $statements_analyzer->node_data->setType(
+                        $stmt,
+                        GlobalAnalyzer::taintGlobalRead($statements_analyzer, $context, $var_name, $type),
+                    );
+
+                    return true;
+                }
+            }
+
+            $first_appearance = $statements_analyzer->getFirstAppearance($var_name);
+
+            if ($first_appearance && !$context->inside_isset && !$context->inside_unset) {
+                if ($context->is_global) {
+                    if ($codebase->alter_code) {
+                        if (isset($project_analyzer->getIssuesToFix()['PossiblyUndefinedGlobalVariable'])) {
+                            $branch_point = $statements_analyzer->getBranchPoint($var_name);
+
+                            if ($branch_point) {
+                                $statements_analyzer->addVariableInitialization($var_name, $branch_point);
+                            }
+                        }
+                    } else {
+                        IssueBuffer::maybeAdd(
+                            new PossiblyUndefinedGlobalVariable(
+                                'Possibly undefined global variable ' . $var_name . ', first seen on line ' .
+                                    $first_appearance->getLineNumber(),
+                                new CodeLocation($statements_analyzer->getSource(), $stmt),
+                                $var_name,
+                            ),
+                            $statements_analyzer->getSuppressedIssues(),
+                            (bool) $statements_analyzer->getBranchPoint($var_name),
+                        );
+                    }
+                } elseif ($codebase->alter_code
+                    && isset($project_analyzer->getIssuesToFix()['PossiblyUndefinedVariable'])
+                ) {
+                    $branch_point = $statements_analyzer->getBranchPoint($var_name);
+
+                    if ($branch_point) {
+                        $statements_analyzer->addVariableInitialization($var_name, $branch_point);
+                    }
+                } else {
+                    IssueBuffer::maybeAdd(
+                        new PossiblyUndefinedVariable(
+                            'Possibly undefined variable ' . $var_name . ', first seen on line ' .
+                                $first_appearance->getLineNumber(),
+                            new CodeLocation($statements_analyzer->getSource(), $stmt),
+                        ),
+                        $statements_analyzer->getSuppressedIssues(),
+                        (bool) $statements_analyzer->getBranchPoint($var_name),
+                    );
+                }
+
+                if ($codebase->store_node_types
+                    && !$context->collect_initializations
+                    && !$context->collect_mutations
+                ) {
+                    $codebase->analyzer->addNodeReference(
+                        $statements_analyzer->getFilePath(),
+                        $stmt,
+                        $first_appearance->raw_file_start . '-' . $first_appearance->raw_file_end . ':mixed',
+                    );
+                }
+
+                $stmt_type = Type::getMixed();
+
+                self::addDataFlowToVariable($statements_analyzer, $stmt, $var_name, $stmt_type, $context);
+
+                $statements_analyzer->node_data->setType(
+                    $stmt,
+                    GlobalAnalyzer::taintGlobalRead($statements_analyzer, $context, $var_name, $stmt_type),
+                );
+
+                $statements_analyzer->registerPossiblyUndefinedVariable($var_name, $stmt);
+
+                return true;
+            }
+        } else {
+            $stmt_type = $context->vars_in_scope[$var_name];
+
+            if (isset($context->captured_by_ref[$var_name])) {
+                // `use (&$x)`: the enclosing scope may change it between calls, so reading it is
+                // reading state, like a property; a recursive closure reading itself is not
+                $source = $statements_analyzer->getSource();
+
+                if (!$source instanceof ClosureAnalyzer || $source->getRecursiveVarId() !== $var_name) {
+                    if ($source instanceof ClosureAnalyzer) {
+                        $source->signalling_by_ref_capture = true;
+                    }
+
+                    $statements_analyzer->signalMutation(
+                        Capabilities::READ_PROPS,
+                        $context,
+                        'variable ' . $var_name . ' captured by reference',
+                        ImpureVariable::class,
+                        $stmt,
+                    );
+
+                    if ($source instanceof ClosureAnalyzer) {
+                        $source->signalling_by_ref_capture = false;
+                    }
+                }
+            }
+
+            self::taintVariable($statements_analyzer, $context, $var_name, $stmt_type, $stmt);
+
+            if ($var_name === '$argv'
+                && $context->is_global
+                && ($graph = $statements_analyzer->getTaintFlowGraphWithSuppressed())
+            ) {
+                $argv_source = self::getArgvTaintSource($statements_analyzer, $graph, $stmt);
+                $stmt_type = $stmt_type->addParentNodes([$argv_source->id => $argv_source]);
+            }
+
+            self::addDataFlowToVariable($statements_analyzer, $stmt, $var_name, $stmt_type, $context);
+
+            $context->vars_in_scope[$var_name] = $stmt_type;
+            // the value that is read is defined, whatever the variable is (an isset() asks about the variable)
+            $statements_analyzer->node_data->setType(
+                $stmt,
+                $context->inside_isset ? $stmt_type : $stmt_type->setPossiblyUndefined(false),
+            );
+
+            // a variable a loop defines, where an iteration starts (see LoopAnalyzer)
+            if ($stmt_type->possibly_undefined
+                && !$stmt_type->possibly_undefined_from_try
+                && !$context->inside_isset
+                && !$context->inside_unset
+                // passed by reference, which defines it
+                && (!$context->inside_assignment || $array_assignment)
+                && ($first_appearance = $statements_analyzer->getFirstAppearance($var_name))
+                && !$codebase->alter_code
+            ) {
+                IssueBuffer::maybeAdd(
+                    $context->is_global
+                        ? new PossiblyUndefinedGlobalVariable(
+                            'Possibly undefined global variable ' . $var_name . ', first seen on line '
+                                . $first_appearance->getLineNumber(),
+                            new CodeLocation($statements_analyzer->getSource(), $stmt),
+                            $var_name,
+                        )
+                        : new PossiblyUndefinedVariable(
+                            'Possibly undefined variable ' . $var_name . ', first seen on line '
+                                . $first_appearance->getLineNumber(),
+                            new CodeLocation($statements_analyzer->getSource(), $stmt),
+                        ),
+                    $statements_analyzer->getSuppressedIssues(),
+                    (bool) $statements_analyzer->getBranchPoint($var_name),
+                );
+            }
+
+            if ($stmt_type->possibly_undefined_from_try && !$context->inside_isset) {
+                if ($context->is_global) {
+                    IssueBuffer::maybeAdd(
+                        new PossiblyUndefinedGlobalVariable(
+                            'Possibly undefined global variable ' . $var_name . ' defined in try block',
+                            new CodeLocation($statements_analyzer->getSource(), $stmt),
+                            $var_name,
+                        ),
+                        $statements_analyzer->getSuppressedIssues(),
+                    );
+                } else {
+                    IssueBuffer::maybeAdd(
+                        new PossiblyUndefinedVariable(
+                            'Possibly undefined variable ' . $var_name . ' defined in try block',
+                            new CodeLocation($statements_analyzer->getSource(), $stmt),
+                        ),
+                        $statements_analyzer->getSuppressedIssues(),
+                    );
+                }
+            }
+
+            if ($codebase->store_node_types
+                && !$context->collect_initializations
+                && !$context->collect_mutations
+            ) {
+                $codebase->analyzer->addNodeType(
+                    $statements_analyzer->getFilePath(),
+                    $stmt,
+                    $stmt_type->getId(),
+                );
+            }
+
+            if ($codebase->store_node_types
+                && !$context->collect_initializations
+                && !$context->collect_mutations
+            ) {
+                $first_appearance = $statements_analyzer->getFirstAppearance($var_name);
+
+                if ($first_appearance) {
+                    $codebase->analyzer->addNodeReference(
+                        $statements_analyzer->getFilePath(),
+                        $stmt,
+                        $first_appearance->raw_file_start
+                            . '-' . $first_appearance->raw_file_end
+                            . ':' . $stmt_type->getId(),
+                    );
+                }
+            }
+        }
+
+        return true;
+    }
+
+    private static function addDataFlowToVariable(
+        StatementsAnalyzer $statements_analyzer,
+        PhpParser\Node\Expr\Variable $stmt,
+        string $var_name,
+        Union &$stmt_type,
+        Context $context,
+    ): void {
+        if ($statements_analyzer->data_flow_graph
+            && ($context->inside_return
+                || $context->inside_call
+                || $context->inside_general_use
+                || $context->inside_conditional
+                || $context->inside_throw
+                || $context->inside_isset)
+        ) {
+            if (!$stmt_type->parent_nodes) {
+                $assignment_location = new CodeLocation($statements_analyzer->getSource(), $stmt);
+                $assignment_node = DataFlowNode::getForAssignment($var_name, $assignment_location);
+
+                // Analysing taints, the new node hides from the taint graph the parent nodes nested in
+                // the value, which carry its taint: lead them to it.
+                $taint_flow_graph = $statements_analyzer->getTaintFlowGraphWithSuppressed();
+
+                if ($taint_flow_graph
+                    && $taint_flow_graph->addPathsFromNestedParentNodes(
+                        $assignment_node,
+                        $stmt_type,
+                        $assignment_location,
+                    )
+                ) {
+                    $taint_flow_graph->addNode($assignment_node);
+                }
+
+                $stmt_type = $stmt_type->setParentNodes([
+                    $assignment_node->id => $assignment_node,
+                ]);
+            }
+
+            foreach ($stmt_type->parent_nodes as $parent_node) {
+                if ($context->inside_call || $context->inside_return) {
+                    $statements_analyzer->data_flow_graph->addPath(
+                        $parent_node,
+                        DataFlowNode::getForVariableUse(),
+                        'use-inside-call',
+                    );
+                } elseif ($context->inside_conditional) {
+                    $statements_analyzer->data_flow_graph->addPath(
+                        $parent_node,
+                        DataFlowNode::getForVariableUse(),
+                        'use-inside-conditional',
+                    );
+                } elseif ($context->inside_isset) {
+                    $statements_analyzer->data_flow_graph->addPath(
+                        $parent_node,
+                        DataFlowNode::getForVariableUse(),
+                        'use-inside-isset',
+                    );
+                } else {
+                    $statements_analyzer->data_flow_graph->addPath(
+                        $parent_node,
+                        DataFlowNode::getForVariableUse(),
+                        'variable-use',
+                    );
+                }
+            }
+        }
+    }
+
+    /**
+     * The arguments of a CLI script are its user's input, and PHP builds $argv from the query string with
+     * register_argc_argv (see also ArrayFetchAnalyzer::USER_CONTROLLED_SERVER_KEYS).
+     */
+    public static function getArgvTaintSource(
+        StatementsAnalyzer $statements_analyzer,
+        TaintFlowGraph $graph,
+        PhpParser\Node\Expr\Variable $stmt,
+    ): DataFlowNode {
+        $taint_source = DataFlowNode::getForTaint(
+            '$argv',
+            new CodeLocation($statements_analyzer->getSource(), $stmt),
+            $statements_analyzer->getCodebase()->getInputTaints(),
+        );
+        $graph->addSource($taint_source);
+
+        return $taint_source;
+    }
+
+    private static function taintVariable(
+        StatementsAnalyzer $statements_analyzer,
+        Context $context,
+        string $var_name,
+        Union &$type,
+        PhpParser\Node\Expr\Variable $stmt,
+    ): void {
+        if (!$graph = $statements_analyzer->getTaintFlowGraphWithSuppressed()) {
+            return;
+        }
+
+        $codebase = $statements_analyzer->getCodebase();
+
+        // Add superglobal server taint sources
+        if ($var_name === '$_GET'
+            || $var_name === '$_POST'
+            || $var_name === '$_COOKIE'
+            || $var_name === '$_REQUEST'
+        ) {
+            $taints = $codebase->getInputTaints();
+        } else {
+            $taints = 0;
+        }
+
+        // Trigger event to possibly get more/less taints
+        $event = new AddRemoveTaintsEvent($stmt, $context, $statements_analyzer, $codebase);
+
+        $added_taints = $codebase->config->eventDispatcher->dispatchAddTaints($event);
+        $removed_taints = $codebase->config->eventDispatcher->dispatchRemoveTaints($event);
+        $taints |= $added_taints;
+        $taints &= ~$removed_taints;
+
+        $taint_location = new CodeLocation($statements_analyzer->getSource(), $stmt);
+
+        if ($var_name === '$_FILES' && $taints === 0) {
+            $type = self::taintFiles($graph, $taint_location, $type, $codebase->getInputTaints());
+            return;
+        }
+
+        if ($taints === 0) {
+            return;
+        }
+
+        $taint_source = DataFlowNode::getForTaint(
+            $var_name,
+            $taint_location,
+            $taints,
+        );
+        $graph->addSource($taint_source);
+
+        $type = $type->setParentNodes([
+            $taint_source->id => $taint_source,
+        ]);
+    }
+
+    /**
+     * $GLOBALS holds what the whole program writes to the global variables (see GlobalAnalyzer::getGlobalNode()).
+     * The variable in scope doesn't, and neither does $GLOBALS assigned to: reading a global by its name gets
+     * what is written to that name only (see ArrayFetchAnalyzer::taintArrayFetch()).
+     */
+    private static function taintGlobals(
+        StatementsAnalyzer $statements_analyzer,
+        string $var_name,
+        Union $type,
+        bool $array_assignment,
+    ): Union {
+        if ($var_name !== '$GLOBALS'
+            || $array_assignment
+            || !($graph = $statements_analyzer->getTaintFlowGraphWithSuppressed())
+        ) {
+            return $type;
+        }
+
+        $globals_node = DataFlowNode::getForGlobals();
+        $graph->addNode($globals_node);
+
+        return $type->addParentNodes([$globals_node->id => $globals_node]);
+    }
+
+    /**
+     * The client chooses the names of the files it uploads, `$_FILES[...]['name']`, unlike the entries of an
+     * uploaded file the server writes (see also ArrayFetchAnalyzer::taintSuperGlobalFetch()).
+     *
+     * @param int $input_taints the taints of user input (see Codebase::getInputTaints())
+     */
+    private static function taintFiles(
+        TaintFlowGraph $graph,
+        CodeLocation $taint_location,
+        Union $type,
+        int $input_taints,
+    ): Union {
+        $taint_source = DataFlowNode::getForTaint('$_FILES[][\'name\']', $taint_location, $input_taints);
+        $name_node = DataFlowNode::getForAssignment('$_FILES[] name', $taint_location);
+        $files_node = DataFlowNode::getForAssignment('$_FILES', $taint_location);
+
+        $graph->addSource($taint_source);
+        $graph->addNode($name_node);
+        $graph->addNode($files_node);
+        $graph->addPath($taint_source, $name_node, 'arrayvalue-assignment-\'name\'');
+        $graph->addPath($name_node, $files_node, 'arrayvalue-assignment');
+
+        return $type->setParentNodes([$files_node->id => $files_node]);
+    }
+
+    /**
+     * The value that is read from a superglobal is defined, whatever the superglobal is (an isset() asks about it),
+     * but $http_response_header, which only exists after a network request, may not be
+     *
+     * @psalm-capabilities read-props
+     */
+    private static function getReadSuperGlobalType(Union $type, string $var_name, Context $context): Union
+    {
+        return $context->inside_isset || $var_name === '$http_response_header'
+            ? $type
+            : $type->setPossiblyUndefined(false);
+    }
+
+    /**
+     * @psalm-pure
+     */
+    public static function isSuperGlobal(string $var_id): bool
+    {
+        return in_array(
+            $var_id,
+            self::SUPER_GLOBALS,
+            true,
+        );
+    }
+
+    /** @var array<value-of<self::SUPER_GLOBALS>|'$_FILES full path'|'$argv'|'$argc', Union> */
+    private static array $globalCache = [];
+
+    public static function getGlobalType(string $var_id, int $codebase_analysis_php_version_id): Union
+    {
+        $config = Config::getInstance();
+
+        if (isset($config->globals[$var_id])) {
+            return Type::parseString($config->globals[$var_id]);
+        }
+
+        if (!self::$globalCache) {
+            foreach (self::SUPER_GLOBALS as $v) {
+                self::$globalCache[$v] = self::getGlobalTypeInner($v);
+            }
+            self::$globalCache['$_FILES full path'] = self::getGlobalTypeInner(
+                '$_FILES',
+                true,
+            );
+            self::$globalCache['$argv'] = self::getGlobalTypeInner('$argv');
+            self::$globalCache['$argc'] = self::getGlobalTypeInner('$argc');
+        }
+
+        if ($codebase_analysis_php_version_id >= 8_01_00 && $var_id === '$_FILES') {
+            $var_id = '$_FILES full path';
+        }
+
+        return self::$globalCache[$var_id] ?? Type::getMixed();
+    }
+
+    /**
+     * @param value-of<self::SUPER_GLOBALS>|'$argv'|'$argc' $var_id
+     */
+    private static function getGlobalTypeInner(string $var_id, bool $files_full_path = false): Union
+    {
+        if ($var_id === '$argv') {
+            // only in CLI, null otherwise
+            return new Union([
+                Type::getNonEmptyListAtomic(Type::getString()),
+                new TNull(),
+            ], [
+                'ignore_nullable_issues' => true,
+            ]);
+            // use TNull explicitly instead of this
+            // as it will cause weird errors due to ignore_nullable_issues true
+            // e.g. InvalidPropertyAssignmentValue
+            // $this->argv 'list<string>' cannot be assigned type 'non-empty-list<string>'
+        }
+
+        if ($var_id === '$argc') {
+            // only in CLI, null otherwise
+            return new Union([
+                new TIntRange(1, null),
+                new TNull(),
+            ], [
+                'ignore_nullable_issues' => true,
+            ]);
+        }
+
+        if ($var_id === '$http_response_header') {
+            // $http_response_header exists only in the local scope after a successful network request
+            return new Union([
+                Type::getNonEmptyListAtomic(Type::getNonFalsyString()),
+            ], [
+                'possibly_undefined' => true,
+            ]);
+        }
+
+        if ($var_id === '$GLOBALS') {
+            return new Union([
+                new TNonEmptyArray([
+                    Type::getNonEmptyString(),
+                    Type::getMixed(),
+                ]),
+            ]);
+        }
+
+        if ($var_id === '$_COOKIE') {
+            $type = new TArray(
+                [
+                    new Union([new TNonEmptyString(), new TInt()]),
+                    Type::getString(),
+                ],
+            );
+
+            return new Union([$type]);
+        }
+
+        if (in_array($var_id, ['$_GET', '$_POST', '$_REQUEST'], true)) {
+            $array_key = new Union([new TNonEmptyString(), new TInt()]);
+            $array = new TNonEmptyArray(
+                [
+                    $array_key,
+                    new Union([
+                        new TString(),
+                        new TArray([
+                            $array_key,
+                            Type::getMixed(),
+                        ]),
+                    ]),
+                ],
+            );
+
+            $type = new TArray(
+                [
+                    $array_key,
+                    new Union([new TString(), $array]),
+                ],
+            );
+
+            return new Union([$type]);
+        }
+
+        if ($var_id === '$_SERVER' || $var_id === '$_ENV') {
+            $string_helper = new Union([new TString()], ['possibly_undefined' => true]);
+            $non_empty_string_helper = new Union([new TNonEmptyString()], ['possibly_undefined' => true]);
+
+            $argv_helper = new Union([
+                Type::getNonEmptyListAtomic(Type::getString()),
+            ], ['possibly_undefined' => true]);
+
+            $positive_int_helper = new Union([
+                new TIntRange(1, null),
+            ], ['possibly_undefined' => true]);
+
+            $request_time_float_helper = new Union([
+                new TFloat(),
+            ], ['possibly_undefined' => true]);
+
+            $bool_string_helper = new Union([new TBool(), new TString()], ['possibly_undefined' => true]);
+
+            $arr = [
+                // https://www.php.net/manual/en/reserved.variables.server.php
+                'PHP_SELF'             => $non_empty_string_helper,
+                'GATEWAY_INTERFACE'    => $non_empty_string_helper,
+                'SERVER_ADDR'          => $non_empty_string_helper,
+                'SERVER_NAME'          => $non_empty_string_helper,
+                'SERVER_SOFTWARE'      => $non_empty_string_helper,
+                'SERVER_PROTOCOL'      => $non_empty_string_helper,
+                'REQUEST_METHOD'       => $non_empty_string_helper,
+                'REQUEST_TIME'         => $positive_int_helper,
+                'REQUEST_TIME_FLOAT'   => $request_time_float_helper,
+                'QUERY_STRING'         => $string_helper,
+                'DOCUMENT_ROOT'        => $non_empty_string_helper,
+                'HTTP_ACCEPT'          => $non_empty_string_helper,
+                'HTTP_ACCEPT_CHARSET'  => $non_empty_string_helper,
+                'HTTP_ACCEPT_ENCODING' => $non_empty_string_helper,
+                'HTTP_ACCEPT_LANGUAGE' => $non_empty_string_helper,
+                'HTTP_CONNECTION'      => $non_empty_string_helper,
+                'HTTP_HOST'            => $non_empty_string_helper,
+                'HTTP_REFERER'         => $non_empty_string_helper,
+                'HTTP_USER_AGENT'      => $non_empty_string_helper,
+                'HTTPS'                => $string_helper,
+                'REMOTE_ADDR'          => $non_empty_string_helper,
+                'REMOTE_HOST'          => $non_empty_string_helper,
+                'REMOTE_PORT'          => $string_helper,
+                'REMOTE_USER'          => $non_empty_string_helper,
+                'REDIRECT_REMOTE_USER' => $non_empty_string_helper,
+                'SCRIPT_FILENAME'      => $non_empty_string_helper,
+                'SERVER_ADMIN'         => $non_empty_string_helper,
+                'SERVER_PORT'          => $non_empty_string_helper,
+                'SERVER_SIGNATURE'     => $non_empty_string_helper,
+                'PATH_TRANSLATED'      => $non_empty_string_helper,
+                'SCRIPT_NAME'          => $non_empty_string_helper,
+                'REQUEST_URI'          => $non_empty_string_helper,
+                'PHP_AUTH_DIGEST'      => $non_empty_string_helper,
+                'PHP_AUTH_USER'        => $non_empty_string_helper,
+                'PHP_AUTH_PW'          => $non_empty_string_helper,
+                'AUTH_TYPE'            => $non_empty_string_helper,
+                'PATH_INFO'            => $non_empty_string_helper,
+                'ORIG_PATH_INFO'       => $non_empty_string_helper,
+                // misc from RFC not included above already http://www.faqs.org/rfcs/rfc3875.html
+                'CONTENT_LENGTH'       => $string_helper,
+                'CONTENT_TYPE'         => $string_helper,
+                // common, misc stuff
+                'FCGI_ROLE'            => $non_empty_string_helper,
+                'HOME'                 => $non_empty_string_helper,
+                'HTTP_CACHE_CONTROL'   => $non_empty_string_helper,
+                'HTTP_COOKIE'          => $non_empty_string_helper,
+                'HTTP_PRIORITY'        => $non_empty_string_helper,
+                'PATH'                 => $non_empty_string_helper,
+                'REDIRECT_STATUS'      => $non_empty_string_helper,
+                'REQUEST_SCHEME'       => $non_empty_string_helper,
+                'USER'                 => $non_empty_string_helper,
+                // common, misc headers
+                'HTTP_UPGRADE_INSECURE_REQUESTS' => $non_empty_string_helper,
+                'HTTP_X_FORWARDED_PROTO'         => $non_empty_string_helper,
+                'HTTP_CLIENT_IP'                 => $non_empty_string_helper,
+                'HTTP_X_REAL_IP'                 => $non_empty_string_helper,
+                'HTTP_X_FORWARDED_FOR'           => $non_empty_string_helper,
+                'HTTP_CF_CONNECTING_IP'          => $non_empty_string_helper,
+                'HTTP_CF_IPCOUNTRY'              => $non_empty_string_helper,
+                'HTTP_CF_VISITOR'                => $non_empty_string_helper,
+                'HTTP_CDN_LOOP'                  => $non_empty_string_helper,
+                // common, misc browser headers
+                'HTTP_DNT'                => $non_empty_string_helper,
+                'HTTP_SEC_FETCH_DEST'     => $non_empty_string_helper,
+                'HTTP_SEC_FETCH_USER'     => $non_empty_string_helper,
+                'HTTP_SEC_FETCH_MODE'     => $non_empty_string_helper,
+                'HTTP_SEC_FETCH_SITE'     => $non_empty_string_helper,
+                'HTTP_SEC_CH_UA_PLATFORM' => $non_empty_string_helper,
+                'HTTP_SEC_CH_UA_MOBILE'   => $non_empty_string_helper,
+                'HTTP_SEC_CH_UA'          => $non_empty_string_helper,
+                // phpunit
+                'APP_DEBUG' => $bool_string_helper,
+                'APP_ENV'   => $string_helper,
+            ];
+
+            if ($var_id === '$_SERVER') {
+                $arr['argv'] = $argv_helper;
+                $arr['argc'] = $positive_int_helper;
+            }
+
+            $detailed_type = TKeyedArray::make(
+                $arr,
+                null,
+                [Type::getNonEmptyString(), Type::getString()],
+            );
+
+            return new Union([$detailed_type]);
+        }
+
+        if ($var_id === '$_FILES') {
+            $str = Type::getString();
+            $values = [
+                'name' => $str,
+                'type' => $str,
+                'tmp_name' => $str,
+                'size' => Type::getListKey(),
+                'error' => Type::getIntRange(0, 8),
+            ];
+
+            if ($files_full_path) {
+                $values['full_path'] = $str;
+            }
+
+            $type = new Union([TKeyedArray::make($values)]);
+            $parent = new TArray([Type::getNonEmptyString(), $type]);
+
+            return new Union([$parent]);
+        }
+
+        // $var_id === $_SESSION
+
+        // keys must be string
+        return new Union([
+            new TArray([
+                Type::getNonEmptyString(),
+                Type::getMixed(),
+            ]),
+        ], ['possibly_undefined' => true]);
+    }
+}

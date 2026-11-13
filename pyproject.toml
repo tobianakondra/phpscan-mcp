@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "php-legacy-auditor"
+version = "0.1.0"
+description = "MCP server for static auditing of legacy PHP projects"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp",
+    "pydantic",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["php_legacy_auditor"]

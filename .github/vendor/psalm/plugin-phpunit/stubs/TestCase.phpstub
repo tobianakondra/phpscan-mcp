@@ -1,0 +1,20 @@
+<?php
+namespace PHPUnit\Framework;
+
+/**
+ * Without a constructor here, Psalm reports a property that setUp() initializes as MissingConstructor, which
+ * TestCaseHandler suppresses, rather than as PropertyNotSetInConstructor of TestCase's final constructor.
+ */
+abstract class TestCase extends Assert implements Test, SelfDescribing
+{
+}
+
+abstract class Assert
+{
+    /**
+     * @psalm-assert !empty $actual
+     * @throws ExpectationFailedException
+     * @throws GeneratorNotSupportedException
+     */
+    final public static function assertNotEmpty(mixed $actual, string $message = ''): void {}
+}

@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install semgrep phpcodesniffer
+
+      - name: Run tests
+        run: pytest tests/ -q
+
+      - name: Semgrep (static analysis)
+        run: |
+          semgrep --config auto tests/sample_vulnerable_app || true
+
+      - name: PHPCS (code style)
+        run: |
+          vendor/bin/phpcs --standard=PSR12 --report=summary tests/sample_vulnerable_app || true
+
+      - name: Psalm (type analysis)
+        run: |
+          vendor/bin/psalm --no-cache --show-info=false --threads=1 --no-progress

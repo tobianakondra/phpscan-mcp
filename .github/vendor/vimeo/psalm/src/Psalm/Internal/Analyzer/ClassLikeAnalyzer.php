@@ -1,0 +1,1107 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Internal\Analyzer;
+
+use InvalidArgumentException;
+use Override;
+use PhpParser;
+use Psalm\Aliases;
+use Psalm\CodeLocation;
+use Psalm\Codebase;
+use Psalm\Context;
+use Psalm\Internal\FileManipulation\FileManipulationBuffer;
+use Psalm\Internal\MethodIdentifier;
+use Psalm\Internal\Provider\NodeDataProvider;
+use Psalm\Internal\Type\Comparator\UnionTypeComparator;
+use Psalm\Internal\Type\PurityArguments;
+use Psalm\Internal\Type\TemplateDefaults;
+use Psalm\Internal\Type\TemplateResult;
+use Psalm\Internal\Type\TemplateStandinTypeReplacer;
+use Psalm\Internal\Type\TypeExpander;
+use Psalm\Issue\InaccessibleProperty;
+use Psalm\Issue\InvalidClass;
+use Psalm\Issue\InvalidTemplateParam;
+use Psalm\Issue\MissingDependency;
+use Psalm\Issue\MissingTemplateParam;
+use Psalm\Issue\ReservedWord;
+use Psalm\Issue\TooManyTemplateParams;
+use Psalm\Issue\UndefinedAttributeClass;
+use Psalm\Issue\UndefinedClass;
+use Psalm\Issue\UndefinedDocblockClass;
+use Psalm\IssueBuffer;
+use Psalm\Plugin\EventHandler\Event\AfterClassLikeExistenceCheckEvent;
+use Psalm\StatementsSource;
+use Psalm\Storage\Capabilities;
+use Psalm\Storage\ClassLikeStorage;
+use Psalm\Storage\PropertyStorage;
+use Psalm\Type;
+use Psalm\Type\Atomic\TTemplateParam;
+use Psalm\Type\Union;
+use UnexpectedValueException;
+
+use function array_keys;
+use function array_pop;
+use function array_search;
+use function count;
+use function explode;
+use function gettype;
+use function in_array;
+use function preg_match;
+use function preg_replace;
+use function strtolower;
+
+/**
+ * @internal
+ */
+abstract class ClassLikeAnalyzer extends SourceAnalyzer
+{
+    public const VISIBILITY_PUBLIC = 1;
+    public const VISIBILITY_PROTECTED = 2;
+    public const VISIBILITY_PRIVATE = 3;
+
+    public const SPECIAL_TYPES = [
+        'int' => 'int',
+        'string' => 'string',
+        'float' => 'float',
+        'bool' => 'bool',
+        'false' => 'false',
+        'object' => 'object',
+        'never' => 'never',
+        'callable' => 'callable',
+        'array' => 'array',
+        'iterable' => 'iterable',
+        'null' => 'null',
+        'mixed' => 'mixed',
+    ];
+
+    public const GETTYPE_TYPES = [
+        'boolean' => true,
+        'integer' => true,
+        'double' => true,
+        'string' => true,
+        'array' => true,
+        'object' => true,
+        'resource' => true,
+        'resource (closed)' => true,
+        'NULL' => true,
+        'unknown type' => true,
+    ];
+
+    public FileAnalyzer $file_analyzer;
+
+    /**
+     * The parent class
+     */
+    protected ?string $parent_fq_class_name = null;
+
+    protected ClassLikeStorage $storage;
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function __construct(
+        protected PhpParser\Node\Stmt\ClassLike $class,
+        SourceAnalyzer $source,
+        protected string $fq_class_name,
+    ) {
+        $this->source = $source;
+        $this->file_analyzer = $source->getFileAnalyzer();
+        $codebase = $source->getCodebase();
+        $this->storage = $codebase->classlike_storage_provider->get($fq_class_name);
+    }
+
+    /**
+     * Registers a class-like's own docblock `@psalm-suppress` annotations for the
+     * unused-suppression check, so redundant ones are reported (UnusedPsalmSuppress)
+     * like member-level suppressions already are.
+     *
+     * Uses the docblock suppressions recorded during scanning, keyed by the char offset of
+     * the issue name. Suppressions added programmatically by plugins land only in
+     * $storage->suppressed_issues and, having no source location, must not be reported.
+     *
+     * @psalm-external-mutation-free
+     */
+    public static function registerDocblockSuppressions(
+        ClassLikeStorage $storage,
+        string $file_path,
+        Codebase $codebase,
+    ): void {
+        $suppressed_issues = $storage->docblock_suppressed_issues;
+
+        if (!$codebase->track_unused_suppressions || $suppressed_issues === []) {
+            return;
+        }
+
+        // a lone UnusedPsalmSuppress should still be reported as unused
+        if (count($suppressed_issues) > 1
+            && $codebase->config->suppressesIssueType($suppressed_issues, 'UnusedPsalmSuppress')
+        ) {
+            return;
+        }
+
+        $file_path = $storage->location !== null ? $storage->location->file_path : $file_path;
+        $taint_analysis = $codebase->taint_flow_graph !== null;
+
+        foreach ($suppressed_issues as $offset => $issue_type) {
+            IssueBuffer::addUnusedSuppression($file_path, $offset, $issue_type, $taint_analysis);
+        }
+    }
+
+    /**
+     * @psalm-external-mutation-free
+     */
+    #[Override]
+    public function __destruct()
+    {
+        unset($this->source);
+        unset($this->file_analyzer);
+    }
+
+    /**
+     * Analyzes method $method_name of this class run on an object of a class inheriting it, `$this` in $context (see
+     * InheritedMethodTaints)
+     */
+    public function analyzeMethodForInheritingClass(string $method_name, Context $context): void
+    {
+        foreach ($this->class->stmts as $stmt) {
+            if ($stmt instanceof PhpParser\Node\Stmt\ClassMethod
+                && strtolower($stmt->name->name) === strtolower($method_name)
+            ) {
+                (new MethodAnalyzer($stmt, $this))->analyze($context, new NodeDataProvider(), null, true);
+
+                return;
+            }
+        }
+    }
+
+    /**
+     * @param string $method_name the name the method is called by, which can be the alias of a trait method
+     */
+    public function getMethodMutations(
+        string $method_name,
+        Context $context,
+    ): void {
+        $project_analyzer = $this->getFileAnalyzer()->project_analyzer;
+        $codebase = $project_analyzer->getCodebase();
+
+        // only the method PHP calls is analyzed: not the one of the class when an alias of a trait method is
+        // called, nor the one of a trait when the class overrides it
+        $called_method_id = $codebase->methods->getDeclaringMethodId(
+            new MethodIdentifier($context->self ?: $this->fq_class_name, strtolower($method_name)),
+        );
+        $actual_method_name = $called_method_id !== null ? $called_method_id->method_name : $method_name;
+
+        // what the caller established about its own variables says nothing about the method's
+        $context->clauses = [];
+
+        foreach ($this->class->stmts as $stmt) {
+            if ($stmt instanceof PhpParser\Node\Stmt\ClassMethod &&
+                strtolower($stmt->name->name) === strtolower($actual_method_name)
+            ) {
+                if ($called_method_id !== null
+                    && strtolower($called_method_id->fq_class_name) !== strtolower($this->fq_class_name)
+                ) {
+                    continue;
+                }
+
+                $method_analyzer = new MethodAnalyzer($stmt, $this);
+
+                $method_analyzer->analyze($context, new NodeDataProvider(), null, true);
+
+                $context->clauses = [];
+            } elseif ($stmt instanceof PhpParser\Node\Stmt\TraitUse) {
+                $this->getTraitUseMethodMutations(
+                    $stmt,
+                    $this->source->getAliases(),
+                    $actual_method_name,
+                    $called_method_id,
+                    $context,
+                );
+            }
+        }
+    }
+
+    /**
+     * Collects the mutations of a method defined by a trait used in the class, or by a trait that trait uses
+     */
+    private function getTraitUseMethodMutations(
+        PhpParser\Node\Stmt\TraitUse $stmt,
+        Aliases $aliases,
+        string $method_name,
+        ?MethodIdentifier $called_method_id,
+        Context $context,
+    ): void {
+        $project_analyzer = $this->getFileAnalyzer()->project_analyzer;
+        $codebase = $project_analyzer->getCodebase();
+
+        foreach ($stmt->traits as $trait) {
+            $fq_trait_name = $codebase->classlikes->getUnAliasedName(
+                self::getFQCLNFromNameObject($trait, $aliases),
+            );
+
+            $trait_file_analyzer = $project_analyzer->getFileAnalyzerForClassLike($fq_trait_name);
+            $trait_node = $codebase->classlikes->getTraitNode($fq_trait_name);
+            $trait_storage = $codebase->classlike_storage_provider->get($fq_trait_name);
+            $trait_aliases = $trait_storage->aliases;
+
+            if ($trait_aliases === null) {
+                continue;
+            }
+
+            $trait_analyzer = new TraitAnalyzer(
+                $trait_node,
+                $trait_file_analyzer,
+                $fq_trait_name,
+                $trait_aliases,
+            );
+
+            foreach ($trait_node->stmts as $trait_stmt) {
+                if ($trait_stmt instanceof PhpParser\Node\Stmt\TraitUse) {
+                    $this->getTraitUseMethodMutations(
+                        $trait_stmt,
+                        $trait_aliases,
+                        $method_name,
+                        $called_method_id,
+                        $context,
+                    );
+                } elseif ($trait_stmt instanceof PhpParser\Node\Stmt\ClassMethod &&
+                    strtolower($trait_stmt->name->name) === strtolower($method_name)
+                ) {
+                    $method_analyzer = new MethodAnalyzer($trait_stmt, $trait_analyzer);
+
+                    // only the method PHP calls is analyzed: a class that overrides the method of a trait
+                    // doesn't run the one of the trait
+                    if ($called_method_id !== null
+                        && (string) $method_analyzer->getMethodId() !== (string) $called_method_id
+                    ) {
+                        continue;
+                    }
+
+                    $method_analyzer->analyze(
+                        $context,
+                        new NodeDataProvider(),
+                        null,
+                        true,
+                    );
+                }
+            }
+
+            $trait_file_analyzer->clearSourceBeforeDestruction();
+        }
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function getFunctionLikeAnalyzer(string $method_name): ?MethodAnalyzer
+    {
+        foreach ($this->class->stmts as $stmt) {
+            if ($stmt instanceof PhpParser\Node\Stmt\ClassMethod &&
+                strtolower($stmt->name->name) === strtolower($method_name)
+            ) {
+                return new MethodAnalyzer($stmt, $this);
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Whether the name is one of the type names that can't be a class name
+     *
+     * @psalm-pure
+     */
+    public static function isReservedClassName(string $fq_class_name): bool
+    {
+        return (bool) preg_match(
+            '/(^|\\\)(int|float|bool|string|void|null|false|true|object|mixed)$/i',
+            $fq_class_name,
+        ) || strtolower($fq_class_name) === 'resource';
+    }
+
+    /**
+     * @param  array<string>    $suppressed_issues
+     */
+    public static function checkFullyQualifiedClassLikeName(
+        StatementsSource $statements_source,
+        string $fq_class_name,
+        CodeLocation $code_location,
+        ?Context $context,
+        array $suppressed_issues,
+        ?ClassLikeNameOptions $options = null,
+        bool $check_classes = true,
+    ): ?bool {
+        if ($options === null) {
+            $options = new ClassLikeNameOptions();
+        }
+
+        $codebase = $statements_source->getCodebase();
+        if ($fq_class_name === '') {
+            if (IssueBuffer::accepts(
+                new UndefinedClass(
+                    'Class or interface <empty string> does not exist',
+                    $code_location,
+                    'empty string',
+                ),
+                $suppressed_issues,
+            )) {
+                return false;
+            }
+
+            return null;
+        }
+
+        $fq_class_name = (string) preg_replace('/^\\\/', '', $fq_class_name, 1);
+
+        if (in_array($fq_class_name, ['callable', 'iterable', 'self', 'static', 'parent'], true)) {
+            return true;
+        }
+
+        if (self::isReservedClassName($fq_class_name)) {
+            $class_name_parts = explode('\\', $fq_class_name);
+            $class_name = array_pop($class_name_parts);
+
+            IssueBuffer::maybeAdd(
+                new ReservedWord(
+                    $class_name . ' is a reserved word',
+                    $code_location,
+                    $class_name,
+                ),
+                $suppressed_issues,
+            );
+
+            return null;
+        }
+
+        $class_exists = $codebase->classlikes->classExists(
+            $fq_class_name,
+            !$options->inferred ? $code_location : null,
+            $context,
+        );
+
+        $interface_exists = $codebase->classlikes->interfaceExists(
+            $fq_class_name,
+            !$options->inferred ? $code_location : null,
+            $context,
+        );
+
+        $enum_exists = $codebase->classlikes->enumExists(
+            $fq_class_name,
+            !$options->inferred ? $code_location : null,
+            $context,
+        );
+
+        if (!$class_exists
+            && !($interface_exists && $options->allow_interface)
+            && !($enum_exists && $options->allow_enum)
+        ) {
+            if (!$check_classes) {
+                return null;
+            }
+            if (!$options->allow_trait
+                || !$codebase->classlikes->traitExists(
+                    $fq_class_name,
+                    !$options->inferred ? $code_location : null,
+                    $context,
+                )
+            ) {
+                if ($options->from_docblock) {
+                    if (IssueBuffer::accepts(
+                        new UndefinedDocblockClass(
+                            'Docblock-defined class, interface or enum named ' . $fq_class_name . ' does not exist',
+                            $code_location,
+                            $fq_class_name,
+                        ),
+                        $suppressed_issues,
+                    )) {
+                        return false;
+                    }
+                } elseif ($options->from_attribute) {
+                    if (IssueBuffer::accepts(
+                        new UndefinedAttributeClass(
+                            'Attribute class ' . $fq_class_name . ' does not exist',
+                            $code_location,
+                            $fq_class_name,
+                        ),
+                        $suppressed_issues,
+                    )) {
+                        return false;
+                    }
+                } else {
+                    if (IssueBuffer::accepts(
+                        new UndefinedClass(
+                            'Class, interface or enum named ' . $fq_class_name . ' does not exist',
+                            $code_location,
+                            $fq_class_name,
+                        ),
+                        $suppressed_issues,
+                    )) {
+                        return false;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        $aliased_name = $codebase->classlikes->getUnAliasedName(
+            $fq_class_name,
+        );
+
+        // Built-in classlikes only referenced via strings were never queued for scanning
+        $codebase->scanner->registerReflectedClassLikeStorage($aliased_name);
+
+        try {
+            $class_storage = $codebase->classlike_storage_provider->get($aliased_name);
+        } catch (InvalidArgumentException $e) {
+            if (!$options->inferred) {
+                throw $e;
+            }
+
+            return null;
+        }
+
+        // The class is known to Psalm (its stubbed definition is always loaded so analysis is
+        // unaffected), but a native symbol introduced in a later PHP version is undefined when
+        // analysing an older version without a polyfill. The issue is reported without halting
+        // resolution, so the rest of the analysis still sees the symbol's real shape.
+        //
+        // Attributes are a PHP 8.0 feature: below 8.0 an `#[...]` is an inert comment that
+        // references no class, so attribute-class availability is not reported there.
+        if ($check_classes
+            && !$class_storage->user_defined
+            && $class_storage->since_php_version_id !== null
+            && ($codebase->getGuardedPhpVersionId($options->context) ?? $codebase->analysis_php_version_id)
+                < $class_storage->since_php_version_id
+            && !($options->from_attribute && $codebase->analysis_php_version_id < 8_00_00)
+            && !$codebase->isClassLikePolyfilled($class_storage->name)
+        ) {
+            $message = $class_storage->name . ' '
+                . $codebase->getUnavailableSymbolMessageSuffix($class_storage->since_php_version_id);
+
+            if ($options->from_docblock) {
+                IssueBuffer::maybeAdd(
+                    new UndefinedDocblockClass($message, $code_location, $class_storage->name),
+                    $suppressed_issues,
+                );
+            } elseif ($options->from_attribute) {
+                IssueBuffer::maybeAdd(
+                    new UndefinedAttributeClass($message, $code_location, $class_storage->name),
+                    $suppressed_issues,
+                );
+            } else {
+                IssueBuffer::maybeAdd(
+                    new UndefinedClass($message, $code_location, $class_storage->name),
+                    $suppressed_issues,
+                );
+            }
+        }
+
+        foreach ($class_storage->invalid_dependencies as $dependency_class_name => $_) {
+            // if the implemented/extended class is stubbed, it may not yet have
+            // been hydrated
+            if ($codebase->classlike_storage_provider->has($dependency_class_name)) {
+                continue;
+            }
+
+            if (IssueBuffer::accepts(
+                new MissingDependency(
+                    $fq_class_name . ' depends on class or interface '
+                        . $dependency_class_name . ' that does not exist',
+                    $code_location,
+                    $fq_class_name,
+                ),
+                $suppressed_issues,
+            )) {
+                return false;
+            }
+        }
+
+        if (!$options->inferred) {
+            if (($class_exists && !$codebase->classHasCorrectCasing($fq_class_name))
+                || ($interface_exists && !$codebase->interfaceHasCorrectCasing($fq_class_name))
+                || ($enum_exists && !$codebase->classlikes->enumHasCorrectCasing($fq_class_name))
+            ) {
+                IssueBuffer::maybeAdd(
+                    new InvalidClass(
+                        'Class, interface or enum ' . $fq_class_name . ' has wrong casing',
+                        $code_location,
+                        $fq_class_name,
+                    ),
+                    $suppressed_issues,
+                );
+            }
+        }
+
+        if (!$options->inferred) {
+            $event = new AfterClassLikeExistenceCheckEvent(
+                $fq_class_name,
+                $code_location,
+                $statements_source,
+                $codebase,
+                [],
+            );
+
+            $codebase->config->eventDispatcher->dispatchAfterClassLikeExistenceCheck($event);
+
+            $file_manipulations = $event->getFileReplacements();
+            if ($file_manipulations) {
+                FileManipulationBuffer::add($code_location->file_path, $file_manipulations);
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Gets the fully-qualified class name from a Name object
+     */
+    public static function getFQCLNFromNameObject(
+        PhpParser\Node\Name $class_name,
+        Aliases $aliases,
+    ): string {
+        /** @var string|null */
+        $resolved_name = $class_name->getAttribute('resolvedName');
+
+        if ($resolved_name) {
+            return $resolved_name;
+        }
+
+        if ($class_name instanceof PhpParser\Node\Name\FullyQualified) {
+            return $class_name->toString();
+        }
+
+        if (in_array($class_name->getFirst(), ['self', 'static', 'parent'], true)) {
+            return $class_name->getFirst();
+        }
+
+        return Type::getFQCLNFromString(
+            $class_name->toString(),
+            $aliases,
+        );
+    }
+
+    /**
+     * @psalm-mutation-free
+     * @return array<lowercase-string, string>
+     */
+    #[Override]
+    public function getAliasedClassesFlipped(): array
+    {
+        if ($this->source instanceof NamespaceAnalyzer || $this->source instanceof FileAnalyzer) {
+            return $this->source->getAliasedClassesFlipped();
+        }
+
+        return [];
+    }
+
+    /**
+     * @psalm-mutation-free
+     * @return array<string, string>
+     */
+    #[Override]
+    public function getAliasedClassesFlippedReplaceable(): array
+    {
+        if ($this->source instanceof NamespaceAnalyzer || $this->source instanceof FileAnalyzer) {
+            return $this->source->getAliasedClassesFlippedReplaceable();
+        }
+
+        return [];
+    }
+
+    /** @psalm-mutation-free */
+    #[Override]
+    public function getFQCLN(): string
+    {
+        return $this->fq_class_name;
+    }
+
+    /** @psalm-mutation-free */
+    #[Override]
+    public function getClassName(): ?string
+    {
+        return $this->class->name->name ?? null;
+    }
+
+    /**
+     * @psalm-mutation-free
+     * @return array<string, array<string, Union>>|null
+     */
+    #[Override]
+    public function getTemplateTypeMap(): ?array
+    {
+        return $this->storage->template_types;
+    }
+
+    /** @psalm-mutation-free */
+    #[Override]
+    public function getParentFQCLN(): ?string
+    {
+        return $this->parent_fq_class_name;
+    }
+
+    /**
+     * @psalm-pure
+     */
+    #[Override]
+    public function isStatic(): bool
+    {
+        return false;
+    }
+
+    /**
+     * Gets the Psalm type from a particular value
+     */
+    public static function getTypeFromValue(mixed $value): Union
+    {
+        switch (gettype($value)) {
+            case 'boolean':
+                if ($value) {
+                    return Type::getTrue();
+                }
+
+                return Type::getFalse();
+
+            case 'integer':
+                return Type::getInt(false, $value);
+
+            case 'double':
+                return Type::getFloat($value);
+
+            case 'string':
+                return Type::getString($value);
+
+            case 'array':
+                return Type::getArray();
+
+            case 'NULL':
+                return Type::getNull();
+
+            default:
+                return Type::getMixed();
+        }
+    }
+
+    /**
+     * @param  string[]         $suppressed_issues
+     */
+    public static function checkPropertyVisibility(
+        string $property_id,
+        Context $context,
+        SourceAnalyzer $source,
+        CodeLocation $code_location,
+        array $suppressed_issues,
+        bool $emit_issues = true,
+        bool $is_write = false,
+    ): ?bool {
+        [$fq_class_name, $property_name] = explode('::$', $property_id);
+
+        $codebase = $source->getCodebase();
+
+        if ($codebase->properties->property_visibility_provider->has($fq_class_name)) {
+            $property_visible = $codebase->properties->property_visibility_provider->isPropertyVisible(
+                $source,
+                $fq_class_name,
+                $property_name,
+                true,
+                $context,
+                $code_location,
+            );
+
+            if ($property_visible !== null) {
+                return $property_visible;
+            }
+        }
+
+        $declaring_property_class = $codebase->properties->getDeclaringClassForProperty(
+            $property_id,
+            true,
+        );
+        $appearing_property_class = $codebase->properties->getAppearingClassForProperty(
+            $property_id,
+            true,
+        );
+
+        if (!$declaring_property_class || !$appearing_property_class) {
+            throw new UnexpectedValueException(
+                'Appearing/Declaring classes are not defined for ' . $property_id,
+            );
+        }
+
+        // if the calling class is the same, we know the property exists, so it must be visible
+        if ($appearing_property_class === $context->self) {
+            return $emit_issues ? null : true;
+        }
+
+        if ($source->getSource() instanceof TraitAnalyzer
+            && strtolower($declaring_property_class) === strtolower((string) $source->getFQCLN())
+        ) {
+            return $emit_issues ? null : true;
+        }
+
+        $class_storage = $codebase->classlike_storage_provider->get($declaring_property_class);
+
+        if (!isset($class_storage->properties[$property_name])) {
+            throw new UnexpectedValueException('$storage should not be null for ' . $property_id);
+        }
+
+        $storage = $class_storage->properties[$property_name];
+
+        // the set visibility is always at least as restrictive as the get visibility,
+        // so checking it alone is enough for writes
+        $visibility = $is_write ? $storage->set_visibility : $storage->visibility;
+
+        if ($is_write && $storage->hasAsymmetricVisibility()) {
+            $verb = 'modify';
+            $visibility_text = PropertyStorage::getVisibilityText($visibility) . '(set)';
+        } else {
+            $verb = 'access';
+            $visibility_text = PropertyStorage::getVisibilityText($visibility);
+        }
+
+        $from_context = $context->self !== null ? ' from context ' . $context->self : '';
+
+        switch ($visibility) {
+            case self::VISIBILITY_PUBLIC:
+                return $emit_issues ? null : true;
+
+            case self::VISIBILITY_PRIVATE:
+                if ($emit_issues) {
+                    IssueBuffer::maybeAdd(
+                        new InaccessibleProperty(
+                            'Cannot ' . $verb . ' ' . $visibility_text . ' property ' . $property_id . $from_context,
+                            $code_location,
+                        ),
+                        $suppressed_issues,
+                    );
+                }
+
+                return null;
+            case self::VISIBILITY_PROTECTED:
+                if (!$context->self) {
+                    if ($emit_issues) {
+                        IssueBuffer::maybeAdd(
+                            new InaccessibleProperty(
+                                'Cannot ' . $verb . ' ' . $visibility_text . ' property ' . $property_id,
+                                $code_location,
+                            ),
+                            $suppressed_issues,
+                        );
+                    }
+
+                    return null;
+                }
+
+                if ($codebase->classExtends($appearing_property_class, $context->self)) {
+                    return $emit_issues ? null : true;
+                }
+
+                // a property redeclared by a subclass or its trait is the one of the class that declared it first
+                $appearing_class_storage = $codebase->classlike_storage_provider->get($appearing_property_class);
+
+                foreach ($appearing_class_storage->parent_classes as $parent_class_name) {
+                    $parent_property = $codebase->classlike_storage_provider->get($parent_class_name)
+                        ->properties[$property_name] ?? null;
+
+                    if ($parent_property !== null
+                        && $parent_property->visibility !== self::VISIBILITY_PRIVATE
+                        && (strtolower($context->self) === strtolower($parent_class_name)
+                            || $codebase->classExtends($context->self, $parent_class_name))
+                    ) {
+                        return $emit_issues ? null : true;
+                    }
+                }
+
+                if (!$codebase->classExtends($context->self, $appearing_property_class)) {
+                    if ($emit_issues) {
+                        IssueBuffer::maybeAdd(
+                            new InaccessibleProperty(
+                                'Cannot ' . $verb . ' ' . $visibility_text . ' property ' . $property_id
+                                    . $from_context,
+                                $code_location,
+                            ),
+                            $suppressed_issues,
+                        );
+                    }
+
+                    return null;
+                }
+        }
+
+        return $emit_issues ? null : true;
+    }
+
+    /**
+     * Reports the docblock issues found when the class-like was scanned, and the template defaults naming undefined
+     * classes or outside their bounds, which can only be checked once the codebase is populated.
+     *
+     * @param array<string> $suppressed_issues
+     */
+    protected static function reportDocblockIssues(
+        StatementsSource $source,
+        ClassLikeStorage $storage,
+        array $suppressed_issues,
+    ): void {
+        foreach ($storage->docblock_issues as $docblock_issue) {
+            IssueBuffer::maybeAdd($docblock_issue);
+        }
+
+        TemplateDefaults::checkBounds(
+            $source,
+            $storage->template_types ?? [],
+            $storage->template_defaults,
+            $storage->template_default_locations,
+            $storage->name,
+            $storage->parent_class,
+            $storage->name,
+            $suppressed_issues,
+        );
+    }
+
+    protected function checkTemplateParams(
+        Codebase $codebase,
+        ClassLikeStorage $storage,
+        ClassLikeStorage $parent_storage,
+        CodeLocation $code_location,
+        int $given_param_count,
+    ): void {
+        $expected_param_count = $parent_storage->template_types === null
+            ? 0
+            : count($parent_storage->template_types);
+
+        if ($parent_storage->getRequiredTemplateParamCount() > $given_param_count) {
+            IssueBuffer::maybeAdd(
+                new MissingTemplateParam(
+                    $storage->name . ' has missing template params when extending ' . $parent_storage->name
+                        . ', expecting ' . TemplateDefaults::getExpectedParamCount($parent_storage),
+                    $code_location,
+                ),
+                $storage->suppressed_issues + $this->getSuppressedIssues(),
+            );
+        } elseif ($expected_param_count < $given_param_count
+            || (isset($storage->template_extended_offsets[$parent_storage->name])
+                && !PurityArguments::fit($storage->template_extended_offsets[$parent_storage->name], $parent_storage))
+        ) {
+            IssueBuffer::maybeAdd(
+                new TooManyTemplateParams(
+                    $storage->name . ' has too many template params when extending ' . $parent_storage->name
+                        . ', expecting ' . $expected_param_count,
+                    $code_location,
+                ),
+                $storage->suppressed_issues + $this->getSuppressedIssues(),
+            );
+        }
+
+        $storage_param_count = ($storage->template_types ? count($storage->template_types) : 0);
+
+        if ($parent_storage->enforce_template_inheritance
+            && $expected_param_count !== $storage_param_count
+        ) {
+            if ($expected_param_count > $storage_param_count) {
+                IssueBuffer::maybeAdd(
+                    new MissingTemplateParam(
+                        $storage->name . ' requires the same number of template params as ' . $parent_storage->name
+                            . ' but saw ' . $storage_param_count,
+                        $code_location,
+                    ),
+                    $storage->suppressed_issues + $this->getSuppressedIssues(),
+                );
+            } else {
+                IssueBuffer::maybeAdd(
+                    new TooManyTemplateParams(
+                        $storage->name . ' requires the same number of template params as ' . $parent_storage->name
+                            . ' but saw ' . $storage_param_count,
+                        $code_location,
+                    ),
+                    $storage->suppressed_issues + $this->getSuppressedIssues(),
+                );
+            }
+        }
+
+        if ($parent_storage->template_types && $storage->template_extended_params) {
+            $i = 0;
+
+            // the written arguments, but for the purity arguments, which come last
+            $written_type_arg_count = $given_param_count
+                - count(PurityArguments::split($storage->template_extended_offsets[$parent_storage->name] ?? [])[1]);
+
+            // the bounds of type templates may use purity templates, which come after them
+            $previous_extended = [];
+
+            foreach ($parent_storage->template_types as $template_name => $type_map) {
+                $extended_purity = $storage->template_extended_params[$parent_storage->name][$template_name] ?? null;
+
+                foreach ($type_map as $declaring_class => $template_type) {
+                    if ($extended_purity !== null
+                        && Capabilities::isPurityType($template_type)
+                        && Capabilities::isPurityType($extended_purity)
+                    ) {
+                        $previous_extended[$template_name] = [$declaring_class => $extended_purity];
+                    }
+                }
+            }
+
+            foreach ($parent_storage->template_types as $template_name => $type_map) {
+                // declares the variables
+                foreach ($type_map as $declaring_class => $template_type) {
+                }
+
+                if (isset($storage->template_extended_params[$parent_storage->name][$template_name])) {
+                    $extended_type = $storage->template_extended_params[$parent_storage->name][$template_name];
+
+                    // Resolve `self`/`static` against the implementing class so the bound check
+                    // below treats `Holder<self>` and `Holder<ConcreteSelf>` as equivalent.
+                    $extended_type = TypeExpander::expandUnion(
+                        $codebase,
+                        $extended_type,
+                        $storage->name,
+                        $storage->name,
+                        $storage->parent_class,
+                        final: $storage->final,
+                    );
+
+                    if (isset($parent_storage->template_covariants[$i])
+                        && !$parent_storage->template_covariants[$i]
+                    ) {
+                        foreach ($extended_type->getAtomicTypes() as $t) {
+                            if ($t instanceof TTemplateParam
+                                && $storage->template_types
+                                && $storage->template_covariants
+                                && ($local_offset
+                                    = array_search($t->param_name, array_keys($storage->template_types), true))
+                                    !== false
+                                && !empty($storage->template_covariants[$local_offset])
+                            ) {
+                                IssueBuffer::maybeAdd(
+                                    new InvalidTemplateParam(
+                                        'Cannot extend an invariant template param ' . $template_name
+                                            . ' into a covariant context',
+                                        $code_location,
+                                    ),
+                                    $storage->suppressed_issues + $this->getSuppressedIssues(),
+                                );
+                            }
+                        }
+                    }
+
+                    if ($parent_storage->enforce_template_inheritance) {
+                        foreach ($extended_type->getAtomicTypes() as $t) {
+                            if (!$t instanceof TTemplateParam
+                                || !isset($storage->template_types[$t->param_name])
+                            ) {
+                                IssueBuffer::maybeAdd(
+                                    new InvalidTemplateParam(
+                                        'Cannot extend a strictly-enforced parent template param '
+                                            . $template_name
+                                            . ' with a non-template type',
+                                        $code_location,
+                                    ),
+                                    $storage->suppressed_issues + $this->getSuppressedIssues(),
+                                );
+                            } elseif ($storage->template_types[$t->param_name][$storage->name]->getId()
+                                !== $template_type->getId()
+                            ) {
+                                IssueBuffer::maybeAdd(
+                                    new InvalidTemplateParam(
+                                        'Cannot extend a strictly-enforced parent template param '
+                                            . $template_name
+                                            . ' with constraint ' . $template_type->getId()
+                                            . ' with a child template param ' . $t->param_name
+                                            . ' with different constraint '
+                                            . $storage->template_types[$t->param_name][$storage->name]->getId(),
+                                        $code_location,
+                                    ),
+                                    $storage->suppressed_issues + $this->getSuppressedIssues(),
+                                );
+                            }
+                        }
+                    }
+
+                    // a parent template left to its default is checked where the default is declared: any of them
+                    // when no arguments are written, else a type template past the written type arguments (type
+                    // templates come first, so $i is its position among them)
+                    if (!$template_type->isMixed()
+                        && !(isset($parent_storage->template_defaults[$template_name])
+                            && ($given_param_count === 0
+                                || ($i >= $written_type_arg_count
+                                    && !isset($parent_storage->purity_templates[$template_name]))))
+                    ) {
+                        $template_result = new TemplateResult(
+                            $previous_extended ?: [],
+                            [],
+                        );
+
+                        $template_type_copy = TemplateStandinTypeReplacer::replace(
+                            $template_type,
+                            $template_result,
+                            $codebase,
+                            null,
+                            $extended_type,
+                            null,
+                            null,
+                        );
+
+                        $lower_bound = $parent_storage->template_lower_bounds[$template_name] ?? null;
+
+                        if (!UnionTypeComparator::isContainedBy($codebase, $extended_type, $template_type_copy)) {
+                            IssueBuffer::maybeAdd(
+                                new InvalidTemplateParam(
+                                    'Extended template param ' . $template_name
+                                        . ' expects type ' . $template_type_copy->getId()
+                                        . ', type ' . $extended_type->getId() . ' given',
+                                    $code_location,
+                                ),
+                                $storage->suppressed_issues + $this->getSuppressedIssues(),
+                            );
+                        } elseif ($lower_bound !== null
+                            && Capabilities::isPurityType($extended_type)
+                            && !Capabilities::allowsAnyOf(Capabilities::fromType($extended_type), $lower_bound)
+                        ) {
+                            // a purity template with a lower bound: the value must require at least that
+                            IssueBuffer::maybeAdd(
+                                new InvalidTemplateParam(
+                                    'Extended template param ' . $template_name
+                                        . ' must include at least ' . Capabilities::toString($lower_bound)
+                                        . ', ' . $extended_type->getId() . ' given',
+                                    $code_location,
+                                ),
+                                $storage->suppressed_issues + $this->getSuppressedIssues(),
+                            );
+                        } else {
+                            $previous_extended[$template_name] = [
+                                $declaring_class => $extended_type,
+                            ];
+                        }
+                    } else {
+                        $previous_extended[$template_name] = [
+                            $declaring_class => $extended_type,
+                        ];
+                    }
+                }
+
+                $i++;
+            }
+        }
+    }
+
+    /**
+     * @return array<string, string>
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs
+     */
+    public static function getClassesForFile(Codebase $codebase, string $file_path): array
+    {
+        try {
+            return $codebase->file_storage_provider->get($file_path)->classlikes_in_file;
+        } catch (InvalidArgumentException) {
+            return [];
+        }
+    }
+
+    #[Override]
+    public function getFileAnalyzer(): FileAnalyzer
+    {
+        return $this->file_analyzer;
+    }
+}

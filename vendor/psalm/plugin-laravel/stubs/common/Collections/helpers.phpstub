@@ -1,0 +1,108 @@
+<?php
+
+/**
+ * Stubs for {@see https://github.com/laravel/framework/blob/master/src/Illuminate/Collections/helpers.php}
+ */
+
+/**
+ * Create a collection from the given value.
+ *
+ * With no arguments `$value` defaults to `[]`, so TKey/TValue infer as `never` — identical to `collect([])`.
+ * This is the correct behaviour: `Collection<never, never>` is assignable to any `Collection<TKey, TValue>`
+ * because `never` is the bottom type (subtype of everything), and methods like `merge()` / `push()` are
+ * stubbed to widen generics on their return so fluent chains propagate concrete types.
+ *
+ * Laravel's runtime accepts far more than array/iterable/Arrayable: `EnumeratesValues::getArrayableItems()`
+ * routes `null|scalar|UnitEnum` through `Arr::wrap()` and any other object (including plain DTOs,
+ * `JsonSerializable`, `Jsonable`, `WeakMap`, `DateTime`) through `Arr::from()`. The `scalar|UnitEnum|object`
+ * branches below widen the param to match so those inputs don't trip a false-positive `InvalidArgument`
+ * (see issue #808). Precision for what TKey/TValue resolve to in those cases comes from
+ * `CollectHandler`, not from this docblock.
+ *
+ * @template TKey of array-key
+ * @template TValue
+ *
+ * No `@psalm-flow` here: `($value) -> return` was evaluated and deliberately withheld.
+ * Experiments on whether `@psalm-taint-specialize` prevents cross-call-site taint pooling through
+ * the shared TValue template slot produced conflicting results across repeated runs, so per the
+ * project's false-positive-averse policy the annotation is left out pending a clean-room
+ * investigation (tracked in issue #808 follow-ups).
+ *
+ * @param  \Illuminate\Contracts\Support\Arrayable<TKey, TValue>|iterable<TKey, TValue>|scalar|\UnitEnum|object|null  $value
+ * @psalm-return \Illuminate\Support\Collection<TKey, TValue>
+ */
+function collect($value = []) {}
+
+/**
+ * Fill in data where it's missing.
+ *
+ * @template TTarget
+ *
+ * @param  TTarget  $target
+ * @param  string|array  $key
+ * @param  mixed  $value
+ * @return mixed
+ * @psalm-return TTarget is array ? array : TTarget
+ */
+function data_fill(&$target, $key, $value) {}
+
+/**
+ * Get an item from an array or object using "dot" notation.
+ *
+ * When $key is null, the $target is returned as-is (identity function).
+ * For non-null keys, dot-notation traversal result type can't be determined statically.
+ *
+ * @template TTarget
+ *
+ * @param  TTarget  $target
+ * @param  string|array|int|null  $key
+ * @param  mixed  $default
+ * @return ($key is null ? TTarget : mixed)
+ */
+function data_get($target, $key, $default = null) {}
+
+/**
+ * Set an item on an array or object using dot notation.
+ *
+ * @template TTarget
+ *
+ * @param  TTarget  $target
+ * @param  string|array  $key
+ * @param  mixed  $value
+ * @param  bool  $overwrite
+ * @psalm-return TTarget is array ? array : TTarget
+ */
+function data_set(&$target, $key, $value, $overwrite = true) {}
+
+/**
+ * Get the first element of an array. Useful for method chaining.
+ *
+ * @template TValue
+ * @template TParam of TValue[]
+ * @param  TParam  $array
+ * @return (TParam is non-empty-array ? TValue : false)
+ */
+function head($array) {}
+
+/**
+ * Get the last element from an array.
+ *
+ * @template TValue
+ * @template TParam of TValue[]
+ *
+ * @param  TParam  $array
+ * @return (TParam is non-empty-array ? TValue : false)
+ */
+function last($array) {}
+
+/**
+ * Return the default value of the given value.
+ *
+ * @template TValue
+ * @template TClosureReturn
+ *
+ * @param  mixed|(Closure(): TClosureReturn)  $value
+ * @param  mixed  ...$args
+ * @return (TValue is Closure ? TClosureReturn : TValue)
+ */
+function value($value, ...$args) {}

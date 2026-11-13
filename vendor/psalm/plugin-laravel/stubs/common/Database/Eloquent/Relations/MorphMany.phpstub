@@ -1,0 +1,27 @@
+<?php
+
+namespace Illuminate\Database\Eloquent\Relations;
+
+/**
+ * @template TRelatedModel of \Illuminate\Database\Eloquent\Model
+ * Covariant TDeclaringModel — required by #913 (see Relation.phpstub for the rationale).
+ * @template-covariant TDeclaringModel of \Illuminate\Database\Eloquent\Model
+ * @template-extends MorphOneOrMany<TRelatedModel, TDeclaringModel, \Illuminate\Database\Eloquent\Collection<int, TRelatedModel>>
+ * @mixin \Illuminate\Database\Eloquent\Builder<TRelatedModel>
+ */
+class MorphMany extends MorphOneOrMany
+{
+    /**
+     * @param array<string, mixed> $attributes
+     *
+     * @return TRelatedModel
+     */
+    public function create(array $attributes = []) {}
+
+    /**
+     * Get the results of the relationship.
+     *
+     * @return \Traversable<int, TRelatedModel>
+     */
+    public function getResults() {}
+}

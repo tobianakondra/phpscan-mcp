@@ -1,0 +1,85 @@
+<?php
+
+namespace Illuminate\Http;
+
+/**
+ * Taint annotations for UploadedFile methods that return user-controlled data.
+ *
+ * Raw multipart metadata and file contents are attacker-controlled. Methods
+ * that normalize or map those values are annotated according to the guarantees
+ * provided by that transformation.
+ *
+ * @see \Symfony\Component\HttpFoundation\File\UploadedFile (parent)
+ */
+class UploadedFile
+{
+    /**
+     * Returns the original file name supplied by the client.
+     *
+     * @return string
+     *
+     * @psalm-taint-source input
+     */
+    public function getClientOriginalName(): string {}
+
+    /**
+     * Returns the original file full path supplied by the client (webkitdirectory uploads).
+     *
+     * @return string
+     *
+     * @psalm-taint-source input
+     */
+    public function getClientOriginalPath(): string {}
+
+    /**
+     * Returns the original file extension supplied by the client.
+     * Symfony File::getName() makes the original name a basename and
+     * UploadedFile::getClientOriginalExtension() returns its dot-free extension.
+     * The result has no /, \\, or . and cannot form a traversal segment.
+     *
+     * @return string
+     *
+     * @psalm-taint-source ~(file|user_secret|system_secret)
+     */
+    public function getClientOriginalExtension(): string {}
+
+    /**
+     * Returns the MIME type supplied by the client (Content-Type header, spoofable).
+     *
+     * @return string
+     *
+     * @psalm-taint-source input
+     */
+    public function getClientMimeType(): string {}
+
+    /**
+     * Returns an extension from the configured MIME registry, selected using
+     * the client-supplied MIME type.
+     *
+     * Registry values are intentionally trusted as application configuration.
+     */
+    public function clientExtension() {}
+
+    /**
+     * Returns the raw contents of the uploaded file.
+     *
+     * @return false|string
+     *
+     * @throws \Illuminate\Contracts\Filesystem\FileNotFoundException
+     *
+     * @psalm-taint-source input
+     */
+    public function get() {}
+
+    /**
+     * Returns the raw contents of the uploaded file (Symfony File parent API).
+     *
+     * Same attacker-controlled bytes as get(), so it is likewise a source. This
+     * is the contents accessor the Request::file() taint fix relies on (#1134).
+     *
+     * @return string
+     *
+     * @psalm-taint-source input
+     */
+    public function getContent(): string {}
+}

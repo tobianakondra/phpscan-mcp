@@ -1,0 +1,789 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Internal\Provider\ReturnTypeProvider;
+
+use Override;
+use PhpParser;
+use PhpParser\NodeFinder;
+use Psalm\CodeLocation;
+use Psalm\Context;
+use Psalm\Internal\Analyzer\FunctionLikeAnalyzer;
+use Psalm\Internal\Analyzer\Statements\Expression\AssertionFinder;
+use Psalm\Internal\Analyzer\Statements\Expression\Assignment\ArrayAssignmentAnalyzer;
+use Psalm\Internal\Analyzer\Statements\Expression\Call\FunctionCallAnalyzer;
+use Psalm\Internal\Analyzer\Statements\Expression\Call\MethodCallAnalyzer;
+use Psalm\Internal\Analyzer\Statements\Expression\Call\StaticCallAnalyzer;
+use Psalm\Internal\Analyzer\Statements\Expression\CallAnalyzer;
+use Psalm\Internal\Analyzer\StatementsAnalyzer;
+use Psalm\Internal\Codebase\CombinedFlowGraph;
+use Psalm\Internal\Codebase\TaintFlowGraph;
+use Psalm\Internal\DataFlow\DataFlowNode;
+use Psalm\Internal\Type\ArrayType;
+use Psalm\Node\Expr\VirtualArrayDimFetch;
+use Psalm\Node\Expr\VirtualFuncCall;
+use Psalm\Node\Expr\VirtualMethodCall;
+use Psalm\Node\Expr\VirtualStaticCall;
+use Psalm\Node\Expr\VirtualVariable;
+use Psalm\Node\Name\VirtualFullyQualified;
+use Psalm\Node\VirtualArg;
+use Psalm\Node\VirtualIdentifier;
+use Psalm\Plugin\EventHandler\Event\FunctionReturnTypeProviderEvent;
+use Psalm\Plugin\EventHandler\FunctionReturnTypeProviderInterface;
+use Psalm\Storage\Assertion;
+use Psalm\Type;
+use Psalm\Type\Atomic;
+use Psalm\Type\Atomic\Scalar;
+use Psalm\Type\Atomic\TArray;
+use Psalm\Type\Atomic\TKeyedArray;
+use Psalm\Type\Atomic\TNamedObject;
+use Psalm\Type\Atomic\TNonEmptyArray;
+use Psalm\Type\Atomic\TNull;
+use Psalm\Type\Atomic\TTemplateParam;
+use Psalm\Type\Atomic\TTemplateParamClass;
+use Psalm\Type\Union;
+use UnexpectedValueException;
+
+use function array_filter;
+use function array_map;
+use function array_shift;
+use function array_slice;
+use function array_values;
+use function assert;
+use function count;
+use function explode;
+use function implode;
+use function is_string;
+use function reset;
+use function str_contains;
+use function substr;
+
+/**
+ * @internal
+ */
+final class ArrayMapReturnTypeProvider implements FunctionReturnTypeProviderInterface
+{
+    /**
+     * @return array<lowercase-string>
+     * @psalm-pure
+     */
+    #[Override]
+    public static function getFunctionIds(): array
+    {
+        return ['array_map'];
+    }
+
+    #[Override]
+    public static function getFunctionReturnType(FunctionReturnTypeProviderEvent $event): Union
+    {
+        $statements_source = $event->getStatementsSource();
+        $call_args = $event->getCallArgs();
+        $context = $event->getContext();
+        if (!$statements_source instanceof StatementsAnalyzer) {
+            return Type::getMixed();
+        }
+
+        $function_call_arg = $call_args[0] ?? null;
+
+        $function_call_type = $function_call_arg
+            ? $statements_source->node_data->getType($function_call_arg->value)
+            : null;
+
+        if ($function_call_type && $function_call_type->isNull()) {
+            array_shift($call_args);
+
+            if (!$call_args) {
+                return Type::getNever();
+            }
+
+            $array_arg_types = [];
+            $orig_types = [];
+
+            foreach ($call_args as $call_arg) {
+                $call_arg_type = $statements_source->node_data->getType($call_arg->value);
+
+                if ($call_arg_type
+                    && $call_arg_type->isSingle()
+                    && ($call_arg_atomic = $call_arg_type->getSingleAtomic()) instanceof TKeyedArray
+                    && $call_arg_atomic->fallback_params === null
+                ) {
+                    $array_arg_types []= array_values($call_arg_atomic->properties);
+                    $orig_types []= $call_arg_type;
+                } elseif ($call_arg_type
+                    && $call_arg_type->isSingle()
+                    && ($call_arg_atomic = $call_arg_type->getSingleAtomic()) instanceof TArray
+                    && $call_arg_atomic->isEmptyArray()
+                ) {
+                    $array_arg_types []= [];
+                    $orig_types []= $call_arg_type;
+                } else {
+                    return Type::getArray();
+                }
+            }
+
+            if (count($orig_types) === 1) {
+                return $orig_types[0];
+            }
+
+            $null = Type::getNull();
+            $array_arg_types = array_map(null, ...$array_arg_types);
+            $array_arg_types = array_map(
+                /** @param non-empty-array<?Union> $sub */
+                static function (array $sub) use ($null) {
+                    $sub = array_map(
+                        static fn(?Union $t) => $t ?? $null,
+                        $sub,
+                    );
+                    return new Union([TKeyedArray::make($sub, null, null, true)]);
+                },
+                $array_arg_types,
+            );
+
+            if (!$array_arg_types) {
+                return Type::getEmptyArray();
+            }
+
+            return new Union([TKeyedArray::make($array_arg_types, null, null, true)]);
+        }
+
+        $array_arg = $call_args[1] ?? null;
+
+        if (!$array_arg) {
+            return Type::getArray();
+        }
+
+        $array_arg_atomic_type = null;
+        $array_arg_type = null;
+
+        if ($array_arg_union_type = $statements_source->node_data->getType($array_arg->value)) {
+            // a template stands for its bound, which may overlap an atomic of the union (`array<string, int>|T`)
+            $expanded_arg_type = null;
+
+            foreach ($array_arg_union_type->getAtomicTypes() as $arg_atomic_type) {
+                $arg_type_part = $arg_atomic_type instanceof TTemplateParam
+                    ? $arg_atomic_type->as
+                    : new Union([$arg_atomic_type]);
+
+                $expanded_arg_type = $expanded_arg_type === null
+                    ? $arg_type_part
+                    : Type::combineUnionTypes($expanded_arg_type, $arg_type_part, $statements_source->getCodebase());
+            }
+
+            $arg_types = $expanded_arg_type->getAtomicTypes();
+
+            if (isset($arg_types['array'])) {
+                $array_arg_atomic_type = $arg_types['array'];
+
+                $array_arg_type = ArrayType::infer($array_arg_atomic_type);
+            }
+        }
+
+        $generic_key_type = null;
+        $mapping_return_type = null;
+
+        if ($function_call_arg && $function_call_type) {
+            if (count($call_args) === 2) {
+                $generic_key_type = $array_arg_type->key ?? Type::getArrayKey();
+            } else {
+                $generic_key_type = Type::getInt();
+            }
+
+            if ($function_call_type->hasCallableType()) {
+                $closure_types = $function_call_type->getClosureTypes() ?: $function_call_type->getCallableTypes();
+                $closure_atomic_type = reset($closure_types);
+                assert($closure_atomic_type !== false);
+
+                $closure_return_type = $closure_atomic_type->return_type ?: Type::getMixed();
+
+                if ($closure_return_type->isVoid()) {
+                    $closure_return_type = Type::getNull();
+                }
+
+                $mapping_return_type = $closure_return_type;
+            } elseif ($function_call_arg->value instanceof PhpParser\Node\Scalar\String_
+                || $function_call_arg->value instanceof PhpParser\Node\Expr\Array_
+                || $function_call_arg->value instanceof PhpParser\Node\Expr\BinaryOp\Concat
+            ) {
+                $mapping_function_ids = CallAnalyzer::getFunctionIdsFromCallableArg(
+                    $statements_source,
+                    $function_call_arg->value,
+                );
+
+                if ($mapping_function_ids) {
+                    $mapping_return_type = self::getReturnTypeFromMappingIds(
+                        $statements_source,
+                        $mapping_function_ids,
+                        $context,
+                        $function_call_arg,
+                        array_slice($call_args, 1),
+                    );
+                }
+
+                if ($function_call_arg->value instanceof PhpParser\Node\Expr\Array_
+                    && isset($function_call_arg->value->items[0])
+                    && isset($function_call_arg->value->items[1])
+                    && $function_call_arg->value->items[1]->value instanceof PhpParser\Node\Scalar\String_
+                    && $function_call_arg->value->items[0]->value instanceof PhpParser\Node\Expr\Variable
+                    && ($variable_type
+                        = $statements_source->node_data->getType($function_call_arg->value->items[0]->value))
+                ) {
+                    $fake_method_call = null;
+
+                    foreach ($variable_type->getAtomicTypes() as $variable_atomic_type) {
+                        if ($variable_atomic_type instanceof TTemplateParam
+                            || $variable_atomic_type instanceof TTemplateParamClass
+                        ) {
+                            $fake_method_call = new VirtualStaticCall(
+                                $function_call_arg->value->items[0]->value,
+                                $function_call_arg->value->items[1]->value->value,
+                                [],
+                            );
+                        }
+                    }
+
+                    if ($fake_method_call) {
+                        $fake_method_return_type = self::executeFakeCall(
+                            $statements_source,
+                            $fake_method_call,
+                            $context,
+                        );
+
+                        if ($fake_method_return_type) {
+                            $mapping_return_type = $fake_method_return_type;
+                        }
+                    }
+                }
+            }
+        }
+
+        if ($mapping_return_type && $generic_key_type) {
+            return self::getMappedArrayType(
+                $array_arg_atomic_type,
+                count($call_args),
+                $generic_key_type,
+                $mapping_return_type,
+            )->addParentNodes(self::getElementNodes($statements_source, $event, $mapping_return_type));
+        }
+
+        return count($call_args) === 2 && !($array_arg_type->is_list ?? false)
+            ? new Union([
+                new TArray([
+                    $array_arg_type->key ?? Type::getArrayKey(),
+                    Type::getMixed(),
+                ]),
+            ])
+            : Type::getList();
+    }
+
+    /**
+     * The array holds what the callback returns as its elements, so a fetch of an element gets the whole of what the
+     * callback returned, keys included, and what takes the whole array (implode(), ...) takes its taints
+     *
+     * @return array<string, DataFlowNode>
+     */
+    private static function getElementNodes(
+        StatementsAnalyzer $statements_analyzer,
+        FunctionReturnTypeProviderEvent $event,
+        Union $mapping_return_type,
+    ): array {
+        $graph = $statements_analyzer->getDataFlowGraphWithSuppressed();
+
+        if ($graph === null || $mapping_return_type->parent_nodes === []) {
+            return [];
+        }
+
+        $element_node = DataFlowNode::getForAssignment(
+            'array_map elements',
+            new CodeLocation($statements_analyzer, $event->getStmt()),
+        );
+
+        $graph->addNode($element_node);
+
+        $element_marker = self::getElementMarker($statements_analyzer, $event->getContext(), $event->getCallArgs());
+        $taint_graph = $graph instanceof CombinedFlowGraph ? $graph->taint_flow_graph : $graph;
+
+        foreach ($mapping_return_type->parent_nodes as $parent_node) {
+            if ($element_marker !== null && $taint_graph instanceof TaintFlowGraph) {
+                // what the closure returns for an element, under the key of the element
+                $taint_graph->addPath($parent_node, $element_node, 'arrayvalue-assignment@' . $element_marker);
+
+                if ($graph instanceof CombinedFlowGraph) {
+                    $graph->variable_use_graph->addPath($parent_node, $element_node, 'arrayvalue-assignment');
+                }
+            } else {
+                $graph->addPath($parent_node, $element_node, 'arrayvalue-assignment');
+            }
+        }
+
+        return [$element_node->id => $element_node];
+    }
+
+    /**
+     * The marker (see ForeachAnalyzer::getForeachMarker()) of the iteration of the array_map() call with arguments
+     * $args over the elements of its array, if the array it returns keeps their keys (it is given one array) and
+     * its callback is a closure, whose body the marker bounds: the closure takes each element with its key (see
+     * ArgumentsAnalyzer::taintClosureParamWithArrayElements()) and what it returns for it goes back under that key
+     * (see getElementNodes()). A closure with something another call of it sees may return what it took for
+     * another element: it has no marker. That is a by-reference use, a static or global variable, `$this`, and any
+     * captured value that isn't plainly a value (an object, or what may hold one): the closure may keep what it took
+     * in it (`$acc[] = $value`) and return it for the next element.
+     *
+     * @param array<int, PhpParser\Node\Arg> $args
+     */
+    public static function getElementMarker(
+        StatementsAnalyzer $statements_analyzer,
+        Context $context,
+        array $args,
+    ): ?string {
+        if (count($args) !== 2
+            || !isset($args[0], $args[1])
+            || $args[0]->unpack
+            || $args[1]->unpack
+            || $args[0]->name !== null
+            || $args[1]->name !== null
+            || $statements_analyzer->getTaintFlowGraphWithSuppressed() === null
+        ) {
+            return null;
+        }
+
+        $callback = $args[0]->value;
+        $array = $args[1]->value;
+
+        if (!$callback instanceof PhpParser\Node\Expr\ArrowFunction
+            && (!$callback instanceof PhpParser\Node\Expr\Closure
+                || array_filter($callback->uses, static fn(PhpParser\Node\ClosureUse $use): bool => $use->byRef))
+        ) {
+            return null;
+        }
+
+        // the variables of a call of the closure are its own, unless static or global, and so are the values it
+        // captured, unless they are objects (or may hold some), which every call sees, as `$this` and $GLOBALS
+        if ((new NodeFinder())->findFirst(
+            $callback,
+            static fn(PhpParser\Node $node): bool => $node instanceof PhpParser\Node\Stmt\Static_
+                || $node instanceof PhpParser\Node\Stmt\Global_
+                || ($node instanceof PhpParser\Node\Expr\Variable
+                    && ($node->name === 'this' || $node->name === 'GLOBALS' || !is_string($node->name))),
+        ) !== null) {
+            return null;
+        }
+
+        foreach (self::getCapturedVarIds($callback) as $var_id) {
+            $captured_type = $context->vars_in_scope[$var_id] ?? null;
+
+            if ($captured_type !== null && !self::isPlainValue($captured_type)) {
+                return null;
+            }
+        }
+
+        $array_type = $statements_analyzer->node_data->getType($array);
+
+        if ($array_type === null || !ArrayAssignmentAnalyzer::hasElementsOfItsOwn($array_type)) {
+            return null;
+        }
+
+        $source = $statements_analyzer->getSource();
+        $function_location = $source instanceof FunctionLikeAnalyzer
+            ? $source->getFunctionLikeStorage($statements_analyzer)->stmt_location
+            : null;
+
+        return implode(':', [
+            $function_location?->raw_file_start ?? $callback->getStartFilePos(),
+            $function_location?->raw_file_end ?? $array->getEndFilePos(),
+            $callback->getStartFilePos(),
+            $array->getEndFilePos(),
+            // no variable of the body of a loop: one of a call of the closure isn't seen by the next one
+            $array->getEndFilePos() + 1,
+            $statements_analyzer->getFilePath(),
+        ]);
+    }
+
+    /**
+     * The variables of the enclosing scope closure $callback captures: those it uses, and for an arrow function
+     * those of its body that aren't its parameters (the others aren't in the enclosing scope)
+     *
+     * @return list<string>
+     */
+    private static function getCapturedVarIds(
+        PhpParser\Node\Expr\Closure|PhpParser\Node\Expr\ArrowFunction $callback,
+    ): array {
+        if ($callback instanceof PhpParser\Node\Expr\Closure) {
+            $var_ids = [];
+
+            foreach ($callback->uses as $use) {
+                if (is_string($use->var->name)) {
+                    $var_ids[] = '$' . $use->var->name;
+                }
+            }
+
+            return $var_ids;
+        }
+
+        $param_ids = [];
+
+        foreach ($callback->params as $param) {
+            if ($param->var instanceof PhpParser\Node\Expr\Variable && is_string($param->var->name)) {
+                $param_ids['$' . $param->var->name] = true;
+            }
+        }
+
+        $var_ids = [];
+
+        foreach ((new NodeFinder())->findInstanceOf($callback->expr, PhpParser\Node\Expr\Variable::class) as $var) {
+            if (is_string($var->name) && !isset($param_ids['$' . $var->name])) {
+                $var_ids[] = '$' . $var->name;
+            }
+        }
+
+        return $var_ids;
+    }
+
+    /**
+     * Whether a value of type $type is plainly a value, which a closure can't keep anything in for another call of
+     * it: scalars, and arrays of them
+     *
+     * @psalm-pure
+     */
+    private static function isPlainValue(Union $type): bool
+    {
+        foreach ($type->getAtomicTypes() as $atomic_type) {
+            if ($atomic_type instanceof Scalar || $atomic_type instanceof TNull) {
+                continue;
+            }
+
+            if ($atomic_type instanceof TArray) {
+                if (!self::isPlainValue($atomic_type->type_params[1])) {
+                    return false;
+                }
+
+                continue;
+            }
+
+            if ($atomic_type instanceof TKeyedArray) {
+                foreach ($atomic_type->properties as $property_type) {
+                    if (!self::isPlainValue($property_type)) {
+                        return false;
+                    }
+                }
+
+                if ($atomic_type->fallback_params !== null && !self::isPlainValue($atomic_type->fallback_params[1])) {
+                    return false;
+                }
+
+                continue;
+            }
+
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * @param array<string, array<array<int, Assertion>>>|null $assertions
+     */
+    private static function executeFakeCall(
+        StatementsAnalyzer $statements_analyzer,
+        PhpParser\Node\Expr $fake_call,
+        Context $context,
+        ?array &$assertions = null,
+    ): ?Union {
+        $old_data_provider = $statements_analyzer->node_data;
+
+        $statements_analyzer->node_data = clone $statements_analyzer->node_data;
+
+        $suppressed_issues = $statements_analyzer->getSuppressedIssues();
+
+        if (!isset($suppressed_issues['PossiblyInvalidMethodCall'])) {
+            $statements_analyzer->addSuppressedIssues(['PossiblyInvalidMethodCall']);
+        }
+
+        if (!isset($suppressed_issues['MixedArrayOffset'])) {
+            $statements_analyzer->addSuppressedIssues(['MixedArrayOffset']);
+        }
+
+        $was_inside_call = $context->inside_call;
+
+        $context->inside_call = true;
+
+        if ($fake_call instanceof PhpParser\Node\Expr\StaticCall) {
+            StaticCallAnalyzer::analyze(
+                $statements_analyzer,
+                $fake_call,
+                $context,
+            );
+        } elseif ($fake_call instanceof PhpParser\Node\Expr\MethodCall) {
+            MethodCallAnalyzer::analyze(
+                $statements_analyzer,
+                $fake_call,
+                $context,
+            );
+        } elseif ($fake_call instanceof PhpParser\Node\Expr\FuncCall) {
+            FunctionCallAnalyzer::analyze(
+                $statements_analyzer,
+                $fake_call,
+                $context,
+            );
+        } else {
+            throw new UnexpectedValueException('UnrecognizedCall');
+        }
+
+        $codebase = $statements_analyzer->getCodebase();
+
+        if ($assertions !== null) {
+            $anded_assertions = AssertionFinder::scrapeAssertions(
+                $fake_call,
+                null,
+                $statements_analyzer,
+                $codebase,
+            );
+
+            $assertions = $anded_assertions[0] ?? [];
+        }
+
+        $context->inside_call = $was_inside_call;
+
+        if (!isset($suppressed_issues['PossiblyInvalidMethodCall'])) {
+            $statements_analyzer->removeSuppressedIssues(['PossiblyInvalidMethodCall']);
+        }
+
+        if (!isset($suppressed_issues['MixedArrayOffset'])) {
+            $statements_analyzer->removeSuppressedIssues(['MixedArrayOffset']);
+        }
+
+        $return_type = $statements_analyzer->node_data->getType($fake_call) ?? null;
+
+        $statements_analyzer->node_data = $old_data_provider;
+
+        return $return_type;
+    }
+
+    /**
+     * @psalm-capabilities read-props
+     */
+    private static function getMappedArrayType(
+        ?Atomic $array_arg_atomic_type,
+        int $call_arg_count,
+        Union $generic_key_type,
+        Union $mapping_return_type,
+    ): Union {
+        if ($array_arg_atomic_type instanceof TKeyedArray && $call_arg_count === 2) {
+            $atomic_type = TKeyedArray::make(
+                array_map(
+                    static fn(Union $in): Union => $mapping_return_type->setPossiblyUndefined(
+                        $in->possibly_undefined,
+                    ),
+                    $array_arg_atomic_type->properties,
+                ),
+                null,
+                $array_arg_atomic_type->fallback_params === null
+                    ? null
+                    : [$array_arg_atomic_type->fallback_params[0], $mapping_return_type],
+                $array_arg_atomic_type->is_list,
+            );
+
+            return new Union([$atomic_type]);
+        }
+
+        if (($array_arg_atomic_type instanceof TKeyedArray && $array_arg_atomic_type->is_list)
+            || $call_arg_count !== 2
+        ) {
+            if ($array_arg_atomic_type instanceof TKeyedArray && $array_arg_atomic_type->isNonEmpty()) {
+                return Type::getNonEmptyList(
+                    $mapping_return_type,
+                );
+            }
+
+            return Type::getList(
+                $mapping_return_type,
+            );
+        }
+
+        if ($array_arg_atomic_type instanceof TNonEmptyArray) {
+            return new Union([
+                new TNonEmptyArray([
+                    $generic_key_type,
+                    $mapping_return_type,
+                ]),
+            ]);
+        }
+
+        return new Union([
+            new TArray([
+                $generic_key_type,
+                $mapping_return_type,
+            ]),
+        ]);
+    }
+
+    /**
+     * @param non-empty-array<int, string> $mapping_function_ids
+     * @param list<PhpParser\Node\Arg> $array_args
+     * @param int|null $fake_var_discriminator Set the fake variable id to a known value with the discriminator
+     *                                         as a substring, and don't clear it from the context.
+     * @param array<string, array<array<int, Assertion>>>|null $assertions
+     */
+    public static function getReturnTypeFromMappingIds(
+        StatementsAnalyzer $statements_source,
+        array $mapping_function_ids,
+        Context $context,
+        PhpParser\Node\Arg $function_call_arg,
+        array $array_args,
+        ?array &$assertions = null,
+        ?int $fake_var_discriminator = null,
+    ): Union {
+        $mapping_return_type = null;
+
+        $codebase = $statements_source->getCodebase();
+
+        $clean_context = false;
+
+        foreach ($mapping_function_ids as $mapping_function_id) {
+            $mapping_function_id_parts = explode('&', $mapping_function_id);
+
+            if ($fake_var_discriminator === null) {
+                // Derive the discriminator deterministically from the call's position instead of mt_rand(),
+                // so the synthetic variable names (and therefore the taint-graph node ids built from them)
+                // are identical across runs and threads. A random value here made the taint graph — and thus
+                // the set of reported taint issues — non-deterministic, especially once analysis is reused
+                // from cache or split across worker processes.
+                $fake_var_discriminator = $function_call_arg->getStartFilePos();
+                $clean_context = true;
+            }
+
+            foreach ($mapping_function_id_parts as $mapping_function_id_part) {
+                $fake_args = [];
+
+                foreach ($array_args as $array_arg) {
+                    $fake_args[] = new VirtualArg(
+                        new VirtualArrayDimFetch(
+                            $array_arg->value,
+                            new VirtualVariable(
+                                "__fake_{$fake_var_discriminator}_offset_var__",
+                                $array_arg->value->getAttributes(),
+                            ),
+                            $array_arg->value->getAttributes(),
+                        ),
+                        false,
+                        false,
+                        $array_arg->getAttributes(),
+                    );
+                }
+
+                if (str_contains($mapping_function_id_part, '::')) {
+                    $is_instance = false;
+
+                    if ($mapping_function_id_part[0] === '$') {
+                        $mapping_function_id_part = substr($mapping_function_id_part, 1);
+                        $is_instance = true;
+                    }
+
+                    $method_id_parts = explode('::', $mapping_function_id_part);
+                    [$callable_fq_class_name, $callable_method_name] = $method_id_parts;
+
+                    if ($is_instance) {
+                        $fake_method_call = new VirtualMethodCall(
+                            new VirtualVariable(
+                                "__fake_{$fake_var_discriminator}_method_call_var__",
+                                $function_call_arg->getAttributes(),
+                            ),
+                            new VirtualIdentifier(
+                                $callable_method_name,
+                                $function_call_arg->getAttributes(),
+                            ),
+                            $fake_args,
+                            $function_call_arg->getAttributes(),
+                        );
+
+                        $lhs_instance_type = null;
+
+                        $callable_type = $statements_source->node_data->getType($function_call_arg->value);
+
+                        if ($callable_type) {
+                            foreach ($callable_type->getAtomicTypes() as $atomic_type) {
+                                if ($atomic_type instanceof TKeyedArray
+                                    && count($atomic_type->properties) === 2
+                                    && isset($atomic_type->properties[0])
+                                ) {
+                                    $lhs_instance_type = $atomic_type->properties[0];
+                                }
+                            }
+                        }
+
+                        $context->vars_in_scope["\$__fake_{$fake_var_discriminator}_offset_var__"] = Type::getMixed();
+                        $context->vars_in_scope["\$__fake_{$fake_var_discriminator}_method_call_var__"] =
+                            $lhs_instance_type ?: new Union([new TNamedObject($callable_fq_class_name)]);
+                    } else {
+                        $fake_method_call = new VirtualStaticCall(
+                            new VirtualFullyQualified(
+                                $callable_fq_class_name,
+                                $function_call_arg->getAttributes(),
+                            ),
+                            new VirtualIdentifier(
+                                $callable_method_name,
+                                $function_call_arg->getAttributes(),
+                            ),
+                            $fake_args,
+                            $function_call_arg->getAttributes(),
+                        );
+
+                        $context->vars_in_scope["\$__fake_{$fake_var_discriminator}_offset_var__"] = Type::getMixed();
+                    }
+
+                    $fake_method_return_type = self::executeFakeCall(
+                        $statements_source,
+                        $fake_method_call,
+                        $context,
+                        $assertions,
+                    );
+
+                    $function_id_return_type = $fake_method_return_type ?? Type::getMixed();
+                } else {
+                    $fake_function_call = new VirtualFuncCall(
+                        new VirtualFullyQualified(
+                            $mapping_function_id_part,
+                            $function_call_arg->getAttributes(),
+                        ),
+                        $fake_args,
+                        $function_call_arg->getAttributes(),
+                    );
+
+                    $context->vars_in_scope["\$__fake_{$fake_var_discriminator}_offset_var__"] = Type::getMixed();
+
+                    $fake_function_return_type = self::executeFakeCall(
+                        $statements_source,
+                        $fake_function_call,
+                        $context,
+                        $assertions,
+                    );
+
+                    $function_id_return_type = $fake_function_return_type ?? Type::getMixed();
+                }
+            }
+
+            if ($clean_context) {
+                self::cleanContext($context, $fake_var_discriminator);
+            }
+
+            $fake_var_discriminator = null;
+
+            $mapping_return_type = Type::combineUnionTypes(
+                $function_id_return_type,
+                $mapping_return_type,
+                $codebase,
+            );
+        }
+
+        return $mapping_return_type;
+    }
+
+    public static function cleanContext(Context $context, int $fake_var_discriminator): void
+    {
+        foreach ($context->vars_in_scope as $var_in_scope => $_) {
+            if (str_contains($var_in_scope, "__fake_{$fake_var_discriminator}_")) {
+                unset($context->vars_in_scope[$var_in_scope]);
+            }
+        }
+    }
+}

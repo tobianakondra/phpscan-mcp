@@ -1,0 +1,85 @@
+<?php
+
+namespace Illuminate\Database\Eloquent\Relations;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Builder;
+
+/**
+ * @template TRelatedModel of \Illuminate\Database\Eloquent\Model
+ * Covariant TDeclaringModel — required by #913 (see Relation.phpstub for the rationale).
+ * @template-covariant TDeclaringModel of \Illuminate\Database\Eloquent\Model
+ * @template TResult
+ * @template-extends Relation<TRelatedModel, TDeclaringModel, TResult>
+ * @mixin \Illuminate\Database\Eloquent\Builder<TRelatedModel>
+ */
+abstract class HasOneOrMany extends Relation
+{
+
+    /**
+     * Create a new has one or many relationship instance.
+     *
+     * @param  \Illuminate\Database\Eloquent\Builder  $query
+     * @param  \Illuminate\Database\Eloquent\Model  $parent
+     * @param  string  $foreignKey
+     * @param  string  $localKey
+     * @return void
+     */
+    public function __construct(Builder $query, Model $parent, $foreignKey, $localKey) {}
+
+    /**
+     * @param  array<string, mixed>  $attributes
+     * @return TRelatedModel
+     */
+    public function make(array $attributes = []) {}
+
+    /**
+     * @template T
+     * @param  T  $id
+     * @param  list<non-empty-string|\Illuminate\Contracts\Database\Query\Expression>  $columns
+     * @psalm-return (T is (array|\Illuminate\Contracts\Support\Arrayable) ? \Illuminate\Database\Eloquent\Collection<int, TRelatedModel> : TRelatedModel)
+     */
+    public function findOrNew($id, $columns = ['*']) {}
+
+    /**
+     * @param  array<string, mixed>  $attributes
+     * @param  array<string, mixed>  $values
+     * @return TRelatedModel
+     */
+    public function updateOrCreate(array $attributes, array $values = []) {}
+
+    /**
+     * @param  array<string, mixed>  $attributes
+     * @return TRelatedModel
+     */
+    public function create(array $attributes = []) {}
+
+    /**
+     * @param  iterable<array<string, mixed>>  $records
+     * @return \Illuminate\Database\Eloquent\Collection<int, TRelatedModel>
+     */
+    public function createMany(iterable $records) {}
+
+    /**
+     * @param  array<string, mixed>  $attributes
+     * @param  array<string, mixed>  $values
+     * @return TRelatedModel
+     */
+    public function firstOrNew(array $attributes = [], array $values = []) {}
+
+    /**
+     * @param  array<string, mixed>  $attributes
+     * @param  (\Closure(): array<string, mixed>)|array<string, mixed>  $values
+     * @return TRelatedModel
+     */
+    public function firstOrCreate(array $attributes = [], \Closure|array $values = []) {}
+
+    /**
+     * Attempt to create the record. If a unique constraint violation occurs, find the matching record.
+     *
+     * @param  array<string, mixed>  $attributes
+     * @param  (\Closure(): array<string, mixed>)|array<string, mixed>  $values
+     * @return TRelatedModel
+     */
+    public function createOrFirst(array $attributes = [], \Closure|array $values = []) {}
+}

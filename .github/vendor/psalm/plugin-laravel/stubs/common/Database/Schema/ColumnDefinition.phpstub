@@ -1,0 +1,36 @@
+<?php
+
+namespace Illuminate\Database\Schema;
+
+use Illuminate\Support\Fluent;
+
+/**
+ * Only lock() and length() are stubbed; every other fluent method resolves from the class-level @method tags
+ * in Laravel's source (kept when Psalm merges this declaration into the reflected class).
+ *
+ * Laravel documents lock() with the same four-literal union, but Psalm does not enforce a
+ * union of 4+ literals in an @method param (3 are enforced). A real method is checked,
+ * so lock() is declared here.
+ *
+ * length() is missing from Laravel's @method list, yet it works: Fluent::__call() stores the
+ * `length` attribute that the grammars read for string and char columns. The class is sealed
+ * (below), so without this declaration `->length(50)` reports UndefinedMagicMethod.
+ *
+ * The stub docblock replaces the sealing flag that Laravel's own @method tags set on the reflected
+ * class, so the seal is restated here to keep unknown modifiers (`->indexed()`) reported.
+ *
+ * @psalm-seal-methods
+ */
+class ColumnDefinition extends Fluent
+{
+    // @todo-by https://github.com/vimeo/psalm/issues/12247 drop this lock() redeclaration, the @method tag in Laravel's source then suffices
+    /**
+     * Specify the DDL lock mode for the column operation (MySQL).
+     *
+     * @param 'none'|'shared'|'default'|'exclusive' $value
+     */
+    public function lock(string $value): static {}
+
+    /** Set the column length (string and char columns). */
+    public function length(int $length): static {}
+}

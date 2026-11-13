@@ -1,0 +1,656 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\LaravelPlugin\Handlers\Rules;
+
+use Illuminate\Database\Eloquent\Builder as EloquentBuilder;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\Relation;
+use PhpParser\Node\Arg;
+use PhpParser\Node\Expr\MethodCall;
+use PhpParser\Node\Expr\StaticCall;
+use PhpParser\Node\Identifier;
+use PhpParser\Node\Name;
+use Psalm\Codebase;
+use Psalm\CodeLocation;
+use Psalm\Exception\UnpopulatedClasslikeException;
+use Psalm\IssueBuffer;
+use Psalm\LaravelPlugin\Handlers\Eloquent\Metadata\ModelMetadata;
+use Psalm\LaravelPlugin\Handlers\Eloquent\Metadata\ModelMetadataRegistry;
+use Psalm\LaravelPlugin\Handlers\Eloquent\Support\AggregateCallParser;
+use Psalm\LaravelPlugin\Handlers\Eloquent\Support\ModelPropertyResolver;
+use Psalm\LaravelPlugin\Handlers\Eloquent\Support\RelationResolver;
+use Psalm\LaravelPlugin\Internal\Arg as ArgUtil;
+use Psalm\LaravelPlugin\Internal\ClassLineage;
+use Psalm\LaravelPlugin\Issues\UndefinedModelRelation;
+use Psalm\Plugin\EventHandler\AfterCodebasePopulatedInterface;
+use Psalm\Plugin\EventHandler\AfterExpressionAnalysisInterface;
+use Psalm\Plugin\EventHandler\Event\AfterCodebasePopulatedEvent;
+use Psalm\Plugin\EventHandler\Event\AfterExpressionAnalysisEvent;
+use Psalm\StatementsSource;
+use Psalm\Storage\ClassLikeStorage;
+use Psalm\Storage\PropertyStorage;
+use Psalm\Type\Atomic;
+use Psalm\Type\Atomic\TGenericObject;
+use Psalm\Type\Atomic\TKeyedArray;
+use Psalm\Type\Atomic\TNamedObject;
+use Psalm\Type\Atomic\TNull;
+use Psalm\Type\Union;
+
+/**
+ * Flags relation names passed to eager-loading / relationship-query methods that
+ * do not resolve to a method on the model — the typo case that is one of the most
+ * common sources of runtime errors in Laravel apps:
+ *
+ *   User::with('nonExistent')->get();   // Relation 'nonExistent' is not defined on User
+ *   $user->load('missingRelation');
+ *   User::whereHas('pots', ...);        // typo for 'posts'
+ *
+ * Handled syntaxes (all carried by the FIRST argument of every targeted method):
+ *   - string:        with('posts')
+ *   - dot-notation:  with('posts.comments.author')   — each segment resolved against
+ *                    the previous segment's related model
+ *   - array (list):  with(['posts', 'comments'])
+ *   - array (keyed): with(['posts' => fn ($q) => ...]) — the key is the relation
+ *   - select syntax: with('posts:id,title')           — the `:columns` part is stripped, except on a
+ *                    relation paired with a Closure (`with(['posts:id' => fn ...])`,
+ *                    `Builder::with('posts:id', fn ...)`): Laravel looks that name up verbatim
+ *
+ * **Hook choice — AfterExpressionAnalysis, not AfterMethodCallAnalysis.** The
+ * issue's headline examples are static calls (`User::with(...)`, `User::has(...)`).
+ * `has()`/`whereHas()` are not real static methods on the model — they resolve
+ * through Eloquent's `__callStatic` magic — so AfterMethodCallAnalysis is not a
+ * reliable place to observe them. AfterExpressionAnalysis fires on the call node
+ * regardless of how the method resolves, the same reason
+ * {@see UndefinedBuilderMethodHandler} uses it.
+ *
+ * **Existence-only, deliberately.** The rule reports only when *no* method (real
+ * or `@method`) with the name exists. A method that exists but is not a relation
+ * is left alone. This targets the typo/missing case the issue describes while
+ * keeping false positives near zero on real apps, where relations can be added in
+ * ways static analysis cannot see (runtime `Model::resolveRelationUsing()`,
+ * package macros). Resolution is also conservative: a non-model receiver, the
+ * bare/abstract base `Model`, an ambiguous union, a dynamic class-string, or an
+ * unresolvable intermediate model (`morphTo`) all cause the rule to defer. A concrete
+ * userland base model (`BookStack\App\Model`) is validated too, but a name that some analysed
+ * descendant defines is not reported on a call through the base type: the runtime instance may be
+ * that descendant. A name no descendant defines stays reported. The `$with` / `$withCount`
+ * defaults of a model are checked against that model alone.
+ *
+ * The `withCount()` / `withSum()` family (relation + ` as alias` aggregate
+ * sub-selects) is intentionally out of scope for this first pass.
+ *
+ * **No autoloading class checks.** Ancestry is resolved via {@see ClassLineage::isA()} /
+ * {@see concreteModel()} off Psalm's reflection, never `\is_a($class, X::class, true)` — that
+ * autoloads $class, and a deprecation raised while loading crashes the whole run (Psalm's error
+ * handler turns it into an exception).
+ *
+ * @see https://github.com/psalm/psalm-plugin-laravel/issues/643
+ * @see https://github.com/larastan/larastan RelationExistenceRule — Larastan's analogue
+ */
+final class UndefinedModelRelationHandler implements AfterCodebasePopulatedInterface, AfterExpressionAnalysisInterface
+{
+    /**
+     * Methods whose relation name(s) come from the FIRST argument. That is the
+     * common case and the array form (`['posts', 'comments']`) is fully handled.
+     * The `load*`/`loadMissing`/`loadCount`/`loadExists` forms are additionally
+     * variadic (extra positional relation names are accepted); those extra
+     * positions are not validated, only the first argument. Keys are lowercase to
+     * match the case-insensitive method-name compare.
+     *
+     * Values say whether a `:columns` suffix is safe to strip before the lookup: `true` where
+     * Laravel parses it (eager loading, and `withWhereHas()` via `Str::before()`) or where it is
+     * harmless (`without()` removes eager-load keys verbatim and never throws), `false` for the
+     * relationship existence queries, which look the name up verbatim (`has()` and everything
+     * delegating to it), so a `:columns` suffix never resolves.
+     */
+    private const RELATION_NAME_METHODS = [
+        // Eager loading
+        'with' => true,
+        'without' => true,
+        // Relationship existence queries
+        'has' => false,
+        'orhas' => false,
+        'doesnthave' => false,
+        'ordoesnthave' => false,
+        'wherehas' => false,
+        'orwherehas' => false,
+        'wheredoesnthave' => false,
+        'orwheredoesnthave' => false,
+        'withwherehas' => true,
+        'whererelation' => false,
+        'orwhererelation' => false,
+        'withwhererelation' => false,
+        'wheredoesnthaverelation' => false,
+        'orwheredoesnthaverelation' => false,
+        'wheremorphrelation' => false,
+        'orwheremorphrelation' => false,
+        // Lazy eager loading on a loaded model
+        'load' => true,
+        'loadmissing' => true,
+        'loadcount' => true,
+        'loadsum' => true,
+        'loadavg' => true,
+        'loadmax' => true,
+        'loadmin' => true,
+        'loadexists' => true,
+    ];
+
+    private const CLOSURE_COLUMNS_HINT = ": Laravel does not parse ':columns' on a relation paired with a constraint closure; select the columns inside the closure.";
+
+    private const EXISTENCE_COLUMNS_HINT = ": Laravel does not parse ':columns' in a relationship existence query; remove the suffix.";
+
+    /**
+     * The subset of {@see RELATION_NAME_METHODS} that resolve through
+     * `Model::loadAggregate()` / `Builder::withAggregate()`, which parse a
+     * `relation as alias` clause off the name (the alias names the aggregate
+     * sub-select column). For these the ` as <alias>` suffix is stripped before the
+     * relation lookup; for every other method a space in the name is a genuine error
+     * and stays reportable.
+     */
+    private const AGGREGATE_METHODS = [
+        'loadcount' => true,
+        'loadsum' => true,
+        'loadavg' => true,
+        'loadmax' => true,
+        'loadmin' => true,
+        'loadexists' => true,
+    ];
+
+    /**
+     * Validate effective `$with` / `$withCount` defaults after ModelRegistrationHandler has warmed
+     * ModelMetadataRegistry. Metadata is intentionally read from the concrete model: a child can
+     * supply a relation that makes an inherited default valid, while a sibling cannot.
+     */
+    #[\Override]
+    public static function afterCodebasePopulated(AfterCodebasePopulatedEvent $event): void
+    {
+        $codebase = $event->getCodebase();
+        $provider = $codebase->classlike_storage_provider;
+
+        foreach (ModelMetadataRegistry::all() as $modelFqcn => $metadata) {
+            if (
+                ($metadata->with === [] && $metadata->withCount === [])
+                || !$metadata->isComplete(ModelMetadata::SECTION_RUNTIME_CONFIGURATION)
+                || !$provider->has($modelFqcn)
+            ) {
+                continue;
+            }
+
+            $storage = $provider->get($modelFqcn);
+            if (!$storage->user_defined || $storage->abstract) {
+                continue;
+            }
+
+            foreach (['with' => $metadata->with, 'withCount' => $metadata->withCount] as $property => $relations) {
+                $propertyStorage = self::ownDefaultProperty($storage, $modelFqcn, $property);
+                $location = $propertyStorage?->location ?? $storage->location;
+                if (!$location instanceof CodeLocation) {
+                    continue;
+                }
+
+                $suppressedIssues = $storage->suppressed_issues;
+                if ($propertyStorage instanceof \Psalm\Storage\PropertyStorage) {
+                    $suppressedIssues = [...$suppressedIssues, ...$propertyStorage->suppressed_issues];
+                }
+
+                foreach ($relations as $relation) {
+                    self::validateRelationPath(
+                        $codebase,
+                        $modelFqcn,
+                        $relation,
+                        $location,
+                        $suppressedIssues,
+                        allowsAlias: $property === 'withCount',
+                        allowsPaths: $property === 'with',
+                        allowsColumns: $property === 'with',
+                        receiverMayBeDescendant: false,
+                        property: $property,
+                    );
+                }
+            }
+        }
+    }
+
+    /** @inheritDoc */
+    #[\Override]
+    public static function afterExpressionAnalysis(AfterExpressionAnalysisEvent $event): ?bool
+    {
+        $expr = $event->getExpr();
+
+        if (!$expr instanceof MethodCall && !$expr instanceof StaticCall) {
+            return null;
+        }
+
+        // Dynamic `->{$name}()` has no statically known method name.
+        if (!$expr->name instanceof Identifier) {
+            return null;
+        }
+
+        $methodNameLc = \strtolower($expr->name->name);
+        if (!isset(self::RELATION_NAME_METHODS[$methodNameLc])) {
+            return null;
+        }
+
+        // Mirror Psalm's own gating: stay silent where method checks are disabled
+        // (e.g. inside isset()/empty() operands), matching the core call analyzer.
+        if (!$event->getContext()->check_methods) {
+            return null;
+        }
+
+        // getArgs() throws on a first-class callable (`->has(...)`), which names no relation.
+        if ($expr->isFirstClassCallable()) {
+            return null;
+        }
+
+        $args = \array_values($expr->getArgs());
+        $relationArg = self::relationArg($args);
+        if (!$relationArg instanceof Arg) {
+            return null;
+        }
+
+        $source = $event->getStatementsSource();
+        $codebase = $event->getCodebase();
+
+        $modelFqcn = self::resolveBaseModel($expr, $source, $codebase);
+        if ($modelFqcn === null) {
+            return null;
+        }
+
+        $allowsAlias = isset(self::AGGREGATE_METHODS[$methodNameLc]);
+
+        $callbackArg = $methodNameLc === 'with' && $expr instanceof MethodCall
+            && self::isBuilderReceiver($expr, $source, $codebase)
+            ? ArgUtil::boundTo($args, 'callback', 1)
+            : null;
+
+        $methodParsesColumns = self::RELATION_NAME_METHODS[$methodNameLc];
+
+        foreach (self::extractRelationNames($source, $relationArg, $callbackArg) as [$relationName, $parsesColumns]) {
+            self::validateRelationPath(
+                $codebase,
+                $modelFqcn,
+                $relationName,
+                new CodeLocation($source, $relationArg->value),
+                $source->getSuppressedIssues(),
+                allowsAlias: $allowsAlias,
+                allowsPaths: true,
+                allowsColumns: $methodParsesColumns && $parsesColumns,
+                receiverMayBeDescendant: true,
+                verbatimColumnsHint: $methodParsesColumns ? self::CLOSURE_COLUMNS_HINT : self::EXISTENCE_COLUMNS_HINT,
+            );
+        }
+
+        return null;
+    }
+
+    /**
+     * `Eloquent\Builder::with()` (also reached through a Relation, which forwards to its builder)
+     * is the only target of the `with($relations, Closure $callback)` pairing; the receiver must
+     * be a Builder or Relation in every atomic, never a Model (`Model::with()` is list-only).
+     */
+    private static function isBuilderReceiver(MethodCall $expr, StatementsSource $source, Codebase $codebase): bool
+    {
+        $type = $source->getNodeTypeProvider()->getType($expr->var);
+        foreach ($type?->getAtomicTypes() ?? [] as $atomic) {
+            if (
+                !$atomic instanceof TNamedObject
+                || !ClassLineage::isA($codebase, $atomic->value, EloquentBuilder::class) && !ClassLineage::isA($codebase, $atomic->value, Relation::class)
+            ) {
+                return false;
+            }
+        }
+
+        return $type instanceof Union;
+    }
+
+    /**
+     * The relation-name argument: the first positional one, else the named `$relations` (with/load*) or
+     * `$relation` (has/whereHas/whereRelation family), which keeps a reordered named call checked.
+     *
+     * @param array<array-key, Arg> $args
+     * @psalm-capabilities read-props
+     */
+    private static function relationArg(array $args): ?Arg
+    {
+        foreach ($args as $index => $arg) {
+            $name = $arg->name?->name;
+            if ($name === null ? $index === 0 : ($name === 'relations' || $name === 'relation')) {
+                return $arg;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * True only when every atomic is a Closure (Psalm's `TClosure` extends `TNamedObject` and is
+     * named `Closure`); unions such as `Closure|array` or `?Closure` are not proven.
+     *
+     * @psalm-pure
+     */
+    private static function isProvenClosure(?Union $type): bool
+    {
+        foreach ($type?->getAtomicTypes() ?? [] as $atomic) {
+            if (!$atomic instanceof TNamedObject || \strtolower($atomic->value) !== 'closure') {
+                return false;
+            }
+        }
+
+        return $type instanceof Union;
+    }
+
+    /**
+     * Resolve the model the relation names should be validated against.
+     *
+     * Static call (`User::with(...)`)   → the called class, when it is a concrete model.
+     * Instance call (`$builder->with()`) → the receiver type: `Builder<TModel>` /
+     * `Relation<TModel, ...>` first generic parameter, or a `Model` receiver directly.
+     *
+     * @return ?class-string<Model>
+     */
+    private static function resolveBaseModel(MethodCall|StaticCall $expr, StatementsSource $source, Codebase $codebase): ?string
+    {
+        if ($expr instanceof StaticCall) {
+            if (!$expr->class instanceof Name) {
+                return null;
+            }
+
+            $fqcn = self::resolveClassName($expr->class, $source);
+
+            return $fqcn !== null ? self::concreteModel($codebase, $fqcn) : null;
+        }
+
+        $receiverType = $source->getNodeTypeProvider()->getType($expr->var);
+        if (!$receiverType instanceof Union) {
+            return null;
+        }
+
+        return self::resolveModelFromType($codebase, $receiverType);
+    }
+
+    /**
+     * Resolve a `Name` class reference to an FQCN. `self` / `static` resolve to the
+     * enclosing class; `parent` is not resolved (relations on a parent reached via
+     * static call are rare and `getFQCLN()` would point at the wrong class).
+     */
+    private static function resolveClassName(Name $class, StatementsSource $source): ?string
+    {
+        if ($class->isSpecialClassName()) {
+            return match ($class->toLowerString()) {
+                'self', 'static' => $source->getFQCLN(),
+                default => null,
+            };
+        }
+
+        // Psalm's name resolver stores the FQCN as a string on this attribute.
+        /** @psalm-var ?string $resolved */
+        $resolved = $class->getAttribute('resolvedName');
+
+        return \is_string($resolved) ? $resolved : $class->toString();
+    }
+
+    /**
+     * Mirror Larastan's `findModelReflectionFromType`: require a single concrete
+     * model. A union mixing distinct models, or any atomic that does not map to a
+     * model, is ambiguous and defers. `null` atomics (`Builder<Post>|null`) are
+     * skipped.
+     *
+     * @return ?class-string<Model>
+     */
+    private static function resolveModelFromType(Codebase $codebase, Union $type): ?string
+    {
+        $candidate = null;
+
+        foreach ($type->getAtomicTypes() as $atomic) {
+            if ($atomic instanceof TNull) {
+                continue;
+            }
+
+            $model = self::modelFromAtomic($codebase, $atomic);
+            if ($model === null) {
+                return null;
+            }
+
+            if ($candidate !== null && \strtolower($candidate) !== \strtolower($model)) {
+                return null;
+            }
+
+            $candidate = $model;
+        }
+
+        return $candidate;
+    }
+
+    /**
+     * Map one atomic type to the concrete model it queries, or null when it is not
+     * a model-bearing type. `Builder<TModel>` and `Relation<TModel, ...>` expose the
+     * model as their first generic parameter; a `Model` atomic is the model itself.
+     *
+     * @return ?class-string<Model>
+     */
+    private static function modelFromAtomic(Codebase $codebase, Atomic $atomic): ?string
+    {
+        if ($atomic instanceof TGenericObject) {
+            if (
+                ClassLineage::isA($codebase, $atomic->value, EloquentBuilder::class)
+                || ClassLineage::isA($codebase, $atomic->value, Relation::class)
+            ) {
+                $model = ModelPropertyResolver::extractModelFromUnion($atomic->type_params[0] ?? null, $codebase);
+
+                return $model !== null ? self::concreteModel($codebase, $model) : null;
+            }
+
+            if (ClassLineage::isA($codebase, $atomic->value, Model::class)) {
+                return self::concreteModel($codebase, $atomic->value);
+            }
+
+            return null;
+        }
+
+        if ($atomic instanceof TNamedObject && ClassLineage::isA($codebase, $atomic->value, Model::class)) {
+            return self::concreteModel($codebase, $atomic->value);
+        }
+
+        return null;
+    }
+
+    /**
+     * Accept only a concrete, non-abstract model subclass. The bare base `Model`
+     * (an un-narrowed `Builder<Model>`) and abstract base models are rejected:
+     * their relation set is unknown / lives in subclasses, so validating against
+     * them would be a false positive.
+     *
+     * @return ?class-string<Model>
+     */
+    private static function concreteModel(Codebase $codebase, string $fqcn): ?string
+    {
+        // classExtends() non-reflexive → already excludes Model itself; no autoload.
+        if (!$codebase->classExists($fqcn)) {
+            return null;
+        }
+
+        try {
+            if (!$codebase->classExtends($fqcn, Model::class)) {
+                return null;
+            }
+
+            $storage = $codebase->classlike_storage_provider->get($fqcn);
+        } catch (\InvalidArgumentException|UnpopulatedClasslikeException) {
+            return null;
+        }
+
+        if ($storage->abstract) {
+            return null;
+        }
+
+        /** @var class-string<Model> $fqcn */
+        return $fqcn;
+    }
+
+    /**
+     * Extract statically-known relation names from the first argument.
+     *
+     * Single string literal → one name. Constant array → string keys (the
+     * `['posts' => fn]` closure form) plus single-string-literal values (the
+     * `['posts', 'comments']` list form). Anything dynamic yields nothing and the
+     * call is left unvalidated.
+     *
+     * Each name carries whether Laravel parses a `:columns` suffix on it. It does not for a string
+     * key whose value is a Closure (looked up verbatim), nor for a literal paired with a proven
+     * Closure `$callbackArg` (`Builder::with('posts:id', fn ...)`); every other form is parsed.
+     *
+     * @return list<array{string, bool}> [name, parsesColumns]
+     */
+    private static function extractRelationNames(StatementsSource $source, Arg $arg, ?Arg $callbackArg = null): array
+    {
+        $argType = $source->getNodeTypeProvider()->getType($arg->value);
+        if (!$argType instanceof Union) {
+            return [];
+        }
+
+        if ($argType->isSingleStringLiteral()) {
+            $paired = $callbackArg instanceof Arg && self::isProvenClosure($source->getNodeTypeProvider()->getType($callbackArg->value));
+
+            return [[$argType->getSingleStringLiteral()->value, !$paired]];
+        }
+
+        $names = [];
+
+        foreach ($argType->getAtomicTypes() as $atomic) {
+            if (!$atomic instanceof TKeyedArray) {
+                continue;
+            }
+
+            foreach ($atomic->properties as $key => $valueType) {
+                // Keyed form `['posts' => fn ($q) => ...]`: the string key is the relation.
+                if (\is_string($key)) {
+                    $names[] = [$key, !self::isProvenClosure($valueType)];
+                }
+
+                // List form `['posts', 'comments']`: the string-literal value is the relation.
+                if ($valueType->isSingleStringLiteral()) {
+                    $names[] = [$valueType->getSingleStringLiteral()->value, true];
+                }
+            }
+        }
+
+        return $names;
+    }
+
+    /**
+     * Validate one (possibly dotted) relation path, emitting at the first segment
+     * that does not resolve to a relation method. Walking stops early when an
+     * intermediate related model cannot be determined (polymorphic / dynamic), so
+     * the deeper segments are left unvalidated rather than guessed.
+     *
+     * @param class-string<Model> $modelFqcn
+     * @param bool $allowsAlias whether the calling method accepts a `relation as alias`
+     *                          clause (the aggregate `load*` family) that must be
+     *                          stripped before the relation lookup
+     * @param bool $allowsPaths whether dot notation is meaningful for this declaration surface
+     * @param bool $allowsColumns whether eager-load `:columns` syntax is meaningful
+     * @param bool $receiverMayBeDescendant whether the model is only the static bound of the runtime class, so a
+     *                                      relation defined by an analysed descendant is not a typo
+     * @param array<array-key, string> $suppressedIssues
+     * @param ?string $verbatimColumnsHint message suffix used when a name that is looked up verbatim
+     *                                     (`$allowsColumns` false) still contains `:`; null reports plainly
+     */
+    private static function validateRelationPath(
+        Codebase $codebase,
+        string $modelFqcn,
+        string $relationName,
+        CodeLocation $location,
+        array $suppressedIssues,
+        bool $allowsAlias,
+        bool $allowsPaths,
+        bool $allowsColumns,
+        bool $receiverMayBeDescendant,
+        ?string $property = null,
+        ?string $verbatimColumnsHint = null,
+    ): void {
+        $segments = $allowsPaths ? \explode('.', $relationName) : [$relationName];
+        $lastIndex = \count($segments) - 1;
+        $current = $modelFqcn;
+
+        foreach ($segments as $index => $segment) {
+            // Strip the `:col1,col2` select syntax (with()/load() eager-load columns).
+            $name = \trim($allowsColumns ? \explode(':', $segment, 2)[0] : $segment);
+
+            // Strip the ` as <alias>` aggregate clause (loadCount/loadSum/...): the
+            // alias names the sub-select column, not part of the relation name. A real
+            // relation maps to a PHP method, which never contains a space, so this can
+            // only ever remove alias syntax, never mask a typo.
+            if ($allowsAlias) {
+                [$name] = AggregateCallParser::splitAlias($name);
+            }
+
+            if ($name === '') {
+                return;
+            }
+
+            if (!RelationResolver::relationMethodExists($codebase, $current, $name)) {
+                if ($receiverMayBeDescendant && RelationResolver::relationMethodExistsOnDescendant($codebase, $current, $name)) {
+                    return;
+                }
+
+                $context = $property === null ? '' : " from {$modelFqcn}::\${$property}";
+                // A verbatim name containing ':' is the unparsed `:columns` mistake.
+                $hint = !$allowsColumns && $verbatimColumnsHint !== null && \str_contains($name, ':')
+                    ? $verbatimColumnsHint
+                    : '.';
+                IssueBuffer::accepts(
+                    new UndefinedModelRelation(
+                        "Relation '{$name}'{$context} is not defined on {$current}{$hint}",
+                        $location,
+                    ),
+                    $suppressedIssues,
+                );
+
+                return;
+            }
+
+            if ($index === $lastIndex) {
+                return;
+            }
+
+            $related = RelationResolver::relatedModel($codebase, $current, $name);
+            if ($related === null) {
+                return;
+            }
+
+            // Gate the intermediate model exactly like the receiver: the bare base
+            // Model and abstract bases (e.g. a relation declared as
+            // `hasMany(Model::class)`) have an unknown / subclass-owned relation set,
+            // so deeper segments must defer rather than be validated against them.
+            $current = self::concreteModel($codebase, $related);
+            if ($current === null) {
+                return;
+            }
+        }
+    }
+
+    /**
+     * A parent or trait default is evaluated in the child context, so only a property declared by the
+     * concrete model supplies a property-local location or suppression; inherited defaults stay on the child.
+     *
+     * @psalm-mutation-free
+     */
+    private static function ownDefaultProperty(ClassLikeStorage $storage, string $modelFqcn, string $property): ?PropertyStorage
+    {
+        $declaringClass = $storage->declaring_property_ids[$property] ?? null;
+        $propertyStorage = $storage->properties[$property] ?? null;
+
+        if (
+            $declaringClass !== null
+            && \strtolower($declaringClass) === \strtolower($modelFqcn)
+            && $propertyStorage !== null
+            && $propertyStorage->location instanceof CodeLocation
+        ) {
+            return $propertyStorage;
+        }
+
+        return null;
+    }
+}

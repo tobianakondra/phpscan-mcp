@@ -1,0 +1,723 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Storage;
+
+use Override;
+use Psalm\Aliases;
+use Psalm\CodeLocation;
+use Psalm\Codebase;
+use Psalm\Config;
+use Psalm\Internal\Analyzer\ClassLikeAnalyzer;
+use Psalm\Internal\MethodIdentifier;
+use Psalm\Internal\Type\TypeAlias\ClassTypeAlias;
+use Psalm\Issue\CodeIssue;
+use Psalm\Issue\DeprecatedClass;
+use Psalm\Type\Atomic\TGenericObject;
+use Psalm\Type\Atomic\TNamedObject;
+use Psalm\Type\Atomic\TTemplateParam;
+use Psalm\Type\Union;
+
+use function array_keys;
+use function array_reverse;
+use function array_values;
+use function count;
+use function in_array;
+
+/**
+ * @api
+ * @psalm-import-type CapabilitySet from Capabilities
+ */
+final class ClassLikeStorage implements HasAttributesInterface
+{
+    use CustomMetadataTrait;
+    use UnserializeMemoryUsageSuppressionTrait;
+
+    /**
+     * @var array<string, ClassConstantStorage>
+     */
+    public array $constants = [];
+
+    /**
+     * Aliases to help Psalm understand constant refs
+     */
+    public ?Aliases $aliases = null;
+
+    public bool $populated = false;
+
+    public bool $stubbed = false;
+
+    /**
+     * How the strings some members of the class hold start, as the scan found them, for the names of the keyed stores
+     * of the taint analysis (see StringStartScanner)
+     *
+     * @internal
+     * @var array<string, string>
+     */
+    public array $string_starts = [];
+
+    /**
+     * The `analysis_php_version_id` at which this native symbol became available, from an `@since`
+     * tag on a stub class (e.g. 8_05_00 for a class tagged `@since 8.5`). Used to report the symbol
+     * as undefined when analysing an older PHP version without a polyfill, while still keeping its
+     * stubbed definition for analysis. Null when unversioned/user-defined. Propagates to the class's
+     * own constants, methods and properties unless they carry a later `@since` of their own.
+     */
+    public ?int $since_php_version_id = null;
+
+    public bool $deprecated = false;
+
+    /**
+     * The literal message of a native #[\Deprecated] attribute, if any.
+     *
+     * @var non-empty-string|null
+     */
+    public ?string $deprecated_message = null;
+
+    /**
+     * @var list<non-empty-string>
+     */
+    public array $internal = [];
+
+    /**
+     * @var TTemplateParam[]
+     */
+    public array $templatedMixins = [];
+
+    /**
+     * @var list<TNamedObject>
+     */
+    public array $namedMixins = [];
+
+    /**
+     * Named mixins reachable only through another mixin's own `@mixin` chain, deepest hop first.
+     * Filled during population; see getNamedMixinsForLookup().
+     *
+     * @var list<TNamedObject>
+     */
+    public array $transitiveNamedMixins = [];
+
+    public ?string $mixin_declaring_fqcln = null;
+
+    public ?bool $sealed_properties = null;
+
+    public ?bool $sealed_methods = null;
+
+    public bool $override_property_visibility = false;
+
+    public bool $override_method_visibility = false;
+
+    /**
+     * @var array<int, string>
+     */
+    public array $suppressed_issues = [];
+
+    /**
+     * The subset of $suppressed_issues written in this class-like's own docblock, keyed by the
+     * char offset of the issue name. Plugins append to $suppressed_issues, never to this, so only
+     * these entries have a source location to report as unused.
+     *
+     * @var array<int, string>
+     */
+    public array $docblock_suppressed_issues = [];
+
+    /**
+     * Is this class user-defined
+     */
+    public bool $user_defined = false;
+
+    /**
+     * Interfaces this class implements directly
+     *
+     * @var array<lowercase-string, string>
+     */
+    public array $direct_class_interfaces = [];
+
+    /**
+     * Interfaces this class implements explicitly and implicitly
+     *
+     * @var array<lowercase-string, string>
+     */
+    public array $class_implements = [];
+
+    /**
+     * Parent interfaces listed explicitly
+     *
+     * @var array<lowercase-string, string>
+     */
+    public array $direct_interface_parents = [];
+
+    /**
+     * Parent interfaces
+     *
+     * @var  array<lowercase-string, string>
+     */
+    public array $parent_interfaces = [];
+
+    /**
+     * There can only be one direct parent class
+     */
+    public ?string $parent_class = null;
+
+    /**
+     * Parent classes
+     *
+     * @var array<lowercase-string, string>
+     */
+    public array $parent_classes = [];
+
+    public ?CodeLocation $location = null;
+
+    public ?CodeLocation $stmt_location = null;
+
+    public ?CodeLocation $namespace_name_location = null;
+
+    public bool $abstract = false;
+
+    public bool $final = false;
+
+    public bool $final_from_docblock = false;
+
+    public bool $trait_used = false;
+
+    /**
+     * @var array<lowercase-string, string>
+     */
+    public array $used_traits = [];
+
+    /**
+     * @var array<lowercase-string, lowercase-string>
+     */
+    public array $trait_alias_map = [];
+
+    /**
+     * @var array<string, string>
+     */
+    public array $trait_alias_map_cased = [];
+
+    /**
+     * The trait an alias is qualified with (`use A { A::f as g; }`), by the alias name
+     *
+     * @var array<lowercase-string, lowercase-string>
+     */
+    public array $trait_alias_trait_map = [];
+
+    /**
+     * The traits whose method is not used because of `insteadof` (`use A, B { B::f insteadof A; }`),
+     * by the method name
+     *
+     * @var array<lowercase-string, array<lowercase-string, true>>
+     */
+    public array $trait_excluded_methods = [];
+
+    /**
+     * @var array<lowercase-string, bool>
+     */
+    public array $trait_final_map = [];
+
+    /**
+     * @var array<string, ClassLikeAnalyzer::VISIBILITY_*>
+     */
+    public array $trait_visibility_map = [];
+
+    public bool $is_trait = false;
+
+    public bool $is_interface = false;
+
+    public bool $is_enum = false;
+
+    /** @var CapabilitySet */
+    public int $capabilities = Capabilities::ALL;
+
+    /**
+     * A `@psalm-capabilities` value that names imported type aliases, resolved into
+     * {@see self::$capabilities} by the populator once every class is scanned.
+     */
+    public ?Union $capabilities_type = null;
+
+    public bool $has_mutations_annotation = false;
+
+    /**
+     * Whether the class is a marker interface without a class-level purity annotation: it declares no method or
+     * property, nor inherits one, so it does nothing and counts as pure. Its contract caps no implementer, as it has
+     * none of their methods to cap.
+     */
+    public bool $is_marker_interface = false;
+
+    public bool $specialize_instance = false;
+
+    /**
+     * Whether the class, or a class it extends, has `@psalm-taint-specialize`: its instances are
+     * specialized, so they may not change once constructed and its methods may not change other
+     * objects or global state (see {@see Capabilities::TAINT_SPECIALIZED})
+     */
+    public bool $taint_specialize = false;
+
+    /**
+     * Whether the class is only specialized because a class it extends has `@psalm-taint-specialize`
+     */
+    public bool $inherits_taint_specialize = false;
+
+    /**
+     * The array property holding the properties of the objects of the class under their names, from
+     * `@psalm-taint-property-bag` on the class or a class it extends (see PropertyBagTaints)
+     */
+    public ?string $taint_property_bag = null;
+
+    /**
+     * Whether the methods of the class only run from the command line (`@psalm-cli-only`): what they print goes to a
+     * terminal, not to an HTML response
+     */
+    public bool $cli_only = false;
+
+    /**
+     * @var array<lowercase-string, MethodStorage>
+     */
+    public array $methods = [];
+
+    /**
+     * @var array<lowercase-string, MethodStorage>
+     */
+    public array $pseudo_methods = [];
+
+    /**
+     * @var array<lowercase-string, MethodStorage>
+     */
+    public array $pseudo_static_methods = [];
+
+    /**
+     * Every `@method` of a name declared more than once, in the order of the docblock
+     *
+     * @var array<lowercase-string, non-empty-list<MethodStorage>>
+     */
+    public array $pseudo_method_overloads = [];
+
+    /**
+     * Same as $pseudo_method_overloads, for the static `@method`s
+     *
+     * @var array<lowercase-string, non-empty-list<MethodStorage>>
+     */
+    public array $pseudo_static_method_overloads = [];
+
+    public bool $has_children = false;
+
+    /**
+     * Maps pseudo method names to the original declaring method identifier
+     * The key is the method name in lowercase, and the value is the original `MethodIdentifier` instance
+     *
+     * This property contains all pseudo methods declared on ancestors.
+     *
+     * @var array<lowercase-string, MethodIdentifier>
+     */
+    public array $declaring_pseudo_method_ids = [];
+
+    /**
+     * Same as $declaring_pseudo_method_ids, but for static pseudo methods
+     *
+     * @var array<lowercase-string, MethodIdentifier>
+     */
+    public array $declaring_pseudo_static_method_ids = [];
+
+    /**
+     * @var array<lowercase-string, MethodIdentifier>
+     */
+    public array $declaring_method_ids = [];
+
+    /**
+     * @var array<lowercase-string, MethodIdentifier>
+     */
+    public array $appearing_method_ids = [];
+
+    /**
+     * Map from lowercase method name to list of declarations in order from parent, to grandparent, to
+     * great-grandparent, etc **including traits and interfaces**. Ancestors that don't have their own declaration are
+     * skipped.
+     *
+     * @var array<lowercase-string, array<string, MethodIdentifier>>
+     */
+    public array $overridden_method_ids = [];
+
+    /**
+     * @var array<lowercase-string, MethodIdentifier>
+     */
+    public array $documenting_method_ids = [];
+
+    /**
+     * @var array<lowercase-string, MethodIdentifier>
+     */
+    public array $inheritable_method_ids = [];
+
+    /**
+     * @var array<lowercase-string, array<string, bool>>
+     */
+    public array $potential_declaring_method_ids = [];
+
+    /**
+     * @var array<string, PropertyStorage>
+     */
+    public array $properties = [];
+
+    /**
+     * @var array<string, Union>
+     */
+    public array $pseudo_property_set_types = [];
+
+    /**
+     * @var array<string, Union>
+     */
+    public array $pseudo_property_get_types = [];
+
+    /**
+     * @var array<string, string>
+     */
+    public array $declaring_property_ids = [];
+
+    /**
+     * @var array<string, string>
+     */
+    public array $appearing_property_ids = [];
+
+    public ?Union $inheritors = null;
+
+    /**
+     * @var array<string, string>
+     */
+    public array $inheritable_property_ids = [];
+
+    /**
+     * @var array<string, array<string>>
+     */
+    public array $overridden_property_ids = [];
+
+    /**
+     * An array holding the class template "as" types.
+     *
+     * It's the de-facto list of all templates on a given class.
+     *
+     * The name of the template is the first key. The nested array is keyed by the defining class
+     * (i.e. the same as the class name). This allows operations with the same-named template defined
+     * across multiple classes to not run into trouble.
+     *
+     * @var array<string, non-empty-array<string, Union>>|null
+     */
+    public ?array $template_types = null;
+
+    /**
+     * @var array<int, bool>|null
+     */
+    public ?array $template_covariants = null;
+
+    /**
+     * The templates declared with `@psalm-purity-template` (capability sets); the others are type templates.
+     *
+     * @var array<string, true>
+     */
+    public array $purity_templates = [];
+
+    /**
+     * What a template left out of a use of the class stands for: the declared default of a type template, in which
+     * earlier templates stand for their arguments (`@template T of Bound = Default`), or the default of a purity
+     * template (`@psalm-purity-template C(pure) <= io`), else its upper bound. Subclasses not binding it get it, as do
+     * uses like `Foo<A>` leaving out trailing type templates, but not a use without type arguments (`Foo`).
+     *
+     * @var array<string, Union>
+     */
+    public array $template_defaults = [];
+
+    /**
+     * Where each declared type template default is, for the issues about it.
+     *
+     * @var array<string, CodeLocation>
+     */
+    public array $template_default_locations = [];
+
+    /**
+     * The lower bound of each purity template that has one (`@psalm-purity-template write-props <= C`):
+     * what every value of the template requires, so the methods depending on it get these
+     * capabilities unconditionally, and subclasses may not bind it to less.
+     *
+     * @var array<string, CapabilitySet>
+     */
+    public array $template_lower_bounds = [];
+
+    /**
+     * A map of which generic classlikes are extended or implemented by this class or interface.
+     *
+     * This is only used in the populator, which poulates the $template_extended_params property below.
+     *
+     * @internal
+     * @var array<string, non-empty-array<int, Union>>|null
+     */
+    public ?array $template_extended_offsets = null;
+
+    /**
+     * A map of which generic classlikes are extended or implemented by this class or interface.
+     *
+     * The annotation "@extends Traversable<SomeClass, SomeOtherClass>" would generate an entry of
+     *
+     * [
+     *     "Traversable" => [
+     *         "TKey" => new Union([new TNamedObject("SomeClass")]),
+     *         "TValue" => new Union([new TNamedObject("SomeOtherClass")])
+     *     ]
+     * ]
+     *
+     * @var array<string, array<string, Union>>|null
+     */
+    public ?array $template_extended_params = null;
+
+    /**
+     * @var array<string, int>|null
+     */
+    public ?array $template_type_extends_count = null;
+
+
+    /**
+     * @var array<string, int>|null
+     */
+    public ?array $template_type_implements_count = null;
+
+    public ?Union $yield = null;
+
+    public ?string $declaring_yield_fqcn = null;
+
+    /**
+     * @var array<string, int>|null
+     */
+    public ?array $template_type_uses_count = null;
+
+    /**
+     * @var array<string, bool>
+     */
+    public array $initialized_properties = [];
+
+    /**
+     * @var array<string, true>
+     */
+    public array $invalid_dependencies = [];
+
+    /**
+     * @var array<lowercase-string, bool>
+     */
+    public array $dependent_classlikes = [];
+
+    public bool $has_visitor_issues = false;
+
+    /**
+     * @var list<CodeIssue>
+     */
+    public array $docblock_issues = [];
+
+    /**
+     * @var array<string, ClassTypeAlias>
+     */
+    public array $type_aliases = [];
+
+    public bool $preserve_constructor_signature = false;
+
+    public bool $enforce_template_inheritance = false;
+
+    public ?string $extension_requirement = null;
+
+    /**
+     * The type arguments of the class `@psalm-require-extends` names, in the templates of the trait
+     */
+    public ?TGenericObject $extension_requirement_type = null;
+
+    /**
+     * The type arguments of the interfaces `@psalm-require-implements` names, in the templates of the trait
+     *
+     * @var array<string, TGenericObject>
+     */
+    public array $implementation_requirement_types = [];
+
+    /**
+     * @var array<int, string>
+     */
+    public array $implementation_requirements = [];
+
+    /**
+     * @var list<AttributeStorage>
+     */
+    public array $attributes = [];
+
+    /**
+     * @var array<string, EnumCaseStorage>
+     */
+    public array $enum_cases = [];
+
+    /**
+     * @var 'int'|'string'|null
+     */
+    public ?string $enum_type = null;
+
+    public ?string $description = null;
+
+    public bool $public_api = false;
+
+    public bool $readonly = false;
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function __construct(public string $name)
+    {
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function isPure(): bool
+    {
+        return Capabilities::allowsAnyOf(Capabilities::NONE, $this->capabilities);
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function isMutationFree(): bool
+    {
+        return Capabilities::allowsAnyOf(Capabilities::MUTATION_FREE, $this->capabilities);
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function isExternalMutationFree(): bool
+    {
+        return Capabilities::allowsAnyOf(Capabilities::EXTERNAL_MUTATION_FREE, $this->capabilities);
+    }
+
+    /**
+     * @return list<AttributeStorage>
+     */
+    #[Override]
+    public function getAttributeStorages(): array
+    {
+        return $this->attributes;
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function hasAttributeIncludingParents(
+        string $fq_class_name,
+        Codebase $codebase,
+    ): bool {
+        if ($this->hasAttribute($fq_class_name)) {
+            return true;
+        }
+
+        foreach ($this->parent_classes as $parent_class) {
+            // skip missing dependencies
+            if (!$codebase->classlike_storage_provider->has($parent_class)) {
+                continue;
+            }
+            $parent_class_storage = $codebase->classlike_storage_provider->get($parent_class);
+            if ($parent_class_storage->hasAttribute($fq_class_name)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * How many template params a use of this class must give: all but the trailing ones with a default.
+     *
+     * @psalm-mutation-free
+     */
+    public function getRequiredTemplateParamCount(): int
+    {
+        $required_param_count = count($this->template_types ?? []);
+
+        foreach (array_reverse(array_keys($this->template_types ?? [])) as $template_name) {
+            if (!isset($this->template_defaults[$template_name])) {
+                break;
+            }
+
+            $required_param_count--;
+        }
+
+        return $required_param_count;
+    }
+
+    /**
+     * Get the template constraint types for the class.
+     *
+     * @return list<Union>
+     * @psalm-mutation-free
+     */
+    public function getClassTemplateTypes(): array
+    {
+        $type_params = [];
+
+        foreach ($this->template_types ?? [] as $type_map) {
+            $type_params[] = array_values($type_map)[0];
+        }
+
+        return $type_params;
+    }
+
+    /**
+     * Named mixins in member-lookup order: transitive ones first, then those declared on or inherited by
+     * the class, so that with last-match-wins lookup a nearer mixin shadows a deeper one.
+     *
+     * @return list<TNamedObject>
+     * @psalm-mutation-free
+     */
+    public function getNamedMixinsForLookup(): array
+    {
+        return [...$this->transitiveNamedMixins, ...$this->namedMixins];
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function hasSealedProperties(Config $config): bool
+    {
+        return $this->sealed_properties ?? ($this->user_defined ? $config->seal_all_properties : false);
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function hasSealedMethods(Config $config): bool
+    {
+        return $this->sealed_methods ?? ($this->user_defined ? $config->seal_all_methods : false);
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    private function hasAttribute(string $fq_class_name): bool
+    {
+        foreach ($this->attributes as $attribute) {
+            if ($fq_class_name === $attribute->fq_class_name) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @return array<int, string>
+     * @psalm-mutation-free
+     */
+    public function getSuppressedIssuesForTemplateExtendParams(): array
+    {
+        $allowed_issue_types = [
+            DeprecatedClass::getIssueType(),
+        ];
+        $suppressed_issues_for_template_extend_params = [];
+        foreach ($this->suppressed_issues as $offset => $suppressed_issue) {
+            if (!in_array($suppressed_issue, $allowed_issue_types, true)) {
+                continue;
+            }
+            $suppressed_issues_for_template_extend_params[$offset] = $suppressed_issue;
+        }
+        return $suppressed_issues_for_template_extend_params;
+    }
+}

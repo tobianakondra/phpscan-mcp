@@ -1,0 +1,82 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Internal\Scope;
+
+use Psalm\Context;
+use Psalm\Type\Union;
+
+/**
+ * @internal
+ */
+final class LoopScope
+{
+    public int $iteration_count = 0;
+
+    /**
+     * The variables the loop (and the loops around it) may assign, written to, or pass to a call, as the root of
+     * what is changed: `$a` for `$a['x']++` and `$a->p = 1`
+     *
+     * @var array<string, bool>
+     */
+    public array $assigned_root_var_ids = [];
+
+    /**
+     * @var array<string, Union>
+     */
+    public array $redefined_loop_vars = [];
+
+    /**
+     * @var array<string, Union>
+     */
+    public array $possibly_redefined_loop_vars = [];
+
+    /**
+     * What the variables the loop defines, which weren't defined before it, hold where an iteration continues
+     *
+     * @var array<string, Union>
+     */
+    public array $possibly_defined_loop_vars = [];
+
+    /**
+     * @var array<string, Union>
+     */
+    public array $possibly_redefined_loop_parent_vars = [];
+
+    /**
+     * @var array<string, Union>
+     */
+    public array $possibly_defined_loop_parent_vars = [];
+
+    /**
+     * @var array<string, bool>
+     */
+    public array $vars_possibly_in_scope = [];
+
+    /**
+     * @var array<string, bool|int>
+     */
+    public array $protected_var_ids = [];
+
+    /**
+     * @var string[]
+     */
+    public array $final_actions = [];
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function __construct(public Context $loop_context, public Context $loop_parent_context)
+    {
+    }
+
+    /**
+     * @psalm-external-mutation-free
+     */
+    public function __destruct()
+    {
+        unset($this->loop_context);
+        unset($this->loop_parent_context);
+    }
+}

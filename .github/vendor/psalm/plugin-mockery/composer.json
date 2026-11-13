@@ -1,0 +1,62 @@
+{
+    "name": "psalm/plugin-mockery",
+    "description": "Psalm plugin for Mockery",
+    "type": "psalm-plugin",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Matt Brown",
+            "email": "github@muglug.com"
+        }
+    ],
+    "require": {
+        "php": ">=8.1",
+        "composer-runtime-api": "^2.0",
+        "composer/semver": "^1.4 || ^2.0 || ^3.0",
+        "psalm/psalm-plugin-api": "^0.4",
+        "vimeo/psalm": "^7|dev-master"
+    },
+    "require-dev": {
+        "codeception/codeception": "^5.0",
+        "mockery/mockery": "^1.0",
+        "phpunit/phpunit": "^10.5 || ^11.5 || ^12.0 || ^13.0",
+        "squizlabs/php_codesniffer": "^3.3.1",
+        "weirdan/codeception-psalm-module": "^0.14.1"
+    },
+    "conflict": {
+        "mockery/mockery": "<1.0"
+    },
+    "extra": {
+        "psalm": {
+            "pluginClass": "Psalm\\MockeryPlugin\\Plugin"
+        }
+    },
+    "autoload": {
+        "psr-4": {
+            "Psalm\\MockeryPlugin\\": ["."]
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Psalm\\MockeryPlugin\\Tests\\": ["tests/_support"]
+        }
+    },
+    "scripts" : {
+        "check": [
+            "@cs-check",
+            "@test",
+            "@analyze"
+        ],
+        "analyze": "psalm",
+        "cs-check": "phpcs -s",
+        "cs-fix": "phpcbf",
+        "test": "codecept run -v"
+    },
+    "config": {
+        "allow-plugins": {
+            "composer/package-versions-deprecated": true
+        },
+        "optimize-autoloader": true,
+        "sort-packages": true
+    }
+}

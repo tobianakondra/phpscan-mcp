@@ -1,0 +1,126 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Internal\Analyzer\Statements;
+
+use PhpParser;
+use Psalm\CodeLocation;
+use Psalm\Context;
+use Psalm\Internal\Analyzer\Statements\Expression\Call\ArgumentAnalyzer;
+use Psalm\Internal\Analyzer\Statements\Expression\CastAnalyzer;
+use Psalm\Internal\Analyzer\StatementsAnalyzer;
+use Psalm\Internal\Codebase\CliOutput;
+use Psalm\Internal\DataFlow\DataFlowNode;
+use Psalm\Issue\ForbiddenCode;
+use Psalm\Issue\ImpureFunctionCall;
+use Psalm\IssueBuffer;
+use Psalm\Storage\Capabilities;
+use Psalm\Storage\FunctionLikeParameter;
+use Psalm\Type;
+use Psalm\Type\TaintKind;
+
+use function assert;
+use function is_int;
+
+/**
+ * @internal
+ */
+final class EchoAnalyzer
+{
+    public static function analyze(
+        StatementsAnalyzer $statements_analyzer,
+        PhpParser\Node\Stmt\Echo_ $stmt,
+        Context $context,
+    ): bool {
+        $echo_param = new FunctionLikeParameter(
+            'var',
+            false,
+        );
+
+        $codebase = $statements_analyzer->getCodebase();
+
+        foreach ($stmt->exprs as $i => $expr) {
+            assert(is_int($i));
+            $context->inside_call = true;
+            ExpressionAnalyzer::analyze($statements_analyzer, $expr, $context);
+            $context->inside_call = false;
+
+            $expr_type = $statements_analyzer->node_data->getType($expr);
+
+            if ($statements_analyzer->taint_flow_graph) {
+                if ($expr_type && $expr_type->hasObjectType()) {
+                    // only the data-flow path is wanted: the argument check below reports an object that can't be
+                    // a string, whether or not a graph is built
+                    $expr_type = $expr_type->setParentNodes(CastAnalyzer::castStringAttempt(
+                        $statements_analyzer,
+                        $context,
+                        $expr_type,
+                        $expr,
+                        false,
+                        false,
+                    )->parent_nodes);
+                }
+
+                $call_location = new CodeLocation($statements_analyzer->getSource(), $stmt);
+
+                $echo_param_sink = DataFlowNode::getForCallableArg(
+                    'builtin',
+                    'echo',
+                    $i,
+                    $call_location,
+                    (TaintKind::INPUT_HTML
+                        | TaintKind::INPUT_HAS_QUOTES
+                        | TaintKind::USER_SECRET
+                        | TaintKind::SYSTEM_SECRET)
+                    & ~(CliOutput::isInCliOnlyCode($statements_analyzer) ? CliOutput::HTML_TAINTS : 0),
+                );
+
+
+                $statements_analyzer->taint_flow_graph->addSink($echo_param_sink);
+            }
+
+            if (ArgumentAnalyzer::verifyType(
+                $statements_analyzer,
+                $expr_type ?? Type::getMixed(),
+                Type::getString(),
+                null,
+                'echo',
+                null,
+                $i,
+                new CodeLocation($statements_analyzer->getSource(), $expr),
+                $expr,
+                $context,
+                null,
+                $echo_param,
+                false,
+                null,
+                true,
+                true,
+                new CodeLocation($statements_analyzer, $stmt),
+            ) === false) {
+                return false;
+            }
+        }
+
+        if (isset($codebase->config->forbidden_functions['echo'])) {
+            IssueBuffer::maybeAdd(
+                new ForbiddenCode(
+                    'Use of echo',
+                    new CodeLocation($statements_analyzer, $stmt),
+                ),
+                $statements_analyzer->getSource()->getSuppressedIssues(),
+            );
+        }
+
+        $statements_analyzer->signalMutation(
+            Capabilities::IO,
+            $context,
+            'echo',
+            ImpureFunctionCall::class,
+            $stmt,
+        );
+
+        return true;
+    }
+}

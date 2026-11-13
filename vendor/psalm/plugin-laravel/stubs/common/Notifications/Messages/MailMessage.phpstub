@@ -1,0 +1,234 @@
+<?php
+
+namespace Illuminate\Notifications\Messages;
+
+use Illuminate\Contracts\Support\Renderable;
+
+/**
+ * Class declaration mirrors Laravel's source. Psalm wipes the reflected
+ * class_implements list when a stub re-declares the class, so the clause
+ * must be repeated verbatim or callers typed on the contract break.
+ */
+class MailMessage extends SimpleMessage implements Renderable
+{
+    /**
+     * The view to be rendered.
+     *
+     * Null until view() or text() is called, and reset to null by markdown().
+     *
+     * @var array<array-key, mixed>|string|null
+     */
+    public $view;
+
+    /**
+     * The view data for the message.
+     *
+     * Passed to Blade as named variables, so keys are strings.
+     *
+     * @var array<string, mixed>
+     */
+    public $viewData = [];
+
+    /**
+     * Set the view for the mail message.
+     *
+     * @param  array<array-key, mixed>|string  $view
+     * @param  array<string, mixed>  $data
+     * @return $this
+     */
+    public function view($view, array $data = []) {}
+
+    /**
+     * Set the plain text view for the mail message.
+     *
+     * @param  string  $textView
+     * @param  array<string, mixed>  $data
+     * @return $this
+     */
+    public function text($textView, array $data = []) {}
+
+    /**
+     * Set the Markdown template for the notification.
+     *
+     * @param  string  $view
+     * @param  array<string, mixed>  $data
+     * @return $this
+     */
+    public function markdown($view, array $data = []) {}
+
+    /**
+     * The "from" information for the message.
+     *
+     * The name is optional: MailChannel reads it with Arr::get($from, 1). The address may be an array,
+     * MailChannel passes it to Mail\Message::from(), which takes string|array.
+     *
+     * @var array{}|array{0: string|array<array-key, mixed>, 1?: string|null, ...}
+     */
+    public $from = [];
+
+    /**
+     * The "reply to" information for the message.
+     *
+     * The name is optional: MailChannel reads it with Arr::get($replyTo, 1). The address may be an array
+     * (replyTo([[...]]) keeps nested arrays), MailChannel passes it to Mail\Message::replyTo(), which takes string|array.
+     *
+     * @var array<array-key, array{0: string|array<array-key, mixed>, 1?: string|null, ...}>
+     */
+    public $replyTo = [];
+
+    /**
+     * The attachments for the message.
+     *
+     * Not a list and not sealed (same for $from, $replyTo and $rawAttachments): the property is public
+     * and MailChannel only iterates it and reads the known keys, so array_filter() or extra
+     * bookkeeping keys are valid.
+     *
+     * attach() itself only stores paths, but MailChannel hands each `file` to Mail\Message::attach(),
+     * so anything that method accepts is valid here.
+     *
+     * @var array<array-key, array{file: string|\Illuminate\Contracts\Mail\Attachable|\Illuminate\Mail\Attachment, options: array<array-key, mixed>, ...}>
+     */
+    public $attachments = [];
+
+    /**
+     * The raw attachments for the message.
+     *
+     * `data` can be a resource: Attachment::fromData() passes its closure's result through unchanged.
+     *
+     * @var array<array-key, array{data: string|resource, name: string, options: array<array-key, mixed>, ...}>
+     */
+    public $rawAttachments = [];
+
+    /**
+     * The "cc" information for the message.
+     * @var list<array{0: string, 1: string|null}> Where the first value is email, second — name (optional).
+     */
+    public $cc = [];
+
+    /**
+     * The "bcc" information for the message.
+     * @var list<array{0: string, 1: string|null}> Where the first value is email, second — name (optional).
+     */
+    public $bcc = [];
+
+    /*
+     * Only the address is a header sink. Display names are CR/LF-stripped by Symfony's Address, and the
+     * subject is RFC 2047-encoded by UnstructuredHeader when Symfony serializes the message, so neither can inject a header (#1958).
+     * An address can: a quoted local part or domain literal carrying CRLF reaches the header verbatim
+     * unless Laravel's Message::ensureAddressIsSafe() (12.60+/13.10+) or symfony/mime 7.4.12/8.0.12+
+     * (CVE-2026-45067) rejects it; supported 12.x releases below 12.60 have neither guard.
+     */
+    /**
+     * Set the from address for the mail message.
+     *
+     * @param  string  $address
+     * @param  string|null  $name
+     * @return $this
+     *
+     * @psalm-taint-sink header $address
+     */
+    public function from($address, $name = null) {}
+
+    /**
+     * Set the "reply to" address of the message.
+     *
+     * @param  array|string  $address
+     * @param  string|null  $name
+     * @return $this
+     *
+     * @psalm-taint-sink header $address
+     */
+    public function replyTo($address, $name = null) {}
+
+    /**
+     * Set the cc address for the mail message.
+     *
+     * @param  string|list<string>|array<string, string>  $address
+     * @param  string|null  $name
+     * @return $this
+     *
+     * @psalm-taint-sink header $address
+     */
+    public function cc($address, $name = null) {}
+
+    /**
+     * Set the bcc address for the mail message.
+     *
+     * @param  string|list<string>|array<string, string>  $address
+     * @param  string|null  $name
+     * @return $this
+     *
+     * @psalm-taint-sink header $address
+     */
+    public function bcc($address, $name = null) {}
+
+    /**
+     * Set the subject of the notification.
+     *
+     * @param  string  $subject
+     * @return $this
+     */
+    public function subject($subject) {}
+
+    /**
+     * Set the greeting of the notification.
+     *
+     * @param  string  $greeting
+     * @return $this
+     *
+     * @psalm-taint-sink html $greeting
+     */
+    public function greeting($greeting) {}
+
+    /**
+     * Set the salutation of the notification.
+     *
+     * @param  string  $salutation
+     * @return $this
+     *
+     * @psalm-taint-sink html $salutation
+     */
+    public function salutation($salutation) {}
+
+    /**
+     * Add a line of text to the notification.
+     *
+     * @param  mixed  $line
+     * @return $this
+     *
+     * @psalm-taint-sink html $line
+     */
+    public function line($line) {}
+
+    /**
+     * Configure the "call to action" button.
+     *
+     * The $url is rendered into an `<a href="...">` attribute by the
+     * notification template. HTML-escaping the string (via `e()`) blocks
+     * attribute breakout but does NOT validate the URL scheme, so
+     * `javascript:` / `data:` URLs survive. The `html_url` sink models
+     * this scheme-injection threat as a separate cleanser context from
+     * generic HTML escaping. See Filament GHSA-3fc8-8hp6-6jr4 for a
+     * worked stored-XSS example, and docs/contributing/taint-analysis.md
+     * for the `html_url` annotation guide.
+     *
+     * @param  string  $text
+     * @param  string  $url
+     * @return $this
+     *
+     * @psalm-taint-sink html $text
+     * @psalm-taint-sink html $url
+     * @psalm-taint-sink html_url $url
+     */
+    public function action($text, $url) {}
+
+    /**
+     * Render the mail notification message into an HTML string.
+     *
+     * Laravel documents HtmlString only, but the view() branch returns Mailer::render(),
+     * which is a plain string; only the Markdown branch yields an HtmlString.
+     *
+     * @return \Illuminate\Support\HtmlString|string
+     */
+    public function render() {}
+}

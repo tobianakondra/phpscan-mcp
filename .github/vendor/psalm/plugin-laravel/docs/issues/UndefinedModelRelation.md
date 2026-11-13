@@ -1,0 +1,122 @@
+---
+title: UndefinedModelRelation
+parent: Custom Issues
+nav_order: 11
+---
+
+# UndefinedModelRelation
+
+A relation name passed to an eager-loading or relationship-query method, or configured in a model's `$with` / `$withCount` defaults, does not resolve to a method on the model. See [Reporting level](#reporting-level).
+
+## Why it matters
+
+Passing a non-existent relation name is one of the most common sources of runtime errors in Laravel apps. A typo such as `User::with('pots')` (for `posts`) is silently accepted by Psalm, then throws `RelationNotFoundException` at runtime. This rule reports it during analysis.
+
+The same typo in a model default is evaluated when Laravel builds or hydrates a query:
+
+```php
+final class Post extends Model
+{
+    protected $with = ['authr'];
+    protected $withCount = ['nmae'];
+}
+```
+
+## What is checked
+
+The relation name in the first argument of these methods is validated against the resolved model:
+
+* Eager loading: `with()`, `without()`.
+* Existence queries: `has()`, `orHas()`, `doesntHave()`, `orDoesntHave()`, `whereHas()`, `orWhereHas()`, `whereDoesntHave()`, `orWhereDoesntHave()`, `withWhereHas()`, `whereRelation()`, `orWhereRelation()`, `withWhereRelation()`, `whereDoesntHaveRelation()`, `orWhereDoesntHaveRelation()`, `whereMorphRelation()`, `orWhereMorphRelation()`.
+* Lazy eager loading: `load()`, `loadMissing()`, `loadCount()`, `loadSum()`, `loadAvg()`, `loadMax()`, `loadMin()`, `loadExists()`.
+
+The model is resolved from the receiver: a `Builder<TModel>` or `Relation<TModel, ...>` generic parameter, a `Model` instance, or the class of a static call (`User::with(...)`).
+
+Effective string entries from concrete, user-owned models' `$with` and `$withCount` defaults are also checked. `$with` supports dot notation and `:columns`; `$withCount` accepts a direct relation name and a case-insensitive ` as alias` suffix. Keyed configuration maps are not checked.
+
+Supported name syntaxes:
+
+* String: `with('posts')`.
+* Dot-notation: `with('posts.comments.author')`, where each segment is resolved against the previous segment's related model.
+* Array (list): `with(['posts', 'comments'])`.
+* Array (keyed closure): `with(['posts' => fn ($query) => $query])`, where the key is the relation name.
+* Select columns: `with('posts:id,title')`, where the `:columns` part is stripped before checking. The exception is a relation paired with a constraint closure, see [`:columns` with a closure](#columns-with-a-closure). Relationship existence queries do not parse `:columns` at all, see [`:columns` in existence queries](#columns-in-existence-queries).
+
+## Example
+
+```php
+class User extends Model
+{
+    /** @return HasMany<Post, $this> */
+    public function posts(): HasMany
+    {
+        return $this->hasMany(Post::class);
+    }
+}
+
+User::with('posts');      // OK
+User::with('postz');      // UndefinedModelRelation: Relation 'postz' is not defined on App\Models\User.
+$user->load('comments');  // UndefinedModelRelation: Relation 'comments' is not defined on App\Models\User.
+```
+
+## How to fix
+
+Correct the relation name, or define the missing relationship method on the model.
+
+### `:columns` with a closure
+
+Laravel parses the `:columns` select syntax for list entries (`with('posts:id')`, `with(['posts:id'])`) and for nested-array keys, but not for a relation name paired with a constraint closure. There the name is looked up verbatim and `RelationNotFoundException` is thrown. The rule reports this for `with()` / `load()` / `loadMissing()` array keys whose value is a closure, and for the two-argument `Builder::with($relation, $closure)` form:
+
+```php
+User::with(['posts:id,user_id,title' => fn ($query) => $query->latest()]);  // UndefinedModelRelation
+User::query()->with('posts:id,user_id,title', fn ($query) => $query->latest());  // UndefinedModelRelation
+
+// Eager loading matches the posts to their users by `user_id`, so the foreign key must be selected.
+User::with(['posts' => fn ($query) => $query->select('id', 'user_id', 'title')->latest()]);  // OK: select inside the closure
+User::with('posts:id,user_id,title');  // OK: no closure, columns are parsed
+```
+
+### `:columns` in existence queries
+
+Relationship existence queries look the relation name up verbatim, so a `:columns` suffix never resolves and Laravel throws `BadMethodCallException` (`Call to undefined method ...::posts:id()`). This covers `has()` / `whereHas()` / `doesntHave()` / `whereDoesntHave()` (and their `or*` forms) and the `where*Relation()` families. There are no related columns to select in an existence query, so `:columns` has no meaning there. `withWhereHas()` is the exception and is not reported: without a callback it strips `:columns` itself on every supported Laravel version. With a closure, Laravel parses the suffix only from 13.37.0; on older versions the eager load looks it up verbatim. The rule does not report that case yet ([#1982](https://github.com/psalm/psalm-plugin-laravel/issues/1982)).
+
+```php
+User::has('posts:id');  // UndefinedModelRelation
+User::has('posts');     // OK
+```
+
+## Known limitations
+
+To keep false positives near zero, the rule reports only when no method (real or `@method`) with that name exists, and defers (stays silent) when it cannot resolve the target with confidence:
+
+* Dynamic relation names (a variable rather than a literal).
+* An un-narrowed `Builder` (the bare base `Model`) or an abstract base model.
+* A name that an analysed subclass of the receiver model defines. A concrete base model (`App\Model extends Eloquent\Model`) is only the static bound of what runs, so `$model->load('ownedBy')` on `App\Model` is not reported when a subclass declares `ownedBy()`. A name no subclass defines is still reported, and so is a model without subclasses. Intermediate models of a dot-notation path follow the same rule; `$with` / `$withCount` defaults are checked against their own model only.
+* Relations registered at runtime via `Model::resolveRelationUsing()` or package macros, which static analysis cannot see.
+* Deeper dot-notation segments after a polymorphic `morphTo`, whose related model is not statically known.
+
+Keyed `$with` / `$withCount` configuration maps are not checked.
+
+## Reporting level
+
+The handler always runs. Without an explicit issue handler, it is reported as `info` by default. Promote that default to an error in `psalm.xml`:
+
+```xml
+<pluginClass class="Psalm\LaravelPlugin\Plugin">
+    <experimental value="true" />
+</pluginClass>
+```
+
+Any explicit `<PluginIssue>` entry owns this issue's complete reporting policy. The plugin leaves both its base level and scoped filters unchanged, regardless of `<experimental>`. When using scoped filters, specify the desired base level explicitly:
+
+```xml
+<issueHandlers>
+    <PluginIssue name="UndefinedModelRelation" errorLevel="info">
+        <errorLevel type="suppress">
+            <directory name="legacy" />
+        </errorLevel>
+    </PluginIssue>
+</issueHandlers>
+```
+
+Without the outer `errorLevel="info"`, Psalm uses its normal implicit fallback of `error` outside the scoped filter.

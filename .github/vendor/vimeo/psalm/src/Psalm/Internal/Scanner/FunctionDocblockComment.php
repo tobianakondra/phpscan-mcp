@@ -1,0 +1,256 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Internal\Scanner;
+
+use Psalm\Issue\CodeIssue;
+use Psalm\Issue\InvalidDocblock;
+use Psalm\Storage\Capabilities;
+
+/**
+ * @internal
+ * @psalm-import-type CapabilitySet from Capabilities
+ */
+final class FunctionDocblockComment
+{
+    public ?string $return_type = null;
+
+    public ?string $return_type_description = null;
+
+    public ?int $return_type_start = null;
+
+    public ?int $return_type_end = null;
+
+    public ?int $return_type_line_number = null;
+
+    /**
+     * @var array<
+     *     int,
+     *     array{
+     *         name:string,
+     *         type:string,
+     *         line_number: int,
+     *         start: int,
+     *         end: int,
+     *         description?: string
+     *     }
+     * >
+     */
+    public array $params = [];
+
+    /**
+     * @var array<int, array{name:string, type:string, line_number: int}>
+     */
+    public array $params_out = [];
+
+    /**
+     * @var array<int, array{name:string, type:string, line_number: int}>
+     */
+    public array $params_closure_this = [];
+
+    /**
+     * @var array{type:string, line_number: int}|null
+     */
+    public ?array $self_out = null;
+
+    /**
+     * @var array{type:string, line_number: int}|null
+     */
+    public ?array $if_this_is = null;
+
+    /**
+     * @var array<int, array{name:string, type:string, line_number: int, start: int, end: int}>
+     */
+    public array $globals = [];
+
+    /**
+     * Whether or not the function is deprecated
+     */
+    public bool $deprecated = false;
+
+    /**
+     * If set, the function is internal to the given namespace.
+     *
+     * @var list<non-empty-string>
+     */
+    public array $psalm_internal = [];
+
+    /**
+     * Whether or not the function is internal
+     */
+    public bool $internal = false;
+
+    /**
+     * Whether or not the function uses get_args
+     */
+    public bool $variadic = false;
+
+    /**
+     * Whether or not to specialize a given call (useful for taint analysis)
+     */
+    public bool $specialize_call = false;
+
+    /** Whether the function-like has `@psalm-cli-only` */
+    public bool $cli_only = false;
+
+    /**
+     * Represents the flow from function params to return type
+     *
+     * @var array<string>
+     */
+    public array $flows = [];
+
+    /**
+     * @var array<string>
+     */
+    public array $added_taints = [];
+
+    /**
+     * @var list<string>
+     */
+    public array $conditionally_removed_taints = [];
+
+    /**
+     * @var list<string>
+     */
+    public array $removed_taints = [];
+
+    /**
+     * @var array<int, array{name:string, taint: int}>
+     */
+    public array $taint_sink_params = [];
+
+    /**
+     * `@psalm-taint-sink (<conditional>) $param`: the parameter and the conditional type of the taints it is a sink of
+     *
+     * @var list<array{name: string, type: string}>
+     */
+    public array $conditional_taint_sink_params = [];
+
+    public int $taint_source_types = 0;
+
+    /**
+     * The taints of the sources under keys of what the function-like returns: `@psalm-taint-source input return['key']`
+     *
+     * @var list<array{non-empty-list<string>, int}>
+     */
+    public array $taint_source_keys = [];
+
+    /**
+     * @var array<int, array{name:string}>
+     */
+    public array $assert_untainted_params = [];
+
+    /**
+     * What is wrong with the docblock: FunctionLikeDocblockScanner keeps it in the storage of the function-like, whose
+     * analysis reports it (Config reports those of the stubs, which aren't analyzed)
+     *
+     * @var list<InvalidDocblock>
+     */
+    public array $docblock_issues = [];
+
+    /**
+     * Issues found while scanning the docblock, for FunctionLikeDocblockScanner to add to those of the file
+     *
+     * @var list<CodeIssue>
+     */
+    public array $scan_issues = [];
+
+    /**
+     * Whether or not to ignore the nullability of this function's return type
+     */
+    public bool $ignore_nullable_return = false;
+
+    /**
+     * Whether or not to ignore the nullability of this function's return type
+     */
+    public bool $ignore_falsable_return = false;
+
+    /**
+     * @var array<int, string>
+     */
+    public array $suppressed_issues = [];
+
+    /**
+     * @var array<int, array{0: string, 1: int, 2: int}>
+     */
+    public array $throws = [];
+
+    /**
+     * @var array<int, array{string, ?string, ?string, bool}>
+     */
+    public array $templates = [];
+
+    /**
+     * The default of each template that has one (`@template T of Bound = Default`), and its line.
+     *
+     * @var array<string, array{type: string, line_number: int}>
+     */
+    public array $template_defaults = [];
+
+    /**
+     * @var array<int, array{type: string, param_name: string}>
+     */
+    public array $assertions = [];
+
+    /**
+     * @var array<int, array{type: string, param_name: string}>
+     */
+    public array $if_true_assertions = [];
+
+    /**
+     * @var array<int, array{type: string, param_name: string}>
+     */
+    public array $if_false_assertions = [];
+
+    public bool $inheritdoc = false;
+
+    /**
+     * A bitmask of {@see Capabilities} constants
+     *
+     * @var CapabilitySet
+     */
+    public int $capabilities = Capabilities::ALL;
+
+    public bool $has_mutations_annotation = false;
+
+    /**
+     * Names of the templates this function-like inherits its purity from.
+     * Populated from `@psalm-purity-from-template T`.
+     *
+     * @var list<string>
+     */
+    public array $purity_from_templates = [];
+
+    /**
+     * The names of the templates declared with `@psalm-purity-template`, whose values are
+     * capability sets.
+     *
+     * @var list<string>
+     */
+    public array $purity_templates = [];
+
+    /**
+     * The values of `@psalm-capabilities` tags that are not plain capability lists: purity
+     * types, resolved once the type aliases in scope are known.
+     *
+     * @var list<string>
+     */
+    public array $capabilities_expressions = [];
+
+    public bool $no_named_args = false;
+
+    public bool $stub_override = false;
+
+    public int $since_php_major_version = 0;
+
+    public int $since_php_minor_version = 0;
+
+    public ?string $description = null;
+
+    /** @var array<string, array{lines:list<int>, suggested_replacement?:string}> */
+    public array $unexpected_tags = [];
+
+    public bool $public_api = false;
+}

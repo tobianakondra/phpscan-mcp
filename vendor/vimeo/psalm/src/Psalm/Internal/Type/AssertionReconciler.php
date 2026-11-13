@@ -1,0 +1,2068 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Internal\Type;
+
+use Psalm\CodeLocation;
+use Psalm\Codebase;
+use Psalm\Internal\Analyzer\Statements\Expression\Fetch\VariableFetchAnalyzer;
+use Psalm\Internal\Analyzer\StatementsAnalyzer;
+use Psalm\Internal\Analyzer\TraitAnalyzer;
+use Psalm\Internal\MethodIdentifier;
+use Psalm\Internal\Type\Comparator\AtomicTypeComparator;
+use Psalm\Internal\Type\Comparator\TypeComparisonResult;
+use Psalm\Internal\Type\Comparator\UnionTypeComparator;
+use Psalm\Internal\Type\TemplateBound;
+use Psalm\Issue\DocblockTypeContradiction;
+use Psalm\Issue\TypeDoesNotContainNull;
+use Psalm\Issue\TypeDoesNotContainType;
+use Psalm\IssueBuffer;
+use Psalm\Storage\Assertion;
+use Psalm\Storage\Assertion\ArrayKeyExists;
+use Psalm\Storage\Assertion\Falsy;
+use Psalm\Storage\Assertion\HasAtLeastCount;
+use Psalm\Storage\Assertion\HasExactCount;
+use Psalm\Storage\Assertion\IsAClass;
+use Psalm\Storage\Assertion\IsClassEqual;
+use Psalm\Storage\Assertion\IsEqualIsset;
+use Psalm\Storage\Assertion\IsIsset;
+use Psalm\Storage\Assertion\IsLooselyEqual;
+use Psalm\Storage\Assertion\NestedAssertions;
+use Psalm\Storage\Assertion\NonEmpty;
+use Psalm\Storage\Assertion\NonEmptyCountable;
+use Psalm\Type;
+use Psalm\Type\Atomic;
+use Psalm\Type\Atomic\Scalar;
+use Psalm\Type\Atomic\TArray;
+use Psalm\Type\Atomic\TArrayKey;
+use Psalm\Type\Atomic\TCallableString;
+use Psalm\Type\Atomic\TClassConstant;
+use Psalm\Type\Atomic\TClassString;
+use Psalm\Type\Atomic\TDecimalIntString;
+use Psalm\Type\Atomic\TEnumCase;
+use Psalm\Type\Atomic\TFloat;
+use Psalm\Type\Atomic\TGenericObject;
+use Psalm\Type\Atomic\TInt;
+use Psalm\Type\Atomic\TIntRange;
+use Psalm\Type\Atomic\TIterable;
+use Psalm\Type\Atomic\TKeyedArray;
+use Psalm\Type\Atomic\TLiteralFloat;
+use Psalm\Type\Atomic\TLiteralInt;
+use Psalm\Type\Atomic\TLiteralString;
+use Psalm\Type\Atomic\TLowercaseString;
+use Psalm\Type\Atomic\TMixed;
+use Psalm\Type\Atomic\TNamedObject;
+use Psalm\Type\Atomic\TNonDecimalIntString;
+use Psalm\Type\Atomic\TNonEmptyLowercaseString;
+use Psalm\Type\Atomic\TNonEmptyMixed;
+use Psalm\Type\Atomic\TNonEmptyNonspecificLiteralString;
+use Psalm\Type\Atomic\TNonEmptyString;
+use Psalm\Type\Atomic\TNull;
+use Psalm\Type\Atomic\TNumeric;
+use Psalm\Type\Atomic\TObject;
+use Psalm\Type\Atomic\TScalar;
+use Psalm\Type\Atomic\TString;
+use Psalm\Type\Atomic\TTemplateParam;
+use Psalm\Type\Atomic\TTemplateParamClass;
+use Psalm\Type\Atomic\TTraitString;
+use Psalm\Type\Atomic\TTypeVariable;
+use Psalm\Type\Reconciler;
+use Psalm\Type\Union;
+
+use function array_diff_key;
+use function array_intersect_key;
+use function array_keys;
+use function array_merge;
+use function array_search;
+use function count;
+use function is_nan;
+use function is_numeric;
+use function is_string;
+use function strtolower;
+
+/**
+ * @internal
+ */
+final class AssertionReconciler extends Reconciler
+{
+    /**
+     * Reconciles types
+     *
+     * think of this as a set of functions e.g. empty(T), notEmpty(T), null(T), notNull(T) etc. where
+     *  - empty(Object) => null,
+     *  - empty(bool) => false,
+     *  - notEmpty(Object|null) => Object,
+     *  - notEmpty(Object|false) => Object
+     *
+     * @param   string[]            $suppressed_issues
+     * @param   array<string, array<string, Union>> $template_type_map
+     * @param-out Reconciler::RECONCILIATION_* $failed_reconciliation
+     */
+    public static function reconcile(
+        Assertion $assertion,
+        ?Union $existing_var_type,
+        ?string $key,
+        StatementsAnalyzer $statements_analyzer,
+        bool $inside_loop,
+        array $template_type_map,
+        ?CodeLocation $code_location = null,
+        array $suppressed_issues = [],
+        ?int &$failed_reconciliation = Reconciler::RECONCILIATION_OK,
+        bool $negated = false,
+    ): Union {
+        $codebase = $statements_analyzer->getCodebase();
+
+        $failed_reconciliation = Reconciler::RECONCILIATION_OK;
+
+        $is_negation = $assertion->isNegation();
+
+        if ($assertion instanceof NestedAssertions) {
+            $assertion = new Falsy();
+            $is_negation = true;
+        }
+
+        if ($existing_var_type === null
+            && is_string($key)
+            && VariableFetchAnalyzer::isSuperGlobal($key)
+        ) {
+            $existing_var_type = VariableFetchAnalyzer::getGlobalType($key, $codebase->analysis_php_version_id);
+        }
+
+        if ($existing_var_type === null) {
+            return self::getMissingType(
+                $assertion,
+                $inside_loop,
+            );
+        }
+
+        $old_var_type_string = $existing_var_type->getId();
+
+        $type_variables = [];
+
+        foreach ($existing_var_type->getAtomicTypes() as $existing_atomic) {
+            if ($existing_atomic instanceof TTypeVariable) {
+                $type_variables[] = $existing_atomic;
+            }
+        }
+
+        if ($type_variables) {
+            // A type variable's constraints reconcile at the end of the
+            // surrounding function-like: asserting a simple type on it
+            // records that type as a lower bound and keeps the variable
+            // alive, rather than narrowing it away (which would report
+            // spurious contradictions). Other assertions (like instanceof
+            // checks, which can simply be false at runtime) leave its bounds
+            // alone.
+            if (!$is_negation
+                && ($assertion_atomic_type = $assertion->getAtomicType())
+                && $assertion_atomic_type instanceof Scalar
+            ) {
+                foreach ($type_variables as $type_variable) {
+                    $statements_analyzer->type_variable_tracker->addBounds(
+                        [[$type_variable->name, new TemplateBound(new Union([$assertion_atomic_type]))]],
+                        [],
+                        $code_location,
+                    );
+                }
+            }
+
+            return new Union($type_variables);
+        }
+
+        if ($is_negation) {
+            return NegatedAssertionReconciler::reconcile(
+                $statements_analyzer,
+                $assertion,
+                $existing_var_type,
+                $old_var_type_string,
+                $key,
+                $negated,
+                $code_location,
+                $suppressed_issues,
+                $failed_reconciliation,
+                $inside_loop,
+            );
+        }
+
+        $assertion_type = $assertion->getAtomicType();
+
+        if ($assertion_type instanceof TLiteralInt
+            || $assertion_type instanceof TLiteralString
+            || $assertion_type instanceof TLiteralFloat
+            || $assertion_type instanceof TEnumCase
+        ) {
+            return self::handleLiteralEquality(
+                $statements_analyzer,
+                $assertion,
+                $assertion_type,
+                $existing_var_type,
+                $old_var_type_string,
+                $key,
+                $negated,
+                $code_location,
+                $suppressed_issues,
+            );
+        }
+
+        if ($assertion instanceof IsAClass) {
+            $should_return = false;
+
+            $new_type_parts = self::handleIsA(
+                $assertion,
+                $codebase,
+                $existing_var_type,
+                $code_location,
+                $key,
+                $suppressed_issues,
+                $should_return,
+            );
+
+            if ($should_return) {
+                return new Union($new_type_parts);
+            }
+
+            $new_type_part = $new_type_parts[0];
+        } else {
+            $simply_reconciled_type = SimpleAssertionReconciler::reconcile(
+                $assertion,
+                $codebase,
+                $existing_var_type,
+                $key,
+                $negated,
+                $code_location,
+                $suppressed_issues,
+                $failed_reconciliation,
+                $inside_loop,
+            );
+
+            if ($simply_reconciled_type) {
+                return $simply_reconciled_type;
+            }
+
+            if ($assertion instanceof IsClassEqual) {
+                $new_type_part = Atomic::create($assertion->type, null, $template_type_map);
+            } elseif ($assertion_type = $assertion->getAtomicType()) {
+                $new_type_part = $assertion_type;
+            } else {
+                $new_type_part = new TMixed();
+            }
+        }
+
+        if ($existing_var_type->hasMixed()) {
+            if ($assertion instanceof IsLooselyEqual
+                && $new_type_part instanceof Scalar
+            ) {
+                return $existing_var_type;
+            }
+
+            return new Union([$new_type_part]);
+        }
+
+        $refined_type = self::refine(
+            $statements_analyzer,
+            $assertion,
+            $new_type_part,
+            $existing_var_type,
+            $key,
+            $negated,
+            $code_location,
+            $suppressed_issues,
+            $failed_reconciliation,
+        );
+
+        return TypeExpander::expandUnion(
+            $codebase,
+            $refined_type,
+            null,
+            null,
+            null,
+            true,
+            false,
+            false,
+            true,
+        );
+    }
+
+    /**
+     * @psalm-pure
+     */
+    private static function getMissingType(
+        Assertion $assertion,
+        bool $inside_loop,
+    ): Union {
+        if ($assertion instanceof NonEmpty) {
+            return new Union([new TNonEmptyMixed($inside_loop)]);
+        }
+
+        if ($assertion instanceof IsIsset || $assertion instanceof IsEqualIsset) {
+            return Type::getMixed($inside_loop);
+        }
+
+        if ($assertion instanceof ArrayKeyExists
+            || $assertion instanceof NonEmptyCountable
+            || $assertion instanceof HasExactCount
+            || $assertion instanceof HasAtLeastCount
+        ) {
+            return Type::getMixed();
+        }
+
+        if (!$assertion->isNegation()) {
+            $assertion_type = $assertion->getAtomicType();
+
+            if ($assertion_type) {
+                return new Union([$assertion_type]);
+            }
+        }
+
+        return Type::getMixed();
+    }
+
+    /**
+     * This method is called when SimpleAssertionReconciler was not enough. It receives the existing type, the assertion
+     * and also a new type created from the assertion string.
+     *
+     * @param Reconciler::RECONCILIATION_* $failed_reconciliation
+     * @param   string[]    $suppressed_issues
+     * @param-out Reconciler::RECONCILIATION_* $failed_reconciliation
+     */
+    private static function refine(
+        StatementsAnalyzer $statements_analyzer,
+        Assertion $assertion,
+        Atomic $new_type_part,
+        Union &$existing_var_type,
+        ?string $key,
+        bool $negated,
+        ?CodeLocation $code_location,
+        array $suppressed_issues,
+        int &$failed_reconciliation,
+    ): Union {
+        $codebase = $statements_analyzer->getCodebase();
+
+        $old_var_type_string = $existing_var_type->getId();
+
+        if ($new_type_part instanceof TMixed) {
+            return $existing_var_type;
+        }
+
+        $new_type_has_interface = false;
+
+        if ($new_type_part->isObjectType()) {
+            if ($new_type_part instanceof TNamedObject &&
+                $codebase->interfaceExists($new_type_part->value)
+            ) {
+                $new_type_has_interface = true;
+            }
+        }
+
+        $old_type_has_interface = false;
+
+        if ($existing_var_type->hasObjectType()) {
+            foreach ($existing_var_type->getAtomicTypes() as $existing_type_part) {
+                if ($existing_type_part instanceof TNamedObject &&
+                    $codebase->interfaceExists($existing_type_part->value)
+                ) {
+                    $old_type_has_interface = true;
+                    break;
+                }
+            }
+        }
+
+        if ($new_type_part instanceof TTemplateParam
+            && $new_type_part->as->isSingle()
+        ) {
+            $new_as_atomic = $new_type_part->as->getSingleAtomic();
+
+            $acceptable_atomic_types = [];
+
+            foreach ($existing_var_type->getAtomicTypes() as $existing_var_type_part) {
+                if ($existing_var_type_part instanceof TNamedObject
+                    || $existing_var_type_part instanceof TTemplateParam
+                ) {
+                    $acceptable_atomic_types[] = $existing_var_type_part;
+                } else {
+                    if (AtomicTypeComparator::isContainedBy(
+                        $codebase,
+                        $existing_var_type_part,
+                        $new_as_atomic,
+                    )) {
+                        $acceptable_atomic_types[] = $existing_var_type_part;
+                    }
+                }
+            }
+
+            if ($acceptable_atomic_types) {
+                $acceptable_atomic_types =
+                    count($acceptable_atomic_types) === count($existing_var_type->getAtomicTypes())
+                        ? $existing_var_type
+                        : new Union($acceptable_atomic_types);
+                return new Union([$new_type_part->replaceAs($acceptable_atomic_types)]);
+            }
+        }
+
+        if ($new_type_part instanceof TKeyedArray) {
+            $acceptable_atomic_types = [];
+
+            foreach ($existing_var_type->getAtomicTypes() as $existing_var_type_part) {
+                if ($existing_var_type_part instanceof TKeyedArray) {
+                    if (!array_intersect_key(
+                        $existing_var_type_part->properties,
+                        $new_type_part->properties,
+                    )) {
+                        $acceptable_atomic_types[] = $existing_var_type_part->setProperties(array_merge(
+                            $existing_var_type_part->properties,
+                            $new_type_part->properties,
+                        ));
+                    }
+                }
+            }
+
+            if ($acceptable_atomic_types) {
+                return new Union($acceptable_atomic_types);
+            }
+        }
+
+        $new_type = null;
+
+        if ($new_type_part instanceof TNamedObject
+            && ($new_type_has_interface || $old_type_has_interface)
+            && !UnionTypeComparator::canExpressionTypesBeIdentical(
+                $codebase,
+                new Union([$new_type_part]),
+                $existing_var_type,
+                false,
+            )
+        ) {
+            $acceptable_atomic_types = [];
+
+            foreach ($existing_var_type->getAtomicTypes() as $existing_var_type_part) {
+                if (AtomicTypeComparator::isContainedBy(
+                    $codebase,
+                    $existing_var_type_part,
+                    $new_type_part,
+                )) {
+                    $acceptable_atomic_types[] = $existing_var_type_part;
+                    continue;
+                }
+
+                if ($existing_var_type_part instanceof TNamedObject
+                    && ($codebase->classExists($existing_var_type_part->value)
+                        || $codebase->interfaceExists($existing_var_type_part->value))
+                    && self::canBeIntersected($codebase, $existing_var_type_part, $new_type_part)
+                ) {
+                    $intersected_type_part = $new_type_part;
+
+                    if ($existing_var_type_part instanceof TGenericObject
+                        && !$new_type_part instanceof TGenericObject
+                    ) {
+                        $intersected_type_part = self::inferTemplateParamsFromParent(
+                            $codebase,
+                            $new_type_part,
+                            $existing_var_type_part,
+                        );
+                    }
+
+                    $existing_var_type_part = $existing_var_type_part->addIntersectionType($intersected_type_part);
+                    $acceptable_atomic_types[] = $existing_var_type_part;
+                }
+
+                if ($existing_var_type_part instanceof TTemplateParam) {
+                    $existing_var_type_part = $existing_var_type_part->addIntersectionType($new_type_part);
+                    $acceptable_atomic_types[] = $existing_var_type_part;
+                }
+            }
+
+            if ($acceptable_atomic_types) {
+                return new Union($acceptable_atomic_types);
+            }
+        } elseif (!$new_type_part instanceof TMixed) {
+            $any_scalar_type_match_found = false;
+
+            $redundant_comparison_result = new TypeComparisonResult();
+
+            if ($code_location
+                && $key
+                && !$assertion->hasEquality()
+                && $new_type_part instanceof TNamedObject
+                && !$new_type_has_interface
+                && (!($statements_analyzer->getSource()->getSource() instanceof TraitAnalyzer)
+                    || $key !== '$this')
+                && UnionTypeComparator::isContainedBy(
+                    $codebase,
+                    $existing_var_type,
+                    new Union([$new_type_part]),
+                    false,
+                    false,
+                    $redundant_comparison_result,
+                    false,
+                    false,
+                )
+                // a containment that recorded type-variable bounds is
+                // provisional (the variable's constraints reconcile at the
+                // end of the function-like), so it cannot prove the
+                // assertion redundant
+                && !$redundant_comparison_result->type_variable_lower_bounds
+                && !$redundant_comparison_result->type_variable_upper_bounds
+            ) {
+                self::triggerIssueForImpossible(
+                    $existing_var_type,
+                    $old_var_type_string,
+                    $key,
+                    $assertion,
+                    true,
+                    $negated,
+                    $code_location,
+                    $suppressed_issues,
+                );
+            }
+
+            $intersection_type = self::filterTypeWithAnother(
+                $codebase,
+                $existing_var_type,
+                new Union([$new_type_part]),
+                $any_scalar_type_match_found,
+            );
+
+            if ($code_location
+                && !$intersection_type
+                && (!$assertion instanceof IsLooselyEqual || !$any_scalar_type_match_found)
+            ) {
+                if ($new_type_part instanceof TNull) {
+                    if ($existing_var_type->from_docblock) {
+                        IssueBuffer::maybeAdd(
+                            new DocblockTypeContradiction(
+                                'Cannot resolve types for ' . $key . ' - docblock-defined type '
+                                    . $existing_var_type . ' does not contain null',
+                                $code_location,
+                                $existing_var_type->getId() . ' null',
+                            ),
+                            $suppressed_issues,
+                        );
+                    } else {
+                        IssueBuffer::maybeAdd(
+                            new TypeDoesNotContainNull(
+                                'Cannot resolve types for ' . $key . ' - ' . $existing_var_type
+                                    . ' does not contain null',
+                                $code_location,
+                                $existing_var_type->getId(),
+                            ),
+                            $suppressed_issues,
+                        );
+                    }
+                } elseif (!($statements_analyzer->getSource()->getSource() instanceof TraitAnalyzer)
+                    || ($key !== '$this'
+                        && !($existing_var_type->hasLiteralClassString()
+                            && $assertion instanceof IsAClass))
+                ) {
+                    if ($existing_var_type->from_docblock) {
+                        IssueBuffer::maybeAdd(
+                            new DocblockTypeContradiction(
+                                'Cannot resolve types for ' . $key . ' - docblock-defined type '
+                                    . $existing_var_type->getId() . ' does not contain ' . $new_type_part->getId(),
+                                $code_location,
+                                $existing_var_type->getId() . ' ' . $new_type_part->getId(),
+                            ),
+                            $suppressed_issues,
+                        );
+                    } else {
+                        IssueBuffer::maybeAdd(
+                            new TypeDoesNotContainType(
+                                'Cannot resolve types for ' . $key . ' - ' . $existing_var_type->getId()
+                                    . ' does not contain ' . $new_type_part->getId(),
+                                $code_location,
+                                $existing_var_type->getId() . ' ' . $new_type_part->getId(),
+                            ),
+                            $suppressed_issues,
+                        );
+                    }
+                }
+
+                $failed_reconciliation = Reconciler::RECONCILIATION_EMPTY;
+            }
+
+            if ($intersection_type) {
+                $new_type = $intersection_type;
+            }
+        }
+
+        return $new_type ?: new Union([$new_type_part]);
+    }
+
+    /**
+     * This method receives two types. The goal is to use data in the new type to reduce the existing_type to a more
+     * precise version. For example: new is `array<int>` old is `list<mixed>` so the result is `list<int>`
+     */
+    private static function filterTypeWithAnother(
+        Codebase $codebase,
+        Union &$existing_type,
+        Union $new_type,
+        bool &$any_scalar_type_match_found = false,
+    ): ?Union {
+        $matching_atomic_types = [];
+
+        $existing_types = $existing_type->getAtomicTypes();
+        foreach ($new_type->getAtomicTypes() as $new_type_part) {
+            foreach ($existing_types as &$existing_type_part) {
+                $matching_atomic_type = self::filterAtomicWithAnother(
+                    $existing_type_part,
+                    $new_type_part,
+                    $codebase,
+                    $any_scalar_type_match_found,
+                );
+
+                if ($matching_atomic_type) {
+                    $matching_atomic_types[] = $matching_atomic_type;
+                }
+            }
+            unset($existing_type_part);
+        }
+        $existing_type = $existing_type->setTypes($existing_types);
+
+        if ($matching_atomic_types) {
+            return new Union($matching_atomic_types);
+        }
+
+        return null;
+    }
+
+    /**
+     * Narrowing a `Parent<A, B>` to a child class whose templates are passed straight to Parent's
+     * (`@extends Parent<T, U>`, `@implements Iterator[P]<K, V>`) gives the child those arguments:
+     * `Iterator[pure]<int, string>` narrowed to `Child` is a `Child[pure]<int, string>`.
+     *
+     * @psalm-capabilities read-props
+     */
+    private static function inferTemplateParamsFromParent(
+        Codebase $codebase,
+        TNamedObject $child,
+        TGenericObject $parent,
+    ): TNamedObject {
+        if (!$codebase->classlike_storage_provider->has($child->value)
+            || !$codebase->classlike_storage_provider->has($parent->value)
+        ) {
+            return $child;
+        }
+
+        $child_storage = $codebase->classlike_storage_provider->get($child->value);
+        $parent_storage = $codebase->classlike_storage_provider->get($parent->value);
+
+        $extended_params = $child_storage->template_extended_params[$parent_storage->name] ?? null;
+
+        if ($child_storage->template_types === null
+            || $child_storage->template_types === []
+            || $parent_storage->template_types === null
+            || $parent_storage->template_types === []
+            || $extended_params === null
+        ) {
+            return $child;
+        }
+
+        $parent_template_names = array_keys($parent_storage->template_types);
+        $type_params = [];
+
+        foreach (array_keys($child_storage->template_types) as $template_name) {
+            $inferred = null;
+
+            foreach ($extended_params as $parent_template_name => $extended_type) {
+                $offset = array_search($parent_template_name, $parent_template_names, true);
+
+                if ($offset === false || !isset($parent->type_params[$offset]) || !$extended_type->isSingle()) {
+                    continue;
+                }
+
+                $extended_atomic = $extended_type->getSingleAtomic();
+
+                if ($extended_atomic instanceof TTemplateParam
+                    && $extended_atomic->param_name === $template_name
+                    && $extended_atomic->defining_class === $child_storage->name
+                ) {
+                    $inferred = $parent->type_params[$offset];
+                    break;
+                }
+            }
+
+            if ($inferred === null) {
+                // a template not passed straight to the parent: nothing is known about it
+                return $child;
+            }
+
+            $type_params[] = $inferred;
+        }
+
+        return new TGenericObject(
+            $child->value,
+            $type_params,
+            false,
+            $child->is_static,
+            $child->extra_types,
+            $child->from_docblock,
+        );
+    }
+
+    /**
+     * Two arrays of the same keys overlap when every pair of their items does, e.g. list{int, true} and list{0, bool}
+     */
+    private static function intersectKeyedArrays(
+        Codebase $codebase,
+        TKeyedArray $array_1,
+        TKeyedArray $array_2,
+        bool &$any_scalar_type_match_found,
+    ): ?Atomic {
+        if ($array_1->fallback_params !== null
+            || $array_2->fallback_params !== null
+            || count($array_1->properties) !== count($array_2->properties)
+            || array_diff_key($array_1->properties, $array_2->properties) !== []
+        ) {
+            return null;
+        }
+
+        $properties = [];
+
+        foreach ($array_1->properties as $key => $property_1) {
+            $property_2 = $array_2->properties[$key];
+
+            if ($property_1->possibly_undefined || $property_2->possibly_undefined) {
+                return null;
+            }
+
+            $property = self::filterTypeWithAnother($codebase, $property_1, $property_2, $any_scalar_type_match_found);
+
+            if ($property === null) {
+                return null;
+            }
+
+            $properties[$key] = $property;
+        }
+
+        return TKeyedArray::make(
+            $properties,
+            $array_1->class_strings,
+            null,
+            $array_1->is_list && $array_2->is_list,
+            $array_1->from_docblock && $array_2->from_docblock,
+        );
+    }
+
+    /**
+     * The object half of an iterable is a Traversable, which can be narrowed to any of its subclasses
+     *
+     * @return array{Atomic, Atomic}
+     */
+    private static function narrowIterableToItsTraversableHalf(
+        Codebase $codebase,
+        Atomic $type_1_atomic,
+        Atomic $type_2_atomic,
+    ): array {
+        if ($type_1_atomic instanceof TIterable && $type_2_atomic instanceof TNamedObject) {
+            $type_1_atomic = AtomicTypeComparator::getTraversableHalf($codebase, $type_1_atomic, $type_2_atomic)
+                ?? $type_1_atomic;
+        } elseif ($type_2_atomic instanceof TIterable && $type_1_atomic instanceof TNamedObject) {
+            $type_2_atomic = AtomicTypeComparator::getTraversableHalf($codebase, $type_2_atomic, $type_1_atomic)
+                ?? $type_2_atomic;
+        }
+
+        return [$type_1_atomic, $type_2_atomic];
+    }
+
+    private static function filterAtomicWithAnother(
+        Atomic &$type_1_atomic,
+        Atomic $type_2_atomic,
+        Codebase $codebase,
+        bool &$any_scalar_type_match_found,
+    ): ?Atomic {
+        if ($type_1_atomic instanceof TFloat
+            && $type_2_atomic instanceof TInt
+        ) {
+            $any_scalar_type_match_found = true;
+            return $type_2_atomic;
+        }
+
+        [$type_1_atomic, $type_2_atomic] = self::narrowIterableToItsTraversableHalf(
+            $codebase,
+            $type_1_atomic,
+            $type_2_atomic,
+        );
+
+        if ($type_1_atomic instanceof TNamedObject) {
+            $type_1_atomic = $type_1_atomic->setIsStatic(false);
+        }
+
+        if ($type_1_atomic instanceof TNamedObject
+            && $type_2_atomic instanceof TString
+            && $codebase->classOrInterfaceExists($type_1_atomic->value)
+            && $codebase->methodExists(new MethodIdentifier($type_1_atomic->value, '__tostring'))
+        ) {
+            $any_scalar_type_match_found = true;
+            return $type_1_atomic;
+        }
+
+        $atomic_comparison_results = new TypeComparisonResult();
+
+        $atomic_contained_by = AtomicTypeComparator::isContainedBy(
+            $codebase,
+            $type_2_atomic,
+            $type_1_atomic,
+            !($type_1_atomic instanceof TNamedObject && $type_2_atomic instanceof TNamedObject),
+            false,
+            $atomic_comparison_results,
+        );
+
+        // an object with __toString() is accepted where a string is expected, but no string is such an object;
+        // it can only be loosely equal to one
+        if ($atomic_contained_by && $atomic_comparison_results->to_string_cast === true) {
+            $any_scalar_type_match_found = true;
+        } elseif ($atomic_contained_by) {
+            return self::refineContainedAtomicWithAnother(
+                $type_1_atomic,
+                $type_2_atomic,
+                $codebase,
+                $atomic_comparison_results->type_coerced ?? false,
+            );
+        }
+
+        $atomic_comparison_results = new TypeComparisonResult();
+
+        $atomic_contained_by = AtomicTypeComparator::isContainedBy(
+            $codebase,
+            $type_1_atomic,
+            $type_2_atomic,
+            $type_1_atomic instanceof TClassString && $type_2_atomic instanceof TClassString,
+            false,
+            $atomic_comparison_results,
+        );
+
+        if ($atomic_contained_by) {
+            return self::refineContainedAtomicWithAnother(
+                $type_2_atomic,
+                $type_1_atomic,
+                $codebase,
+                $atomic_comparison_results->type_coerced ?? false,
+            );
+        }
+
+        $matching_atomic_type = null;
+
+        if ($type_1_atomic instanceof TNamedObject
+            && $type_2_atomic instanceof TNamedObject
+            && ($codebase->interfaceExists($type_1_atomic->value)
+                || $codebase->interfaceExists($type_2_atomic->value))
+            && self::canBeIntersected($codebase, $type_1_atomic, $type_2_atomic)
+        ) {
+            if ($type_1_atomic instanceof TGenericObject && !$type_2_atomic instanceof TGenericObject) {
+                $type_2_atomic = self::inferTemplateParamsFromParent($codebase, $type_2_atomic, $type_1_atomic);
+            }
+
+            return $type_2_atomic->addIntersectionType($type_1_atomic);
+        }
+
+        /*if ($type_2_atomic instanceof TKeyedArray
+        ) {
+            $type_2_key = $type_2_atomic->getGenericKeyType();
+            $type_2_value = $type_2_atomic->getGenericValueType();
+
+            if (!$type_2_key->hasString()) {
+                $type_1_type_param = $type_1_atomic->type_param;
+                $type_2_value = self::filterTypeWithAnother(
+                    $codebase,
+                    $type_1_type_param,
+                    $type_2_value,
+                    $any_scalar_type_match_found
+                );
+                $type_1_atomic = $type_1_atomic->setTypeParam($type_1_type_param);
+
+                if ($type_2_value === null) {
+                    return null;
+                }
+
+                return TKeyedArray::make(
+                    $type_2_atomic->properties,
+                    null,
+                    [Type::getInt(), $type_2_value],
+                    true
+                );
+            }
+        } elseif ($type_1_atomic instanceof TKeyedArray
+            && $type_2_atomic instanceof \Psalm\Type\Atomic\TList
+        ) {
+            $type_1_key = $type_1_atomic->getGenericKeyType();
+            $type_1_value = $type_1_atomic->getGenericValueType();
+
+            if (!$type_1_key->hasString()) {
+                $type_2_type_param = $type_2_atomic->type_param;
+                $type_1_value = self::filterTypeWithAnother(
+                    $codebase,
+                    $type_2_type_param,
+                    $type_1_value,
+                    $any_scalar_type_match_found
+                );
+
+                if ($type_1_value === null) {
+                    return null;
+                }
+
+                return TKeyedArray::make(
+                    $type_1_atomic->properties,
+                    null,
+                    [Type::getInt(), $type_1_value],
+                    true
+                );
+            }
+        }*/
+
+        if ($type_2_atomic instanceof TTemplateParam
+            && $type_1_atomic instanceof TTemplateParam
+            && $type_2_atomic->param_name !== $type_1_atomic->param_name
+            && $type_2_atomic->as->hasObject()
+            && $type_1_atomic->as->hasObject()
+        ) {
+            return $type_2_atomic->addIntersectionType($type_1_atomic);
+        }
+
+        //we filter both types of standard iterables
+        if (($type_2_atomic instanceof TGenericObject
+                || $type_2_atomic instanceof TArray
+                || $type_2_atomic instanceof TIterable)
+            && ($type_1_atomic instanceof TGenericObject
+                || $type_1_atomic instanceof TArray
+                || $type_1_atomic instanceof TIterable)
+            && count($type_2_atomic->type_params) === count($type_1_atomic->type_params)
+        ) {
+            $type_1_params = $type_1_atomic->type_params;
+            foreach ($type_2_atomic->type_params as $i => $type_2_param) {
+                $type_1_param = $type_1_params[$i];
+
+                $type_2_param_id = $type_2_param->getId();
+
+                $type_2_param = self::filterTypeWithAnother(
+                    $codebase,
+                    $type_1_param,
+                    $type_2_param,
+                    $any_scalar_type_match_found,
+                );
+
+                if ($type_2_param === null) {
+                    return null;
+                }
+
+                if ($type_1_params[$i]->getId() !== $type_2_param_id) {
+                    $type_1_params[$i] = $type_2_param;
+                }
+            }
+
+            /** @psalm-suppress InvalidArgument */
+            $type_1_atomic = $type_1_atomic->setTypeParams(
+                $type_1_params,
+            );
+
+            $matching_atomic_type = $type_1_atomic;
+            $atomic_comparison_results->type_coerced = true;
+        }
+
+        //we filter the second part of a list with the second part of standard iterables
+        /*if (($type_2_atomic instanceof TArray
+                || $type_2_atomic instanceof TIterable)
+            && $type_1_atomic instanceof \Psalm\Type\Atomic\TList
+        ) {
+            $type_2_param = $type_2_atomic->type_params[1];
+            $type_1_param = $type_1_atomic->type_param;
+
+            $type_2_param = self::filterTypeWithAnother(
+                $codebase,
+                $type_1_param,
+                $type_2_param,
+                $any_scalar_type_match_found
+            );
+
+            if ($type_2_param === null) {
+                return null;
+            }
+
+            if ($type_1_param->getId() !== $type_2_param->getId()) {
+                $type_1_atomic = $type_1_atomic->setTypeParam($type_2_param);
+            } elseif ($type_1_param !== $type_1_atomic->type_param) {
+                $type_1_atomic = $type_1_atomic->setTypeParam($type_1_param);
+            }
+
+            $matching_atomic_type = $type_1_atomic;
+            $atomic_comparison_results->type_coerced = true;
+        }*/
+
+        //we filter each property of a Keyed Array with the second part of standard iterables
+        if (($type_2_atomic instanceof TArray
+                || $type_2_atomic instanceof TIterable)
+            && $type_1_atomic instanceof TKeyedArray
+        ) {
+            $type_2_param = $type_2_atomic->type_params[1];
+            $type_1_properties = $type_1_atomic->properties;
+            foreach ($type_1_properties as &$type_1_param) {
+                $type_2_param = self::filterTypeWithAnother(
+                    $codebase,
+                    $type_1_param,
+                    $type_2_param,
+                    $any_scalar_type_match_found,
+                );
+
+                if ($type_2_param === null) {
+                    return null;
+                }
+
+                if ($type_1_param->getId() !== $type_2_param->getId()) {
+                    $type_1_param = $type_2_param->setPossiblyUndefined($type_1_param->possibly_undefined);
+                }
+            }
+            unset($type_1_param);
+
+            if ($type_1_atomic->fallback_params === null) {
+                $fallback_types = null;
+            } else {
+                //any fallback type is now the value of iterable
+                $fallback_types = [$type_1_atomic->fallback_params[0], $type_2_param];
+            }
+
+            $filtered_atomic_type = TKeyedArray::make(
+                $type_1_properties,
+                $type_1_atomic->class_strings,
+                $fallback_types,
+                $type_1_atomic->is_list,
+                $type_1_atomic->from_docblock,
+            );
+            $matching_atomic_type = $filtered_atomic_type instanceof TKeyedArray
+                ? $filtered_atomic_type->setIsCallable($type_1_atomic->is_callable)
+                : $filtered_atomic_type;
+            $atomic_comparison_results->type_coerced = true;
+        }
+
+        if ($matching_atomic_type === null
+            && $type_1_atomic instanceof TKeyedArray
+            && $type_2_atomic instanceof TKeyedArray
+        ) {
+            $matching_atomic_type = self::intersectKeyedArrays(
+                $codebase,
+                $type_1_atomic,
+                $type_2_atomic,
+                $any_scalar_type_match_found,
+            );
+        }
+
+        //These partial match wouldn't have been handled by AtomicTypeComparator
+        $new_range = null;
+        if ($type_2_atomic instanceof TIntRange
+            && $type_1_atomic instanceof TIntRange
+        ) {
+            $new_range = TIntRange::intersectIntRanges(
+                $type_1_atomic,
+                $type_2_atomic,
+            );
+        }
+
+        if ($new_range !== null) {
+            $matching_atomic_type = $new_range;
+        }
+
+        $refined_string = $type_1_atomic instanceof TString && $type_2_atomic instanceof TString
+            ? StringRefinement::intersect($type_1_atomic, $type_2_atomic)
+            : null;
+
+        if ($refined_string !== null) {
+            // e.g. lowercase-string and non-falsy-string, none of which is contained into the other completely
+            $matching_atomic_type = $refined_string;
+        } elseif (($type_2_atomic instanceof TLowercaseString && $type_1_atomic instanceof TNonEmptyString) ||
+            ($type_2_atomic instanceof TNonEmptyString && $type_1_atomic instanceof TLowercaseString)
+        ) {
+            // Lowercase-string and non-empty-string are compatible but none is contained into the other completely
+            $matching_atomic_type = new TNonEmptyLowercaseString();
+        }
+
+        // Lowercase-string and non-empty-string are compatible but none is contained into the other completely
+        if (($type_2_atomic instanceof TLowercaseString
+            && $type_1_atomic instanceof TNonEmptyNonspecificLiteralString) ||
+            ($type_2_atomic instanceof TNonEmptyNonspecificLiteralString && $type_1_atomic instanceof TLowercaseString)
+        ) {
+            $matching_atomic_type = new TNonEmptyLowercaseString();
+        }
+
+        if ($matching_atomic_type === null) {
+            $matching_atomic_type = self::intersectDecimalIntString($type_1_atomic, $type_2_atomic);
+        }
+
+        if (!$atomic_comparison_results->type_coerced && $atomic_comparison_results->scalar_type_match_found) {
+            $any_scalar_type_match_found = true;
+        }
+
+        return $matching_atomic_type;
+    }
+
+    /**
+     * A type containing the values that a decimal-int-string or a non-decimal-int-string shares with another string
+     * type when neither contains the other: the decimal-int-string itself (e.g. for a non-falsy-string, still with
+     * "0"), or the other type for a non-decimal-int-string (e.g. a numeric-string, still with "1")
+     *
+     * @psalm-pure
+     */
+    private static function intersectDecimalIntString(Atomic $type_1_atomic, Atomic $type_2_atomic): ?Atomic
+    {
+        if (!$type_1_atomic instanceof TString
+            || !$type_2_atomic instanceof TString
+            || $type_1_atomic instanceof TLiteralString
+            || $type_2_atomic instanceof TLiteralString
+        ) {
+            return null;
+        }
+
+        if ($type_2_atomic instanceof TDecimalIntString || $type_2_atomic instanceof TNonDecimalIntString) {
+            [$type_1_atomic, $type_2_atomic] = [$type_2_atomic, $type_1_atomic];
+        }
+
+        if ($type_2_atomic instanceof TDecimalIntString || $type_2_atomic instanceof TNonDecimalIntString) {
+            // a decimal-int-string and a non-decimal-int-string share no value
+            return null;
+        }
+
+        if ($type_1_atomic instanceof TNonDecimalIntString) {
+            return $type_2_atomic;
+        }
+
+        if ($type_1_atomic instanceof TDecimalIntString
+            // no class, function or trait name is a decimal int
+            && !$type_2_atomic instanceof TClassString
+            && !$type_2_atomic instanceof TCallableString
+            && !$type_2_atomic instanceof TTraitString
+        ) {
+            return $type_1_atomic;
+        }
+
+        return null;
+    }
+
+    private static function refineContainedAtomicWithAnother(
+        Atomic $type_1_atomic,
+        Atomic $type_2_atomic,
+        Codebase $codebase,
+        bool $type_coerced,
+    ): ?Atomic {
+        if ($type_coerced
+            && $type_2_atomic::class === TNamedObject::class
+            && $type_1_atomic instanceof TGenericObject
+        ) {
+            // this is a hack - it's not actually rigorous, as the params may be different
+            return new TGenericObject(
+                $type_2_atomic->value,
+                $type_1_atomic->type_params,
+            );
+        } elseif ($type_2_atomic instanceof TNamedObject
+            && $type_1_atomic instanceof TTemplateParam
+            && $type_1_atomic->as->hasObjectType()
+        ) {
+            $type_1_as_init = $type_1_atomic->as;
+            $type_1_as = self::filterTypeWithAnother(
+                $codebase,
+                $type_1_as_init,
+                new Union([$type_2_atomic]),
+            );
+
+            if ($type_1_as === null) {
+                return null;
+            }
+
+            return $type_1_atomic->replaceAs($type_1_as);
+        } else {
+            return $type_2_atomic;
+        }
+    }
+
+    /**
+     * @param  TLiteralInt|TLiteralFloat|TLiteralString|TEnumCase $assertion_type
+     * @param  string[]          $suppressed_issues
+     */
+    private static function handleLiteralEquality(
+        StatementsAnalyzer $statements_analyzer,
+        Assertion          $assertion,
+        Atomic             $assertion_type,
+        Union              $existing_var_type,
+        string             $old_var_type_string,
+        ?string            $var_id,
+        bool               $negated,
+        ?CodeLocation      $code_location,
+        array              $suppressed_issues,
+    ): Union {
+        $existing_var_atomic_types = [];
+
+        foreach ($existing_var_type->getAtomicTypes() as $existing_var_atomic_type) {
+            if ($existing_var_atomic_type instanceof TClassConstant) {
+                $expanded = TypeExpander::expandAtomic(
+                    $statements_analyzer->getCodebase(),
+                    $existing_var_atomic_type,
+                    $existing_var_atomic_type->fq_classlike_name,
+                    $existing_var_atomic_type->fq_classlike_name,
+                    null,
+                    true,
+                    true,
+                );
+
+                foreach ($expanded as $atomic_type) {
+                    $existing_var_atomic_types[$atomic_type->getKey()] = $atomic_type;
+                }
+            } else {
+                $existing_var_atomic_types[$existing_var_atomic_type->getKey()] = $existing_var_atomic_type;
+            }
+        }
+
+        if ($assertion_type instanceof TLiteralInt) {
+            return self::handleLiteralEqualityWithInt(
+                $statements_analyzer,
+                $assertion,
+                $assertion_type,
+                $existing_var_type,
+                $existing_var_atomic_types,
+                $old_var_type_string,
+                $var_id,
+                $negated,
+                $code_location,
+                $suppressed_issues,
+            );
+        } elseif ($assertion_type instanceof TLiteralString) {
+            return self::handleLiteralEqualityWithString(
+                $statements_analyzer,
+                $assertion,
+                $assertion_type,
+                $existing_var_type,
+                $existing_var_atomic_types,
+                $old_var_type_string,
+                $var_id,
+                $negated,
+                $code_location,
+                $suppressed_issues,
+            );
+        } elseif ($assertion_type instanceof TLiteralFloat) {
+            return self::handleLiteralEqualityWithFloat(
+                $statements_analyzer,
+                $assertion,
+                $assertion_type,
+                $existing_var_type,
+                $existing_var_atomic_types,
+                $old_var_type_string,
+                $var_id,
+                $negated,
+                $code_location,
+                $suppressed_issues,
+            );
+        } else {
+            $fq_enum_name = $assertion_type->value;
+            $case_name = $assertion_type->case_name;
+
+            if ($existing_var_type->hasMixed()) {
+                if ($assertion instanceof IsLooselyEqual) {
+                    return $existing_var_type;
+                }
+
+                return new Union([new TEnumCase($fq_enum_name, $case_name)]);
+            }
+
+            $can_be_equal = false;
+            $redundant = true;
+
+            $existing_var_type = $existing_var_type->getBuilder();
+            foreach ($existing_var_atomic_types as $atomic_key => $atomic_type) {
+                if ($atomic_type::class === TNamedObject::class
+                    && $atomic_type->value === $fq_enum_name
+                ) {
+                    $can_be_equal = true;
+                    $redundant = false;
+                    $existing_var_type->removeType($atomic_key);
+                    $existing_var_type->addType(new TEnumCase($fq_enum_name, $case_name));
+                } elseif (AtomicTypeComparator::canBeIdentical(
+                    $statements_analyzer->getCodebase(),
+                    $atomic_type,
+                    $assertion_type,
+                )) {
+                    $can_be_equal = true;
+                    $redundant = $atomic_key === $assertion_type->getKey();
+                    $existing_var_type->removeType($atomic_key);
+                    $existing_var_type->addType(new TEnumCase($fq_enum_name, $case_name));
+                } elseif ($atomic_key !== $assertion_type->getKey()) {
+                    $existing_var_type->removeType($atomic_key);
+                    $redundant = false;
+                } else {
+                    $can_be_equal = true;
+                }
+            }
+            $existing_var_type = $existing_var_type->freeze();
+
+            if ($var_id
+                && $code_location
+                && (!$can_be_equal || ($redundant && count($existing_var_atomic_types) === 1))
+            ) {
+                self::triggerIssueForImpossible(
+                    $existing_var_type,
+                    $old_var_type_string,
+                    $var_id,
+                    $assertion,
+                    $can_be_equal,
+                    $negated,
+                    $code_location,
+                    $suppressed_issues,
+                );
+            }
+        }
+
+        return $existing_var_type;
+    }
+
+    /**
+     * @param array<string, Atomic> $existing_var_atomic_types
+     * @param string[]     $suppressed_issues
+     */
+    private static function handleLiteralEqualityWithInt(
+        StatementsAnalyzer $statements_analyzer,
+        Assertion      $assertion,
+        TLiteralInt        $assertion_type,
+        Union              $existing_var_type,
+        array              $existing_var_atomic_types,
+        string             $old_var_type_string,
+        ?string            $var_id,
+        bool               $negated,
+        ?CodeLocation      $code_location,
+        array              $suppressed_issues,
+    ): Union {
+        $value = $assertion_type->value;
+
+        // we create the literal that is being asserted. We'll return this when we're sure this is the resulting type
+        $literal_asserted_type = new Union([new TLiteralInt($value)], [
+            'from_docblock' => $existing_var_type->from_docblock,
+        ]);
+        $compatible_int_type = self::getCompatibleIntType(
+            $existing_var_type,
+            $existing_var_atomic_types,
+            $assertion_type,
+            $assertion instanceof IsLooselyEqual,
+        );
+
+        if ($compatible_int_type !== null) {
+            return $compatible_int_type;
+        }
+
+        foreach ($existing_var_atomic_types as $existing_var_atomic_type) {
+            if ($existing_var_atomic_type instanceof TIntRange && $existing_var_atomic_type->contains($value)) {
+                return $literal_asserted_type;
+            }
+
+            if ($existing_var_atomic_type instanceof TLiteralInt && $existing_var_atomic_type->value === $value) {
+                //if we're here, we check that we had at least another type in the union, otherwise it's redundant
+
+                if ($existing_var_type->isSingleIntLiteral()) {
+                    if ($var_id && $code_location) {
+                        self::triggerIssueForImpossible(
+                            $existing_var_type,
+                            $old_var_type_string,
+                            $var_id,
+                            $assertion,
+                            true,
+                            $negated,
+                            $code_location,
+                            $suppressed_issues,
+                        );
+                    }
+                    return $existing_var_type;
+                }
+                return $literal_asserted_type;
+            }
+
+            if ($existing_var_atomic_type instanceof TInt && !$existing_var_atomic_type instanceof TLiteralInt) {
+                return $literal_asserted_type;
+            }
+
+            if ($existing_var_atomic_type instanceof TTemplateParam) {
+                $compatible_int_type = self::getCompatibleIntType(
+                    $existing_var_type,
+                    $existing_var_atomic_type->as->getAtomicTypes(),
+                    $assertion_type,
+                    $assertion instanceof IsLooselyEqual,
+                );
+                if ($compatible_int_type !== null) {
+                    return $compatible_int_type;
+                }
+
+                $existing_var_atomic_type = $existing_var_atomic_type->replaceAs(
+                    self::handleLiteralEquality(
+                        $statements_analyzer,
+                        $assertion,
+                        $assertion_type,
+                        $existing_var_atomic_type->as,
+                        $old_var_type_string,
+                        $var_id,
+                        $negated,
+                        $code_location,
+                        $suppressed_issues,
+                    ),
+                );
+
+                return new Union([$existing_var_atomic_type]);
+            }
+
+            if ($assertion instanceof IsLooselyEqual
+                && $existing_var_atomic_type instanceof TLiteralFloat
+                && $existing_var_atomic_type->value == $value
+            ) {
+                return new Union([$existing_var_atomic_type]);
+            }
+
+            if ($assertion instanceof IsLooselyEqual
+                && $existing_var_atomic_type instanceof TLiteralString
+                && (int)$existing_var_atomic_type->value === $value
+            ) {
+                return new Union([$existing_var_atomic_type]);
+            }
+        }
+
+        //here we'll accept non-literal type that *could* match on loose equality and return the original type
+        foreach ($existing_var_atomic_types as $existing_var_atomic_type) {
+            //here we'll accept non-literal type that *could* match on loose equality and return the original type
+            if ($assertion instanceof IsLooselyEqual) {
+                if ($existing_var_atomic_type instanceof TString
+                    && !$existing_var_atomic_type instanceof TLiteralString
+                ) {
+                    return $existing_var_type;
+                }
+
+                if ($existing_var_atomic_type instanceof TFloat
+                    && !$existing_var_atomic_type instanceof TLiteralFloat
+                ) {
+                    return $existing_var_type;
+                }
+            }
+        }
+
+        //if we're here, no type was eligible for the given literal. We'll emit an impossible error for this assertion
+        if ($var_id && $code_location) {
+            self::triggerIssueForImpossible(
+                $existing_var_type,
+                $old_var_type_string,
+                $var_id,
+                $assertion,
+                false,
+                $negated,
+                $code_location,
+                $suppressed_issues,
+            );
+        }
+
+        return Type::getNever();
+    }
+
+    /**
+     * @param array<string, Atomic> $existing_var_atomic_types
+     * @param string[]     $suppressed_issues
+     */
+    private static function handleLiteralEqualityWithString(
+        StatementsAnalyzer $statements_analyzer,
+        Assertion      $assertion,
+        TLiteralString     $assertion_type,
+        Union              $existing_var_type,
+        array              $existing_var_atomic_types,
+        string             $old_var_type_string,
+        ?string            $var_id,
+        bool               $negated,
+        ?CodeLocation      $code_location,
+        array              $suppressed_issues,
+    ): Union {
+        $value = $assertion_type->value;
+
+        // we create the literal that is being asserted. We'll return this when we're sure this is the resulting type
+        $literal_asserted_type_string = new Union([$assertion_type], [
+            'from_docblock' => $existing_var_type->from_docblock,
+        ]);
+
+        $compatible_string_type = self::getCompatibleStringType(
+            $existing_var_type,
+            $existing_var_atomic_types,
+            $assertion_type,
+            $assertion instanceof IsLooselyEqual,
+            $statements_analyzer->getCodebase()->analysis_php_version_id >= 8_00_00,
+        );
+
+        if ($compatible_string_type !== null) {
+            return $compatible_string_type;
+        }
+
+        foreach ($existing_var_atomic_types as $existing_var_atomic_type) {
+            if ($existing_var_atomic_type instanceof TLiteralString && $existing_var_atomic_type->value === $value) {
+                //if we're here, we check that we had at least another type in the union, otherwise it's redundant
+
+                if ($existing_var_type->isSingleStringLiteral()) {
+                    if ($var_id && $code_location) {
+                        self::triggerIssueForImpossible(
+                            $existing_var_type,
+                            $old_var_type_string,
+                            $var_id,
+                            $assertion,
+                            true,
+                            $negated,
+                            $code_location,
+                            $suppressed_issues,
+                        );
+                    }
+                    return $existing_var_type;
+                }
+
+                return $literal_asserted_type_string;
+            }
+
+            if ($existing_var_atomic_type instanceof TString && !$existing_var_atomic_type instanceof TLiteralString) {
+                return $literal_asserted_type_string;
+            }
+
+            if ($existing_var_atomic_type instanceof TTemplateParam) {
+                $compatible_string_type = self::getCompatibleStringType(
+                    $existing_var_type,
+                    $existing_var_atomic_type->as->getAtomicTypes(),
+                    $assertion_type,
+                    $assertion instanceof IsLooselyEqual,
+                    $statements_analyzer->getCodebase()->analysis_php_version_id >= 8_00_00,
+                );
+                if ($compatible_string_type !== null) {
+                    return $compatible_string_type;
+                }
+
+                if ($existing_var_atomic_type->as->hasString()) {
+                    return $literal_asserted_type_string;
+                }
+
+                $existing_var_atomic_type = $existing_var_atomic_type->replaceAs(
+                    self::handleLiteralEquality(
+                        $statements_analyzer,
+                        $assertion,
+                        $assertion_type,
+                        $existing_var_atomic_type->as,
+                        $old_var_type_string,
+                        $var_id,
+                        $negated,
+                        $code_location,
+                        $suppressed_issues,
+                    ),
+                );
+
+                return new Union([$existing_var_atomic_type]);
+            }
+
+            if ($assertion instanceof IsLooselyEqual
+                && $existing_var_atomic_type instanceof TLiteralInt
+                && (string)$existing_var_atomic_type->value === $value
+            ) {
+                return new Union([$existing_var_atomic_type]);
+            }
+
+            if ($assertion instanceof IsLooselyEqual
+                && $existing_var_atomic_type instanceof TLiteralFloat
+                && !is_nan($existing_var_atomic_type->value) // NAN is not equal to anything
+                && (string)$existing_var_atomic_type->value === $value
+            ) {
+                return new Union([$existing_var_atomic_type]);
+            }
+        }
+
+        //here we'll accept non-literal type that *could* match on loose equality and return the original type
+        foreach ($existing_var_atomic_types as $existing_var_atomic_type) {
+            //here we'll accept non-literal type that *could* match on loose equality and return the original type
+            if ($assertion instanceof IsLooselyEqual) {
+                if ($existing_var_atomic_type instanceof TInt
+                    && !$existing_var_atomic_type instanceof TLiteralInt
+                ) {
+                    return $existing_var_type;
+                }
+
+                if ($existing_var_atomic_type instanceof TFloat
+                    && !$existing_var_atomic_type instanceof TLiteralFloat
+                ) {
+                    return $existing_var_type;
+                }
+            }
+        }
+
+        //if we're here, no type was eligible for the given literal. We'll emit an impossible error for this assertion
+        if ($var_id && $code_location) {
+            self::triggerIssueForImpossible(
+                $existing_var_type,
+                $old_var_type_string,
+                $var_id,
+                $assertion,
+                false,
+                $negated,
+                $code_location,
+                $suppressed_issues,
+            );
+        }
+
+        return Type::getNever();
+    }
+
+    /**
+     * @param array<string, Atomic> $existing_var_atomic_types
+     * @param string[]     $suppressed_issues
+     */
+    private static function handleLiteralEqualityWithFloat(
+        StatementsAnalyzer $statements_analyzer,
+        Assertion      $assertion,
+        TLiteralFloat      $assertion_type,
+        Union              $existing_var_type,
+        array              $existing_var_atomic_types,
+        string             $old_var_type_string,
+        ?string            $var_id,
+        bool               $negated,
+        ?CodeLocation      $code_location,
+        array              $suppressed_issues,
+    ): Union {
+        $value = $assertion_type->value;
+
+        // we create the literal that is being asserted. We'll return this when we're sure this is the resulting type
+        $literal_asserted_type = new Union([new TLiteralFloat($value)], [
+            'from_docblock' => $existing_var_type->from_docblock,
+        ]);
+
+        $compatible_float_type = self::getCompatibleFloatType(
+            $existing_var_type,
+            $existing_var_atomic_types,
+            $assertion_type,
+            $assertion instanceof IsLooselyEqual,
+        );
+
+        if ($compatible_float_type !== null) {
+            return $compatible_float_type;
+        }
+
+        foreach ($existing_var_atomic_types as $existing_var_atomic_type) {
+            if ($existing_var_atomic_type instanceof TLiteralFloat && $existing_var_atomic_type->value === $value) {
+                //if we're here, we check that we had at least another type in the union, otherwise it's redundant
+
+                if ($existing_var_type->isSingleFloatLiteral()) {
+                    if ($var_id && $code_location) {
+                        self::triggerIssueForImpossible(
+                            $existing_var_type,
+                            $old_var_type_string,
+                            $var_id,
+                            $assertion,
+                            true,
+                            $negated,
+                            $code_location,
+                            $suppressed_issues,
+                        );
+                    }
+                    return $existing_var_type;
+                }
+
+                return $literal_asserted_type;
+            }
+
+            if ($existing_var_atomic_type instanceof TFloat && !$existing_var_atomic_type instanceof TLiteralFloat) {
+                return $literal_asserted_type;
+            }
+
+            if ($existing_var_atomic_type instanceof TTemplateParam) {
+                $compatible_float_type = self::getCompatibleFloatType(
+                    $existing_var_type,
+                    $existing_var_atomic_type->as->getAtomicTypes(),
+                    $assertion_type,
+                    $assertion instanceof IsLooselyEqual,
+                );
+                if ($compatible_float_type !== null) {
+                    return $compatible_float_type;
+                }
+
+                if ($existing_var_atomic_type->as->hasFloat()) {
+                    return $literal_asserted_type;
+                }
+
+                $existing_var_atomic_type = $existing_var_atomic_type->replaceAs(
+                    self::handleLiteralEquality(
+                        $statements_analyzer,
+                        $assertion,
+                        $assertion_type,
+                        $existing_var_atomic_type->as,
+                        $old_var_type_string,
+                        $var_id,
+                        $negated,
+                        $code_location,
+                        $suppressed_issues,
+                    ),
+                );
+
+                return new Union([$existing_var_atomic_type]);
+            }
+
+            if ($assertion instanceof IsLooselyEqual
+                && $existing_var_atomic_type instanceof TLiteralInt
+                && (float)$existing_var_atomic_type->value === $value
+            ) {
+                return new Union([$existing_var_atomic_type]);
+            }
+
+            if ($assertion instanceof IsLooselyEqual
+                && $existing_var_atomic_type instanceof TLiteralString
+                && (float)$existing_var_atomic_type->value === $value
+            ) {
+                return new Union([$existing_var_atomic_type]);
+            }
+        }
+
+        //here we'll accept non-literal type that *could* match on loose equality and return the original type
+        foreach ($existing_var_atomic_types as $existing_var_atomic_type) {
+            if ($assertion instanceof IsLooselyEqual) {
+                if ($existing_var_atomic_type instanceof TInt
+                    && !$existing_var_atomic_type instanceof TLiteralInt
+                ) {
+                    return $existing_var_type;
+                }
+
+                if ($existing_var_atomic_type instanceof TString
+                    && !$existing_var_atomic_type instanceof TLiteralString
+                ) {
+                    return $existing_var_type;
+                }
+            }
+        }
+
+        //if we're here, no type was eligible for the given literal. We'll emit an impossible error for this assertion
+        if ($var_id && $code_location) {
+            self::triggerIssueForImpossible(
+                $existing_var_type,
+                $old_var_type_string,
+                $var_id,
+                $assertion,
+                false,
+                $negated,
+                $code_location,
+                $suppressed_issues,
+            );
+        }
+
+        return Type::getNever();
+    }
+
+    /**
+     * @param array<string, Atomic> $existing_var_atomic_types
+     * @psalm-pure
+     */
+    private static function getCompatibleIntType(
+        Union $existing_var_type,
+        array $existing_var_atomic_types,
+        TLiteralInt $assertion_type,
+        bool $is_loose_equality,
+    ): ?Union {
+        foreach ($existing_var_atomic_types as $existing_var_atomic_type) {
+            if ($existing_var_atomic_type instanceof TMixed
+                || $existing_var_atomic_type instanceof TScalar
+                || $existing_var_atomic_type instanceof TNumeric
+                || $existing_var_atomic_type instanceof TArrayKey
+            ) {
+                if ($is_loose_equality) {
+                    return $existing_var_type;
+                }
+
+                return new Union([$assertion_type], [
+                    'from_docblock' => $existing_var_type->from_docblock,
+                ]);
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param array<string, Atomic> $existing_var_atomic_types
+     * @psalm-pure
+     */
+    private static function getCompatibleStringType(
+        Union $existing_var_type,
+        array $existing_var_atomic_types,
+        TLiteralString $assertion_type,
+        bool $is_loose_equality,
+        bool $is_php8,
+    ): ?Union {
+        foreach ($existing_var_atomic_types as $existing_var_atomic_type) {
+            if ($existing_var_atomic_type instanceof TMixed
+                || $existing_var_atomic_type instanceof TScalar
+                || $existing_var_atomic_type instanceof TArrayKey
+            ) {
+                // Since PHP 8, an int is only loosely equal to a numeric string (`switch` compares loosely), so an
+                // array key loosely equal to a string that isn't numeric is that string
+                if ($is_loose_equality
+                    && !($is_php8
+                        && $existing_var_atomic_type instanceof TArrayKey
+                        && !is_numeric($assertion_type->value))
+                ) {
+                    return $existing_var_type;
+                }
+
+                return new Union([$assertion_type], [
+                    'from_docblock' => $existing_var_type->from_docblock,
+                ]);
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param array<string, Atomic> $existing_var_atomic_types
+     * @psalm-pure
+     */
+    private static function getCompatibleFloatType(
+        Union $existing_var_type,
+        array $existing_var_atomic_types,
+        TLiteralFloat $assertion_type,
+        bool $is_loose_equality,
+    ): ?Union {
+        foreach ($existing_var_atomic_types as $existing_var_atomic_type) {
+            if ($existing_var_atomic_type instanceof TMixed
+                || $existing_var_atomic_type instanceof TScalar
+                || $existing_var_atomic_type instanceof TNumeric
+            ) {
+                if ($is_loose_equality) {
+                    return $existing_var_type;
+                }
+
+                return new Union([$assertion_type], [
+                    'from_docblock' => $existing_var_type->from_docblock,
+                ]);
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param array<string>           $suppressed_issues
+     * @return non-empty-list<Atomic>
+     */
+    private static function handleIsA(
+        IsAClass $assertion,
+        Codebase $codebase,
+        Union $existing_var_type,
+        ?CodeLocation $code_location,
+        ?string $key,
+        array $suppressed_issues,
+        bool &$should_return,
+    ): array {
+        $allow_string_comparison = $assertion->allow_string;
+
+        $assertion_type = $assertion->type;
+
+        if ($existing_var_type->hasMixed()) {
+            if (!$assertion_type instanceof TNamedObject) {
+                return [$assertion_type];
+            }
+
+            $types = [$assertion_type];
+
+            if ($allow_string_comparison) {
+                $types[] = new TClassString(
+                    $assertion_type->value,
+                    $assertion_type,
+                );
+            }
+
+            $should_return = true;
+            return $types;
+        }
+
+        $existing_has_object = $existing_var_type->hasObjectType();
+        $existing_has_string = $existing_var_type->hasString();
+
+        if ($existing_has_object && !$existing_has_string) {
+            if ($assertion_type instanceof TTemplateParamClass) {
+                return [new TTemplateParam(
+                    $assertion_type->param_name,
+                    new Union([$assertion_type->as_type ?: new TObject()]),
+                    $assertion_type->defining_class,
+                )];
+            }
+            return [$assertion_type];
+        }
+
+        if ($existing_has_string && !$existing_has_object) {
+            if (!$allow_string_comparison && $code_location) {
+                IssueBuffer::maybeAdd(
+                    new TypeDoesNotContainType(
+                        'Cannot allow string comparison to object for ' . $key,
+                        $code_location,
+                        "no string comparison to $key",
+                    ),
+                    $suppressed_issues,
+                );
+
+                return [new TMixed()];
+            } else {
+                if (!$assertion_type instanceof TNamedObject) {
+                    return [$assertion_type];
+                }
+
+                // a `class-string<T>` stays one of `T`, restricted to the asserted class
+                $template_class_strings = [];
+
+                foreach ($existing_var_type->getAtomicTypes() as $existing_type_part) {
+                    if (!$existing_type_part instanceof TTemplateParamClass) {
+                        $template_class_strings = [];
+                        break;
+                    }
+
+                    $bound = $existing_type_part->as_type;
+
+                    if ($bound === null
+                        || AtomicTypeComparator::isContainedBy($codebase, $assertion_type, $bound)
+                    ) {
+                        $refined_bound = $assertion_type;
+                    } elseif (AtomicTypeComparator::isContainedBy($codebase, $bound, $assertion_type)) {
+                        $refined_bound = $bound;
+                    } else {
+                        $refined_bound = $bound->addIntersectionType($assertion_type);
+                    }
+
+                    $template_class_strings[] = new TTemplateParamClass(
+                        $existing_type_part->param_name,
+                        $refined_bound->value,
+                        $refined_bound,
+                        $existing_type_part->defining_class,
+                    );
+                }
+
+                if ($template_class_strings) {
+                    $should_return = true;
+
+                    return $template_class_strings;
+                }
+
+                $new_type_has_interface_string = $codebase->interfaceExists($assertion_type->value);
+
+                $old_type_has_interface_string = false;
+
+                foreach ($existing_var_type->getAtomicTypes() as $existing_type_part) {
+                    if ($existing_type_part instanceof TClassString
+                        && $existing_type_part->as_type
+                        && $codebase->interfaceExists($existing_type_part->as_type->value)
+                    ) {
+                        $old_type_has_interface_string = true;
+                        break;
+                    }
+                }
+
+                $new_type = Type::getClassString($assertion_type->value);
+
+                if ((
+                        $new_type_has_interface_string
+                        && !UnionTypeComparator::isContainedBy(
+                            $codebase,
+                            $existing_var_type,
+                            $new_type,
+                        )
+                    )
+                    || (
+                        $old_type_has_interface_string
+                        && !UnionTypeComparator::isContainedBy(
+                            $codebase,
+                            $new_type,
+                            $existing_var_type,
+                        )
+                    )
+                ) {
+                    $new_type_part = $assertion_type;
+
+                    $acceptable_atomic_types = [];
+
+                    foreach ($existing_var_type->getAtomicTypes() as $existing_var_type_part) {
+                        if (!$existing_var_type_part instanceof TClassString) {
+                            $acceptable_atomic_types = [];
+
+                            break;
+                        }
+
+                        if (!$existing_var_type_part->as_type instanceof TNamedObject) {
+                            $acceptable_atomic_types = [];
+
+                            break;
+                        }
+
+                        $existing_var_type_part = $existing_var_type_part->as_type;
+
+                        if (AtomicTypeComparator::isContainedBy(
+                            $codebase,
+                            $existing_var_type_part,
+                            $new_type_part,
+                        )) {
+                            $acceptable_atomic_types[] = $existing_var_type_part;
+                            continue;
+                        }
+
+                        if ($codebase->classExists($existing_var_type_part->value)
+                            || $codebase->interfaceExists($existing_var_type_part->value)
+                        ) {
+                            $existing_var_type_part = $existing_var_type_part->addIntersectionType($new_type_part);
+                            $acceptable_atomic_types[] = $existing_var_type_part;
+                        }
+                    }
+
+                    if (count($acceptable_atomic_types) === 1) {
+                        $should_return = true;
+
+                        return [new TClassString('object', $acceptable_atomic_types[0])];
+                    }
+                }
+            }
+
+            return [$new_type->getSingleAtomic()];
+        } else {
+            return [new TMixed()];
+        }
+    }
+
+    /**
+     * No object is an instance of two classes that don't extend one another, or of a final class and an interface
+     * it doesn't implement
+     *
+     * @psalm-capabilities read-props|write-props
+     */
+    private static function canBeIntersected(
+        Codebase $codebase,
+        TNamedObject $existing_type_part,
+        TNamedObject $new_type_part,
+    ): bool {
+        $existing_names = [$existing_type_part->value];
+
+        foreach ($existing_type_part->extra_types as $extra_type) {
+            if ($extra_type instanceof TNamedObject) {
+                $existing_names[] = $extra_type->value;
+            }
+        }
+
+        foreach ($existing_names as $existing_name) {
+            if (!$codebase->classOrInterfaceExists($existing_name)
+                || !$codebase->classOrInterfaceExists($new_type_part->value)
+            ) {
+                continue;
+            }
+
+            $existing_storage = $codebase->classlike_storage_provider->get($existing_name);
+            $new_storage = $codebase->classlike_storage_provider->get($new_type_part->value);
+
+            $existing_is_class = !$existing_storage->is_interface && !$existing_storage->is_trait;
+            $new_is_class = !$new_storage->is_interface && !$new_storage->is_trait;
+
+            if ($existing_is_class && $new_is_class) {
+                if (!$codebase->classExtends($existing_name, $new_type_part->value)
+                    && !$codebase->classExtends($new_type_part->value, $existing_name)
+                    && strtolower($existing_name) !== strtolower($new_type_part->value)
+                ) {
+                    return false;
+                }
+            } elseif ($existing_is_class && $existing_storage->final) {
+                if (!$codebase->classImplements($existing_name, $new_type_part->value)) {
+                    return false;
+                }
+            } elseif ($new_is_class && $new_storage->final) {
+                if (!$codebase->classImplements($new_type_part->value, $existing_name)) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+}

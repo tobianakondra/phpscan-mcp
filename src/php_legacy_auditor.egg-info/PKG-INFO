@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: php-legacy-auditor
+Version: 0.1.0
+Summary: MCP server for static auditing of legacy PHP projects with Semgrep, Psalm, Progpilot and PHPCS
+Requires-Python: >=3.10
+Requires-Dist: mcp
+Requires-Dist: pydantic
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"

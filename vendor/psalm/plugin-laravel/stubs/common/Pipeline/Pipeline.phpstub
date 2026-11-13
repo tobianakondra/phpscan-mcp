@@ -1,0 +1,50 @@
+<?php
+
+namespace Illuminate\Pipeline;
+
+use Illuminate\Contracts\Pipeline\Pipeline as PipelineContract;
+
+/**
+ * Class declaration mirrors Laravel's source. Psalm wipes the reflected
+ * class_implements list when a stub re-declares the class, so the clause
+ * must be repeated verbatim or callers typed on the contract break.
+ */
+class Pipeline implements PipelineContract
+{
+    /**
+     * Set the array of pipes.
+     *
+     * Accepts an array of pipes or variadic pipe arguments via func_get_args().
+     *
+     * @param  array<\Closure|callable|string|object>|\Closure|callable|string|object  $pipes
+     * @return $this
+     *
+     * @psalm-variadic
+     */
+    public function through($pipes) {}
+
+    /**
+     * Run the pipeline with a final destination callback.
+     *
+     * `then()` returns whatever the destination closure returns, so the return type
+     * follows the closure instead of Laravel's declared `mixed`.
+     *
+     * @template TReturn
+     *
+     * @param  \Closure(mixed): TReturn  $destination
+     * @return TReturn
+     */
+    public function then(\Closure $destination) {}
+
+    /**
+     * Push additional pipes onto the pipeline.
+     *
+     * Accepts an array of pipes or variadic pipe arguments via func_get_args().
+     *
+     * @param  array<\Closure|callable|string|object>|\Closure|callable|string|object  $pipes
+     * @return $this
+     *
+     * @psalm-variadic
+     */
+    public function pipe($pipes) {}
+}

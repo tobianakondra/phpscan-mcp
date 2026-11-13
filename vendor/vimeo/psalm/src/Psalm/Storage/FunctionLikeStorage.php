@@ -1,0 +1,554 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Storage;
+
+use Override;
+use Psalm\CodeLocation;
+use Psalm\CodeLocation\DocblockTypeLocation;
+use Psalm\Internal\Analyzer\ClassLikeAnalyzer;
+use Psalm\Issue\CodeIssue;
+use Psalm\Type\Union;
+use Stringable;
+
+use function array_column;
+use function array_fill_keys;
+use function array_map;
+use function count;
+use function implode;
+
+/**
+ * @api
+ * @psalm-import-type CapabilitySet from Capabilities
+ */
+abstract class FunctionLikeStorage implements HasAttributesInterface, Stringable
+{
+    use CustomMetadataTrait;
+    use UnserializeMemoryUsageSuppressionTrait;
+
+    public ?CodeLocation $location = null;
+
+    public ?CodeLocation $stmt_location = null;
+
+    /**
+     * @psalm-readonly-allow-private-mutation
+     * @var list<FunctionLikeParameter>
+     */
+    public array $params = [];
+
+    /**
+     * @psalm-readonly-allow-private-mutation
+     * @var array<string, bool>
+     */
+    public array $param_lookup = [];
+
+    public ?Union $return_type = null;
+
+    public ?CodeLocation $return_type_location = null;
+
+    public ?Union $signature_return_type = null;
+
+    public bool $has_tentative_return_type = false;
+
+    public ?CodeLocation $signature_return_type_location = null;
+
+    public ?string $cased_name = null;
+
+    /**
+     * @var array<int, string>
+     */
+    public array $suppressed_issues = [];
+
+    /**
+     * The subset of $suppressed_issues written in this function-like's own docblock, keyed by the
+     * char offset of the issue name. Plugins append to $suppressed_issues, never to this, so only
+     * these entries have a source location to report as unused.
+     *
+     * @var array<int, string>
+     */
+    public array $docblock_suppressed_issues = [];
+
+    public ?bool $deprecated = null;
+
+    /**
+     * @var list<non-empty-string>
+     */
+    public array $internal = [];
+
+    public bool $variadic = false;
+
+    public bool $returns_by_ref = false;
+
+    public ?int $required_param_count = null;
+
+    /**
+     * @var array<string, Union>
+     */
+    public array $defined_constants = [];
+
+    /**
+     * The globals the body binds with `global` or writes through `$GLOBALS['name']`, by variable id
+     *
+     * @var array<string, bool>
+     */
+    public array $global_variables = [];
+
+    /**
+     * The function-likes the body calls by name, whose bodies may write globals too (see
+     * GlobalAnalyzer::getGlobalsWrittenBy()): lowercase function ids, and `fq_class_name::method_name` method ids
+     *
+     * @var array<lowercase-string, true>
+     */
+    public array $called_function_like_ids = [];
+
+    /**
+     * @var array<string, Union>
+     */
+    public array $global_types = [];
+
+    /**
+     * @var array<string, DocblockTypeLocation>
+     */
+    public array $global_type_locations = [];
+
+    /**
+     * An array holding the class template "as" types.
+     *
+     * It's the de-facto list of all templates on a given class.
+     *
+     * The name of the template is the first key. The nested array is keyed by a unique
+     * function identifier. This allows operations with the same-named template defined
+     * across multiple classes and/or functions to not run into trouble.
+     *
+     * @var array<string, non-empty-array<string, Union>>|null
+     */
+    public ?array $template_types = null;
+
+    /**
+     * What each template with a default (`@template T of Bound = Default`) is when a call does not infer it, the
+     * earlier templates of the function-like and those of its class standing for what they are at the call.
+     *
+     * @var array<string, Union>
+     */
+    public array $template_defaults = [];
+
+    /**
+     * Where each template default is, for the issues about it.
+     *
+     * @var array<string, CodeLocation>
+     */
+    public array $template_default_locations = [];
+
+    /**
+     * @var array<int, Possibilities>
+     */
+    public array $assertions = [];
+
+    /**
+     * @var array<int, Possibilities>
+     */
+    public array $if_true_assertions = [];
+
+    /**
+     * @var array<int, Possibilities>
+     */
+    public array $if_false_assertions = [];
+
+    public bool $has_visitor_issues = false;
+
+    /**
+     * @var list<CodeIssue>
+     */
+    public array $docblock_issues = [];
+
+    /**
+     * @var array<string, bool>
+     */
+    public array $throws = [];
+
+    /**
+     * @var array<string, CodeLocation>
+     */
+    public array $throw_locations = [];
+
+    public bool $has_yield = false;
+
+    public ?string $return_type_description = null;
+
+    /**
+     * @var array<string, CodeLocation>
+     */
+    public array $unused_docblock_parameters = [];
+
+    public bool $has_undertyped_native_parameters = false;
+
+    public bool $is_static = false;
+
+    /**
+     * The capabilities (side effects) this function-like may use: a bitmask of
+     * {@see Capabilities} constants, {@see Capabilities::ALL} when unannotated.
+     *
+     * @var CapabilitySet
+     */
+    public int $capabilities = Capabilities::ALL;
+
+    public bool $has_mutations_annotation = false;
+
+    /**
+     * A `@psalm-capabilities` value that names imported type aliases, resolved into
+     * {@see self::$capabilities} by the populator once every class is scanned.
+     */
+    public ?Union $capabilities_type = null;
+
+    /**
+     * The capabilities a call requires depending on its arguments (`@psalm-capabilities ($id is null ? io : pure)`),
+     * each a conditional over parameters: a call requires the branch its arguments select (see
+     * CallPurityResolver::getOwnCapabilities()). {@see self::$capabilities} includes every branch: it is what the
+     * body may do, and what is required where there is no call to select one.
+     *
+     * @var list<Union>
+     */
+    public array $conditional_capabilities = [];
+
+    /**
+     * The capabilities declared besides {@see self::$conditional_capabilities}, which a call requires whatever its
+     * arguments
+     *
+     * @var CapabilitySet
+     */
+    public int $unconditional_capabilities = Capabilities::ALL;
+
+    /**
+     * Names of the templates (function-level or class-level) this function-like inherits
+     * its purity from (`@psalm-purity-from-template T`): purity templates declared with
+     * `@psalm-purity-template`, or type templates bound to a closure/callable type. The
+     * capabilities a call needs are {@see self::$capabilities} plus those of the closures
+     * the templates are bound to at that call.
+     *
+     * @var list<string>
+     */
+    public array $purity_from_templates = [];
+
+    /**
+     * Whether the return value of this function/method must be used by callers.
+     *
+     * Set when the function-like is annotated with PHP 8.5's `#[\NoDiscard]` attribute.
+     * When true, Psalm reports the return value being discarded at a call site
+     * independently of purity and the find-unused-variables setting.
+     */
+    public bool $no_discard = false;
+
+    /**
+     * The `analysis_php_version_id` at which this native function/method became available, if it
+     * comes from a version-specific stub or carries an `@since x.y` tag (e.g. 8_05_00). Used to
+     * report it as undefined when analysing an older PHP version without a polyfill, while still
+     * keeping its stubbed signature for analysis. Null when unversioned/user-defined.
+     */
+    public ?int $since_php_version_id = null;
+
+    /**
+     * Whether or not the function output is dependent solely on input - a function can be
+     * impure but still have this property (e.g. var_export). Useful for taint analysis.
+     */
+    public bool $specialize_call = false;
+
+    /**
+     * Whether the function-like only runs from the command line (`@psalm-cli-only`): what it prints goes to a
+     * terminal, not to an HTML response
+     */
+    public bool $cli_only = false;
+
+    /**
+     * Whether the function-like is a builtin, declared by Psalm's stubs or built from the call map: it has no body,
+     * so the taints of each of its calls flow as its declaration says (see TaintFlowGraph::isCallSpecialized()).
+     */
+    public bool $builtin = false;
+
+    public int $taint_source_types = 0;
+
+    /**
+     * The taints of the sources under keys of what the function-like returns, the keys outermost first:
+     * `@psalm-taint-source input return['key']`
+     *
+     * @var list<array{non-empty-list<string>, int}>
+     */
+    public array $taint_source_keys = [];
+
+    public int $added_taints = 0;
+
+    public int $removed_taints = 0;
+
+    /**
+     * @var array<Union>
+     */
+    public array $conditionally_removed_taints = [];
+
+    /**
+     * `@psalm-taint-sink (<conditional>) $param`: the offset of the parameter, and the conditional type of the taints
+     * it is a sink of, which each call resolves with its arguments
+     *
+     * @var list<array{param: int, type: Union}>
+     */
+    public array $conditional_taint_sinks = [];
+
+    /**
+     * @var array<int, string>
+     */
+    public array $return_source_params = [];
+
+    /**
+     * The path type of the flow from the object a method is called on to what it returns:
+     * `@psalm-flow ($this) -> return`
+     */
+    public ?string $return_source_this = null;
+
+    /**
+     * The path types of the flows from what the callables given to these parameters return to what the function-like
+     * returns, by parameter offset: `@psalm-flow ($compute()) -> return`
+     *
+     * @var array<int, string>
+     */
+    public array $return_source_callable_params = [];
+
+    /**
+     * The flows of arguments into keyed stores: `@psalm-flow ($value) -> Store::$data[$key]`. `key` is the offset of
+     * the parameter giving the key (a list of keys with `is_list`), null for any key; `params` are those whose
+     * arguments are stored, `callable_params` those whose callables' results are (`($compute()) -> ...`).
+     * `is_late_bound` for a store of `static`, the store of the class the method is called on.
+     *
+     * @var list<array{
+     *     store: string,
+     *     key: ?int,
+     *     is_list: bool,
+     *     params: list<int>,
+     *     callable_params: list<int>,
+     *     path_type: string,
+     *     is_late_bound: bool,
+     * }>
+     */
+    public array $taint_store_writes = [];
+
+    /**
+     * The flows out of keyed stores into what the function-like returns: `@psalm-flow Store::$data[$key] -> return`
+     *
+     * @var list<array{store: string, key: ?int, is_list: bool, path_type: string, is_late_bound: bool}>
+     */
+    public array $taint_store_reads = [];
+
+    /**
+     * The flows of arguments into a property of the object a method is called on:
+     * `@psalm-flow ($value) -> $this->$name`. `name` is the offset of the parameter giving the name of the property,
+     * null for any property; `params` are those whose arguments are set.
+     *
+     * @var list<array{name: ?int, params: list<int>, path_type: string}>
+     */
+    public array $taint_property_writes = [];
+
+    /**
+     * The flows out of a property of the object a method is called on into what it returns:
+     * `@psalm-flow $this->$name -> return`
+     *
+     * @var list<array{name: ?int, path_type: string}>
+     */
+    public array $taint_property_reads = [];
+
+    /**
+     * The flows of arrays given to a method into the properties of the object it is called on that their keys name:
+     * `@psalm-flow ($values) -> $this->{key}`. Each is the offsets of the parameters whose arguments are set.
+     *
+     * @var list<list<int>>
+     */
+    public array $taint_keyed_property_writes = [];
+
+    /**
+     * Whether a method returns the properties of the object it is called on under their names:
+     * `@psalm-flow $this->{key} -> return[key]`
+     */
+    public bool $taint_keyed_property_read = false;
+
+    /**
+     * The flows of arguments into a property of the object a method is called on that the annotation names, or into
+     * an element of it: `@psalm-flow ($value) -> $this->data`, `($value) -> $this->data[$key]`,
+     * `($value) -> $this->data[*]`. `element` is the offset of the parameter giving the key of the element, `*` for any
+     * element, null for the property itself; `params` are those whose arguments are set.
+     *
+     * @var list<array{property: string, element: int|'*'|null, params: list<int>, path_type: string}>
+     */
+    public array $taint_named_property_writes = [];
+
+    /**
+     * The flows out of a property of the object a method is called on that the annotation names, or out of an element
+     * of it, into what the method returns: `@psalm-flow $this->data -> return`, `$this->data[$key] -> return`,
+     * `$this->data[*] -> return`
+     *
+     * @var list<array{property: string, element: int|'*'|null, path_type: string}>
+     */
+    public array $taint_named_property_reads = [];
+
+    public bool $allow_named_arg_calls = true;
+
+    /**
+     * @var list<AttributeStorage>
+     */
+    public array $attributes = [];
+
+    /**
+     * @var list<array{fqn: string, params: array<int>, return: bool}>|null
+     */
+    public ?array $proxy_calls = [];
+
+    public ?string $description = null;
+
+    public bool $public_api = false;
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function isMutationFree(): bool
+    {
+        return Capabilities::allowsAnyOf(Capabilities::MUTATION_FREE, $this->capabilities);
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function isExternalMutationFree(): bool
+    {
+        return Capabilities::allowsAnyOf(Capabilities::EXTERNAL_MUTATION_FREE, $this->capabilities);
+    }
+
+    /**
+     * The capabilities for inheritance/contract checks. For a function-like carrying
+     * `@psalm-purity-from-template`, its purity is assumed to be the worst possible over the
+     * referenced templates, i.e. their upper bounds. Without such annotations this is just
+     * the declared {@see self::$capabilities}.
+     *
+     * @param array<string, non-empty-array<string, Union>> $class_template_types the templates of the
+     *                                                                             containing class, if any
+     * @return CapabilitySet
+     * @psalm-mutation-free
+     */
+    public function getWorstCaseCapabilities(array $class_template_types = []): int
+    {
+        $capabilities = $this->capabilities;
+
+        foreach ($this->purity_from_templates as $template_name) {
+            $bounds = $this->template_types[$template_name] ?? $class_template_types[$template_name] ?? [];
+
+            foreach ($bounds as $bound) {
+                $capabilities |= Capabilities::fromType($bound);
+            }
+        }
+
+        return $capabilities;
+    }
+
+    /**
+     * @psalm-api
+     * @psalm-mutation-free
+     */
+    public function isPure(): bool
+    {
+        return Capabilities::allowsAnyOf(Capabilities::NONE, $this->capabilities);
+    }
+
+    /**
+     * Used in the Language Server
+     *
+     * @psalm-mutation-free
+     */
+    public function getHoverMarkdown(): string
+    {
+        $params = count($this->params) > 0 ? "\n" . implode(
+            ",\n",
+            array_map(
+                static function (FunctionLikeParameter $param): string {
+                    $realType = $param->type ?: 'mixed';
+                    return "    {$realType} \${$param->name}";
+                },
+                $this->params,
+            ),
+        ) . "\n" : '';
+        $return_type = $this->return_type ?: 'mixed';
+        $symbol_text = "function {$this->cased_name}({$params}): {$return_type}";
+
+        if (!$this instanceof MethodStorage) {
+            return $symbol_text;
+        }
+
+        $visibility_text = match ($this->visibility) {
+            ClassLikeAnalyzer::VISIBILITY_PRIVATE => 'private',
+            ClassLikeAnalyzer::VISIBILITY_PROTECTED => 'protected',
+            default => 'public',
+        };
+
+        return $visibility_text . ' ' . $symbol_text;
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function getCompletionSignature(): string
+    {
+        $symbol_text = 'function ' . $this->cased_name . '('   . implode(
+            ',',
+            array_map(
+                static fn(FunctionLikeParameter $param): string => ($param->type ?: 'mixed') . ' $' . $param->name,
+                $this->params,
+            ),
+        ) .  ') : ' . ($this->return_type ?: 'mixed');
+
+        if (!$this instanceof MethodStorage) {
+            return $symbol_text;
+        }
+
+        $visibility_text = match ($this->visibility) {
+            ClassLikeAnalyzer::VISIBILITY_PRIVATE => 'private',
+            ClassLikeAnalyzer::VISIBILITY_PROTECTED => 'protected',
+            default => 'public',
+        };
+
+        return $visibility_text . ' ' . $symbol_text;
+    }
+
+    /**
+     * @internal
+     * @param list<FunctionLikeParameter> $params
+     * @psalm-external-mutation-free
+     */
+    public function setParams(array $params): void
+    {
+        $this->params = $params;
+        $param_names = array_column($params, 'name');
+        $this->param_lookup = array_fill_keys($param_names, true);
+    }
+
+    /**
+     * @internal
+     * @psalm-external-mutation-free
+     */
+    public function addParam(FunctionLikeParameter $param, ?bool $lookup_value = null): void
+    {
+        $this->params[] = $param;
+        $this->param_lookup[$param->name] = $lookup_value ?? true;
+    }
+
+    /**
+     * @return list<AttributeStorage>
+     */
+    #[Override]
+    public function getAttributeStorages(): array
+    {
+        return $this->attributes;
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    #[Override]
+    public function __toString(): string
+    {
+        return $this->getCompletionSignature();
+    }
+}

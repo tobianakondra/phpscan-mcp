@@ -1,0 +1,103 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Plugin\EventHandler\Event;
+
+use PhpParser\Node\Expr\FuncCall;
+use Psalm\Codebase;
+use Psalm\Context;
+use Psalm\FileManipulation;
+use Psalm\StatementsSource;
+use Psalm\Type\Union;
+
+/**
+ * @psalm-external-mutation-free
+ * @api
+ */
+final class AfterFunctionCallAnalysisEvent
+{
+    /**
+     * @param non-empty-string $function_id
+     * @param FileManipulation[] $file_replacements
+     * @internal
+     * @psalm-mutation-free
+     */
+    public function __construct(
+        private readonly FuncCall $expr,
+        private readonly string $function_id,
+        private readonly Context $context,
+        private readonly StatementsSource $statements_source,
+        private readonly Codebase $codebase,
+        private readonly Union $return_type_candidate,
+        private array $file_replacements,
+    ) {
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function getExpr(): FuncCall
+    {
+        return $this->expr;
+    }
+
+    /**
+     * @return non-empty-string
+     * @psalm-mutation-free
+     */
+    public function getFunctionId(): string
+    {
+        return $this->function_id;
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function getContext(): Context
+    {
+        return $this->context;
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function getStatementsSource(): StatementsSource
+    {
+        return $this->statements_source;
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function getCodebase(): Codebase
+    {
+        return $this->codebase;
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function getReturnTypeCandidate(): Union
+    {
+        return $this->return_type_candidate;
+    }
+
+    /**
+     * @return FileManipulation[]
+     * @psalm-mutation-free
+     */
+    public function getFileReplacements(): array
+    {
+        return $this->file_replacements;
+    }
+
+    /**
+     * @param FileManipulation[] $file_replacements
+     * @psalm-external-mutation-free
+     */
+    public function setFileReplacements(array $file_replacements): void
+    {
+        $this->file_replacements = $file_replacements;
+    }
+}

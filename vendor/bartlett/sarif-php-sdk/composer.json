@@ -1,0 +1,62 @@
+{
+    "name": "bartlett/sarif-php-sdk",
+    "description": "PHP library to create and manipulate SARIF logs",
+    "license": "MIT",
+    "type": "library",
+    "keywords": [
+        "sarif"
+    ],
+    "authors": [
+        {
+            "name": "Laurent Laville",
+            "homepage": "https://github.com/llaville",
+            "role": "Lead"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/llaville/sarif-php-sdk/issues",
+        "source": "https://github.com/llaville/sarif-php-sdk"
+    },
+    "require": {
+        "php": "^7.4 || ^8.0",
+        "ext-json": "*",
+        "ext-pcre": "*",
+        "ext-spl": "*"
+    },
+    "require-dev": {
+        "bamarni/composer-bin-plugin": "^1.8"
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true,
+    "autoload": {
+        "psr-4": {
+            "Bartlett\\Sarif\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Bartlett\\Sarif\\Tests\\": "tests/"
+        }
+    },
+    "config": {
+        "allow-plugins": {
+            "bamarni/composer-bin-plugin": true
+        },
+        "optimize-autoloader": true,
+        "sort-packages": true
+    },
+    "extra": {
+        "bamarni-bin": {
+            "bin-links": true,
+            "forward-command": false,
+            "target-directory": "vendor-bin"
+        }
+    },
+    "scripts": {
+        "post-autoload-dump": [
+            "@composer bin captainhook-bin-plugin update",
+            "vendor/bin/captainhook install --configuration=captainhook.json --bootstrap=autoload.php --only-enabled"
+        ],
+        "bin": "echo 'bin not installed'"
+    }
+}

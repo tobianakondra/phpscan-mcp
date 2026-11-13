@@ -1,0 +1,26 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Internal\LanguageServer;
+
+/**
+ * Generates unique, incremental IDs for use as request IDs
+ *
+ * @internal
+ * @psalm-external-mutation-free
+ */
+final class IdGenerator
+{
+    public int $counter = 1;
+
+    /**
+     * Returns a unique ID
+     *
+     * @psalm-external-mutation-free
+     */
+    public function generate(): int
+    {
+        return $this->counter++;
+    }
+}

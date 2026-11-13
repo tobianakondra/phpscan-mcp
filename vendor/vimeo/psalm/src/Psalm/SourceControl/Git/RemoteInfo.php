@@ -1,0 +1,86 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\SourceControl\Git;
+
+/**
+ * Remote info.
+ *
+ * @author Kitamura Satoshi <with.no.parachute@gmail.com>
+ * @psalm-external-mutation-free
+ * @api
+ */
+final class RemoteInfo
+{
+    /**
+     * Remote name.
+     */
+    private ?string $name = null;
+
+    /**
+     * Remote URL.
+     */
+    private ?string $url = null;
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function toArray(): array
+    {
+        return [
+            'name' => $this->name,
+            'url' => $this->url,
+        ];
+    }
+
+    // accessor
+
+    /**
+     * Set remote name.
+     *
+     * @param string $name remote name
+     * @return $this
+     * @psalm-external-mutation-free
+     */
+    public function setName(string $name): RemoteInfo
+    {
+        $this->name = $name;
+
+        return $this;
+    }
+
+    /**
+     * Return remote name.
+     *
+     * @psalm-mutation-free
+     */
+    public function getName(): ?string
+    {
+        return $this->name;
+    }
+
+    /**
+     * Set remote URL.
+     *
+     * @param string $url remote URL
+     * @return $this
+     * @psalm-external-mutation-free
+     */
+    public function setUrl(string $url): RemoteInfo
+    {
+        $this->url = $url;
+
+        return $this;
+    }
+
+    /**
+     * Return remote URL.
+     *
+     * @psalm-mutation-free
+     */
+    public function getUrl(): ?string
+    {
+        return $this->url;
+    }
+}

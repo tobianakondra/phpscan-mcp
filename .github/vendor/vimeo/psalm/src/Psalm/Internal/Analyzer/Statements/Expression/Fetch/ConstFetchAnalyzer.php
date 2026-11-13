@@ -1,0 +1,495 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Internal\Analyzer\Statements\Expression\Fetch;
+
+use PhpParser;
+use Psalm\Aliases;
+use Psalm\CodeLocation;
+use Psalm\Codebase;
+use Psalm\Context;
+use Psalm\Internal\Analyzer\ClassLikeAnalyzer;
+use Psalm\Internal\Analyzer\NamespaceAnalyzer;
+use Psalm\Internal\Analyzer\Statements\Expression\SimpleTypeInferer;
+use Psalm\Internal\Analyzer\Statements\ExpressionAnalyzer;
+use Psalm\Internal\Analyzer\StatementsAnalyzer;
+use Psalm\Internal\Codebase\ConstantTypeResolver;
+use Psalm\Internal\DataFlow\DataFlowNode;
+use Psalm\Internal\Provider\NodeDataProvider;
+use Psalm\Internal\Scanner\UnresolvedConstantComponent;
+use Psalm\Issue\ForbiddenCode;
+use Psalm\Issue\UndefinedConstant;
+use Psalm\IssueBuffer;
+use Psalm\Plugin\EventHandler\Event\AddRemoveTaintsEvent;
+use Psalm\Type;
+use Psalm\Type\Union;
+use ReflectionProperty;
+
+use function array_key_exists;
+use function array_pop;
+use function explode;
+use function implode;
+use function in_array;
+use function preg_match;
+use function preg_quote;
+use function str_contains;
+use function str_replace;
+use function strtolower;
+
+/**
+ * @internal
+ */
+final class ConstFetchAnalyzer
+{
+    public static function analyze(
+        StatementsAnalyzer $statements_analyzer,
+        PhpParser\Node\Expr\ConstFetch $stmt,
+        Context $context,
+    ): void {
+        $const_name = $stmt->name->toString();
+
+        switch (strtolower($const_name)) {
+            case 'null':
+                $statements_analyzer->node_data->setType($stmt, Type::getNull());
+                break;
+
+            case 'false':
+                // false is a subtype of bool
+                $statements_analyzer->node_data->setType($stmt, Type::getFalse());
+                break;
+
+            case 'true':
+                $statements_analyzer->node_data->setType($stmt, Type::getTrue());
+                break;
+
+            case 'stdin':
+                // the STDIN stream (php://stdin) carries user-controlled input
+                $stdin_type = Type::getResource();
+                self::taintStdin($statements_analyzer, $stmt, $context, $stdin_type);
+                $statements_analyzer->node_data->setType($stmt, $stdin_type);
+                break;
+
+            default:
+                if (isset($statements_analyzer->getCodebase()->config->forbidden_constants[$const_name])) {
+                    IssueBuffer::maybeAdd(
+                        new ForbiddenCode(
+                            'You have forbidden the use of ' . $const_name,
+                            new CodeLocation($statements_analyzer->getSource(), $stmt),
+                        ),
+                        $statements_analyzer->getSuppressedIssues(),
+                    );
+        
+                    return;
+                }
+    
+                $const_type = self::getConstType(
+                    $statements_analyzer,
+                    $const_name,
+                    $stmt->name instanceof PhpParser\Node\Name\FullyQualified,
+                    $context,
+                );
+
+                // narrowed by a PHP_VERSION_ID comparison guarding this branch
+                if ($const_type !== null && $stmt->name->getParts() === ['PHP_VERSION_ID']) {
+                    $const_type = $context->vars_in_scope[Context::PHP_VERSION_ID_VAR_ID] ?? $const_type;
+                }
+
+                $codebase = $statements_analyzer->getCodebase();
+
+                $aliased_constants = $statements_analyzer->getAliases()->constants;
+                if (isset($aliased_constants[$const_name])) {
+                    $fq_const_name = $aliased_constants[$const_name];
+                } elseif ($stmt->name instanceof PhpParser\Node\Name\FullyQualified) {
+                    $fq_const_name = $const_name;
+                } else {
+                    $fq_const_name = Type::getFQCLNFromString($const_name, $statements_analyzer->getAliases());
+                }
+
+                $codebase->analyzer->addNodeReference(
+                    $statements_analyzer->getFilePath(),
+                    $stmt,
+                    $const_type
+                        ? $fq_const_name
+                        : '*'
+                            . ($stmt->name instanceof PhpParser\Node\Name\FullyQualified
+                                ? '\\'
+                                : $statements_analyzer->getNamespace() . '-')
+                            . $const_name,
+                );
+
+                if ($const_type) {
+                    $statements_analyzer->node_data->setType($stmt, $const_type);
+                } elseif ($context->check_consts) {
+                    IssueBuffer::maybeAdd(
+                        new UndefinedConstant(
+                            'Const ' . $const_name . ' is not defined'.
+                                ', consider enabling the allConstantsGlobal config option if scanning legacy codebases',
+                            new CodeLocation($statements_analyzer->getSource(), $stmt),
+                        ),
+                        $statements_analyzer->getSuppressedIssues(),
+                    );
+                }
+        }
+    }
+
+    /**
+     * The STDIN stream (php://stdin) yields user-controlled data, so reading from it
+     * is treated as a taint source.
+     */
+    private static function taintStdin(
+        StatementsAnalyzer $statements_analyzer,
+        PhpParser\Node\Expr\ConstFetch $stmt,
+        Context $context,
+        Union &$type,
+    ): void {
+        if (!$graph = $statements_analyzer->getTaintFlowGraphWithSuppressed()) {
+            return;
+        }
+
+        $codebase = $statements_analyzer->getCodebase();
+        $event = new AddRemoveTaintsEvent($stmt, $context, $statements_analyzer, $codebase);
+
+        $taints = $codebase->getInputTaints();
+        $taints |= $codebase->config->eventDispatcher->dispatchAddTaints($event);
+        $taints &= ~$codebase->config->eventDispatcher->dispatchRemoveTaints($event);
+
+        if ($taints === 0) {
+            return;
+        }
+
+        $location = new CodeLocation($statements_analyzer->getSource(), $stmt);
+
+        $source = DataFlowNode::getForTaint('STDIN', $location, $taints);
+        $graph->addSource($source);
+
+        $type = $type->setParentNodes([$source->id => $source]);
+    }
+
+    public static function getGlobalConstType(
+        Codebase $codebase,
+        string $fq_const_name,
+        string $const_name,
+    ): ?Union {
+        if ($const_name === 'STDERR'
+            || $const_name === 'STDOUT'
+            || $const_name === 'STDIN'
+        ) {
+            return Type::getResource();
+        }
+
+        if ($fq_const_name) {
+            $stubbed_const_type = $codebase->getStubbedConstantType(
+                $fq_const_name,
+            );
+
+            if ($stubbed_const_type) {
+                return $stubbed_const_type;
+            }
+        }
+
+        $stubbed_const_type = $codebase->getStubbedConstantType(
+            $const_name,
+        );
+
+        if ($stubbed_const_type) {
+            return $stubbed_const_type;
+        }
+
+        $predefined_constants = $codebase->config->getPredefinedConstants();
+
+        if (($fq_const_name && array_key_exists($fq_const_name, $predefined_constants))
+            || array_key_exists($const_name, $predefined_constants)
+        ) {
+            switch ($const_name) {
+                case 'DIRECTORY_SEPARATOR':
+                case 'PATH_SEPARATOR':
+                case 'PHP_EOL':
+                    return Type::getSingleLetter();
+
+                case 'PHP_VERSION':
+                    return Type::getNonEmptyString();
+
+                case 'PEAR_EXTENSION_DIR':
+                case 'PEAR_INSTALL_DIR':
+                case 'PHP_BINARY':
+                case 'PHP_BINDIR':
+                case 'PHP_CONFIG_FILE_PATH':
+                case 'PHP_CONFIG_FILE_SCAN_DIR':
+                case 'PHP_DATADIR':
+                case 'PHP_EXTENSION_DIR':
+                case 'PHP_EXTRA_VERSION':
+                case 'PHP_LIBDIR':
+                case 'PHP_LOCALSTATEDIR':
+                case 'PHP_MANDIR':
+                case 'PHP_OS':
+                case 'PHP_OS_FAMILY':
+                case 'PHP_PREFIX':
+                case 'PHP_SAPI':
+                case 'PHP_SYSCONFDIR':
+                    return Type::getString();
+
+                case 'PHP_MAJOR_VERSION':
+                case 'PHP_MINOR_VERSION':
+                case 'PHP_RELEASE_VERSION':
+                case 'PHP_DEBUG':
+                case 'PHP_FLOAT_DIG':
+                case 'PHP_INT_MIN':
+                case 'PHP_ZTS':
+                    return Type::getInt();
+
+                case 'PHP_INT_MAX':
+                case 'PHP_INT_SIZE':
+                case 'PHP_MAXPATHLEN':
+                case 'PHP_VERSION_ID':
+                    return Type::getIntRange(1, null);
+
+                case 'PHP_FLOAT_EPSILON':
+                case 'PHP_FLOAT_MAX':
+                case 'PHP_FLOAT_MIN':
+                    return Type::getFloat();
+            }
+
+            if ($fq_const_name && array_key_exists($fq_const_name, $predefined_constants)) {
+                return ClassLikeAnalyzer::getTypeFromValue($predefined_constants[$fq_const_name]);
+            }
+
+            return ClassLikeAnalyzer::getTypeFromValue($predefined_constants[$const_name]);
+        }
+
+        return null;
+    }
+
+    /**
+     * The types of the global constants whose names match a wildcard (`PHP_URL_*`), by name
+     *
+     * @return array<string, Union>
+     */
+    public static function getGlobalConstTypesByWildcard(Codebase $codebase, string $pattern): array
+    {
+        return $codebase->global_constant_types_by_wildcard[$pattern]
+            ??= self::findGlobalConstTypesByWildcard($codebase, $pattern);
+    }
+
+    /**
+     * @return array<string, Union>
+     */
+    private static function findGlobalConstTypesByWildcard(Codebase $codebase, string $pattern): array
+    {
+        $regex = '/^' . str_replace('\\*', '.*', preg_quote($pattern, '/')) . '$/';
+        $types = [];
+
+        foreach ($codebase->file_storage_provider->getAll() as $file_storage) {
+            foreach ($file_storage->constants as $const_name => $const_type) {
+                if (preg_match($regex, $const_name) === 1) {
+                    $types[$const_name] = isset($file_storage->unresolved_constants[$const_name])
+                        ? new Union([ConstantTypeResolver::resolve(
+                            $codebase->classlikes,
+                            $file_storage->unresolved_constants[$const_name],
+                        )])
+                        : $const_type;
+                }
+            }
+        }
+
+        foreach ($codebase->getAllStubbedConstants() as $const_name => $const_type) {
+            if (!isset($types[$const_name]) && preg_match($regex, $const_name) === 1) {
+                $unresolved = $codebase->getUnresolvedGlobalConstant($const_name);
+
+                $types[$const_name] = $unresolved !== null
+                    ? new Union([ConstantTypeResolver::resolve($codebase->classlikes, $unresolved)])
+                    : $const_type;
+            }
+        }
+
+        foreach ($codebase->config->getPredefinedConstants() as $const_name => $_) {
+            if (!isset($types[$const_name]) && preg_match($regex, $const_name) === 1) {
+                $types[$const_name] = self::getGlobalConstType($codebase, $const_name, $const_name)
+                    ?? Type::getMixed();
+            }
+        }
+
+        return $types;
+    }
+
+    public static function getConstType(
+        StatementsAnalyzer $statements_analyzer,
+        string $const_name,
+        bool $is_fully_qualified,
+        ?Context $context,
+    ): ?Union {
+        $aliased_constants = $statements_analyzer->getAliases()->constants;
+        $is_unqualified = !$is_fully_qualified && !str_contains($const_name, '\\');
+
+        if (isset($aliased_constants[$const_name])) {
+            $fq_const_name = $aliased_constants[$const_name];
+        } elseif ($is_fully_qualified) {
+            $fq_const_name = $const_name;
+        } else {
+            $fq_const_name = Type::getFQCLNFromString($const_name, $statements_analyzer->getAliases());
+        }
+
+        if ($fq_const_name) {
+            $const_name_parts = explode('\\', $fq_const_name);
+            $const_name = array_pop($const_name_parts);
+            $namespace_name = implode('\\', $const_name_parts);
+            $namespace_constants = NamespaceAnalyzer::getConstantsForNamespace(
+                $namespace_name,
+                ReflectionProperty::IS_PUBLIC,
+            );
+
+            if (isset($namespace_constants[$const_name])) {
+                return $namespace_constants[$const_name];
+            }
+        }
+
+        if ($context && $context->hasVariable($fq_const_name)) {
+            return $context->vars_in_scope[$fq_const_name];
+        }
+
+        // an unqualified constant of a namespace is the constant of the global namespace where the namespace has none,
+        // which is what `defined('X')` was told about
+        if ($context && $is_unqualified && $context->hasVariable($const_name)) {
+            return $context->vars_in_scope[$const_name];
+        }
+
+        $file_path = $statements_analyzer->getRootFilePath();
+        $codebase = $statements_analyzer->getCodebase();
+
+        $file_storage_provider = $codebase->file_storage_provider;
+
+        $file_storage = $file_storage_provider->get($file_path);
+
+        foreach ([$const_name, $fq_const_name] as $name) {
+            if (isset($file_storage->declaring_constants[$name])) {
+                $constant_storage = $file_storage_provider->get($file_storage->declaring_constants[$name]);
+
+                if (isset($constant_storage->unresolved_constants[$name])) {
+                    return self::resolveConstType($statements_analyzer, $constant_storage->unresolved_constants[$name]);
+                }
+
+                return $constant_storage->constants[$name];
+            }
+        }
+
+        foreach ([$fq_const_name, $const_name] as $name) {
+            $unresolved = $codebase->getUnresolvedGlobalConstant($name);
+
+            if ($unresolved !== null) {
+                return self::resolveConstType($statements_analyzer, $unresolved);
+            }
+        }
+
+        return self::getGlobalConstType($codebase, $fq_const_name, $const_name)
+            ?? self::getGlobalConstType($codebase, $const_name, $const_name);
+    }
+
+    /**
+     * The id under which `defined()` records a constant without a declaration, so that a check of it
+     * (`defined('X') && is_string(X)`) narrows it; declared constants have their own type and no id
+     */
+    public static function getUndeclaredConstVarId(
+        PhpParser\Node\Expr\ConstFetch $stmt,
+        StatementsAnalyzer $statements_analyzer,
+    ): ?string {
+        if (!$stmt->name->isUnqualified() && !$stmt->name->isFullyQualified()) {
+            return null;
+        }
+
+        $const_name = $stmt->name->toString();
+
+        if (in_array(strtolower($const_name), ['true', 'false', 'null'], true)
+            || self::getConstType(
+                $statements_analyzer,
+                $const_name,
+                $stmt->name->isFullyQualified(),
+                null,
+            ) !== null
+        ) {
+            return null;
+        }
+
+        return $const_name;
+    }
+
+    /**
+     * @psalm-pure
+     */
+    public static function isConstVarId(string $var_id): bool
+    {
+        return $var_id !== Context::PHP_VERSION_ID_VAR_ID
+            && preg_match('/^[a-zA-Z_\x80-\xff][\w\x80-\xff]*(\\\\[a-zA-Z_\x80-\xff][\w\x80-\xff]*)*$/', $var_id) === 1;
+    }
+
+    /**
+     * The type of the value of a constant depending on classes, e.g. an enum case, known once they are
+     */
+    private static function resolveConstType(
+        StatementsAnalyzer $statements_analyzer,
+        UnresolvedConstantComponent $value,
+    ): Union {
+        return new Union([ConstantTypeResolver::resolve(
+            $statements_analyzer->getCodebase()->classlikes,
+            $value,
+            $statements_analyzer,
+        )]);
+    }
+
+    public static function setConstType(
+        StatementsAnalyzer $statements_analyzer,
+        string $const_name,
+        Union $const_type,
+        Context $context,
+    ): void {
+        $context->vars_in_scope[$const_name] = $const_type;
+        $context->constants[$const_name] = $const_type;
+
+        $source = $statements_analyzer->getSource();
+
+        if ($source instanceof NamespaceAnalyzer) {
+            $source->setConstType($const_name, $const_type);
+        }
+    }
+
+    public static function getConstName(
+        PhpParser\Node\Expr $first_arg_value,
+        NodeDataProvider $type_provider,
+        Codebase $codebase,
+        Aliases $aliases,
+    ): ?string {
+        $const_name = null;
+
+        if ($first_arg_value instanceof PhpParser\Node\Scalar\String_) {
+            $const_name = $first_arg_value->value;
+        } elseif ($first_arg_type = $type_provider->getType($first_arg_value)) {
+            if ($first_arg_type->isSingleStringLiteral()) {
+                $const_name = $first_arg_type->getSingleStringLiteral()->value;
+            }
+        } else {
+            $simple_type = SimpleTypeInferer::infer($codebase, $type_provider, $first_arg_value, $aliases);
+
+            if ($simple_type && $simple_type->isSingleStringLiteral()) {
+                $const_name = $simple_type->getSingleStringLiteral()->value;
+            }
+        }
+
+        return $const_name;
+    }
+
+    public static function analyzeConstAssignment(
+        StatementsAnalyzer $statements_analyzer,
+        PhpParser\Node\Stmt\Const_ $stmt,
+        Context $context,
+    ): void {
+        foreach ($stmt->consts as $const) {
+            ExpressionAnalyzer::analyze($statements_analyzer, $const->value, $context);
+
+            self::setConstType(
+                $statements_analyzer,
+                $const->name->name,
+                $statements_analyzer->node_data->getType($const->value) ?? Type::getMixed(),
+                $context,
+            );
+        }
+    }
+}

@@ -1,0 +1,51 @@
+<?php declare(strict_types=1);
+/**
+ * This file is part of the Sarif-PHP-SDK package.
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+namespace Bartlett\Sarif\Definition;
+
+use JsonSerializable;
+
+use stdClass;
+
+/**
+ * Key/value pairs that provide additional information about the object.
+ *
+ * @author Laurent Laville
+ * @since Release 1.0.0
+ */
+final class PropertyBag implements JsonSerializable
+{
+    /**
+     * A set of distinct strings that provide additional information.
+     * @var array<string, mixed>
+     */
+    private array $tags = [];
+
+    /**
+     * @param array<string, mixed> $properties
+     */
+    public function addProperties(array $properties): void
+    {
+        $this->tags = $properties;
+    }
+
+    /**
+     * @param mixed $value
+     */
+    public function addProperty(string $key, $value): void
+    {
+        $this->tags[$key] = $value;
+    }
+
+    /**
+     * @return stdClass
+     */
+    public function jsonSerialize(): stdClass
+    {
+        return (object) $this->tags;
+    }
+}

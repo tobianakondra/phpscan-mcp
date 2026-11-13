@@ -1,0 +1,672 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Internal\Codebase;
+
+use PhpParser;
+use Psalm\Codebase;
+use Psalm\Internal\Analyzer\ProjectAnalyzer;
+use Psalm\Internal\Provider\NodeDataProvider;
+use Psalm\Internal\Type\Comparator\TypeComparisonResult;
+use Psalm\Internal\Type\Comparator\UnionTypeComparator;
+use Psalm\NodeTypeProvider;
+use Psalm\Storage\FunctionLikeParameter;
+use Psalm\Storage\FunctionLikeStorage;
+use Psalm\Type;
+use Psalm\Type\Atomic\TArray;
+use Psalm\Type\Atomic\TCallable;
+use Psalm\Type\Atomic\TKeyedArray;
+use Psalm\Type\TaintKind;
+use Psalm\Type\Union;
+use ReflectionClass;
+use ReflectionException;
+use ReflectionFunction;
+use UnexpectedValueException;
+
+use function array_fill_keys;
+use function array_keys;
+use function assert;
+use function class_exists;
+use function count;
+use function dirname;
+use function explode;
+use function file_exists;
+use function function_exists;
+use function intdiv;
+use function interface_exists;
+use function is_int;
+use function is_string;
+use function max;
+use function min;
+use function str_contains;
+use function str_ends_with;
+use function str_starts_with;
+use function strpos;
+use function strtolower;
+use function substr;
+
+use const PHP_VERSION;
+
+/**
+ * @internal
+ *
+ * Gets values from the call map array, which stores data about native functions and methods
+ */
+final class InternalCallMapHandler
+{
+    private const MIN_CALLMAP_VERSION = 70;
+    private const MAX_CALLMAP_VERSION = 86;
+
+    /** see keepsStateBetweenCalls() */
+    private const STATEFUL_FUNCTIONS = ['strtok' => true, 'inflate_add' => true];
+
+    private static ?int $loaded_php_major_version = null;
+    private static ?int $loaded_php_minor_version = null;
+
+    /**
+     * @var non-empty-array<lowercase-string, array<int|string,string>>|null
+     */
+    private static ?array $call_map = null;
+
+    /**
+     * @var array<string, non-empty-list<TCallable>>|null
+     */
+    private static ?array $call_map_callables = [];
+
+    /**
+     * @var non-empty-array<string, non-empty-list<int>>|null
+     */
+    private static ?array $taint_sink_map = null;
+
+    /**
+     * @var array<lowercase-string, array<int|non-empty-string, non-empty-string>>|null
+     */
+    private static ?array $taint_flow_map = null;
+
+    /**
+     * @var array<lowercase-string, non-empty-list<non-empty-string>>|null
+     */
+    private static ?array $taint_store_map = null;
+
+    /**
+     * @var array<lowercase-string, non-empty-list<key-of<TaintKind::TAINT_NAMES>>>|null
+     */
+    private static ?array $taint_escape_map = null;
+
+    /**
+     * The callmap version (e.g. 80) each function/method first appears in, across all callmaps.
+     *
+     * @var ?array<lowercase-string, int>
+     */
+    private static ?array $first_callmap_versions = null;
+
+    /**
+     * @param  list<PhpParser\Node\Arg>   $args
+     */
+    public static function getCallableFromCallMapById(
+        Codebase $codebase,
+        string $method_id,
+        array $args,
+        ?NodeDataProvider $nodes,
+    ): TCallable {
+        $possible_callables = self::getCallablesFromCallMap($method_id);
+
+        if ($possible_callables === null) {
+            throw new UnexpectedValueException(
+                'Not expecting $function_param_options to be null for ' . $method_id,
+            );
+        }
+
+        return self::getMatchingCallableFromCallMapOptions(
+            $codebase,
+            $possible_callables,
+            $args,
+            $nodes,
+            $method_id,
+        );
+    }
+
+    /**
+     * @param  non-empty-list<TCallable>  $callables
+     * @param  list<PhpParser\Node\Arg>                 $args
+     */
+    public static function getMatchingCallableFromCallMapOptions(
+        Codebase $codebase,
+        array $callables,
+        array $args,
+        ?NodeTypeProvider $nodes,
+        string $method_id,
+    ): TCallable {
+        if (count($callables) === 1) {
+            return $callables[0];
+        }
+
+        $matching_param_count_callable = null;
+        $matching_coerced_param_count_callable = null;
+
+        foreach ($callables as $possible_callable) {
+            $possible_function_params = $possible_callable->params;
+
+            assert($possible_function_params !== null);
+
+            $all_args_match = true;
+            $type_coerced = false;
+
+            $last_param = count($possible_function_params)
+                ? $possible_function_params[count($possible_function_params) - 1]
+                : null;
+
+            $mandatory_param_count = count($possible_function_params);
+
+            foreach ($possible_function_params as $i => $possible_function_param) {
+                if ($possible_function_param->is_optional) {
+                    $mandatory_param_count = $i;
+                    break;
+                }
+            }
+
+            if ($mandatory_param_count > count($args) && !($last_param && $last_param->is_variadic)) {
+                continue;
+            }
+
+            foreach ($args as $argument_offset => $arg) {
+                if ($arg->name !== null) {
+                    // a named argument is matched with the parameter of that name
+                    $function_param = null;
+
+                    foreach ($possible_function_params as $candidate_param) {
+                        if ($candidate_param->name === $arg->name->name) {
+                            $function_param = $candidate_param;
+                            break;
+                        }
+                    }
+
+                    // a variadic parameter of a builtin doesn't take unknown named arguments
+                    if ($function_param === null) {
+                        $all_args_match = false;
+                        break;
+                    }
+                } elseif ($argument_offset >= count($possible_function_params)) {
+                    if (!$last_param || !$last_param->is_variadic) {
+                        $all_args_match = false;
+                        break;
+                    }
+
+                    $function_param = $last_param;
+                } else {
+                    $function_param = $possible_function_params[$argument_offset];
+                }
+
+                $param_type = $function_param->type;
+
+                if (!$param_type) {
+                    continue;
+                }
+
+                if (!$nodes
+                    || !($arg_type = $nodes->getType($arg->value))
+                ) {
+                    continue;
+                }
+
+                if ($arg_type->hasMixed()) {
+                    continue;
+                }
+
+                if ($arg->unpack && !$function_param->is_variadic) {
+                    if ($arg_type->hasArray()) {
+                        /**
+                         * @var TArray|TKeyedArray
+                         */
+                        $array_atomic_type = $arg_type->getArray();
+
+                        if ($array_atomic_type instanceof TKeyedArray) {
+                            $arg_type = $array_atomic_type->getGenericValueType();
+                        } else {
+                            $arg_type = $array_atomic_type->type_params[1];
+                        }
+                    }
+                }
+
+                $arg_result = new TypeComparisonResult();
+
+                if (UnionTypeComparator::isContainedBy(
+                    $codebase,
+                    $arg_type,
+                    $param_type,
+                    true,
+                    true,
+                    $arg_result,
+                ) || $arg_result->type_coerced) {
+                    if ($arg_result->type_coerced) {
+                        $type_coerced = true;
+                    }
+
+                    continue;
+                }
+
+                $all_args_match = false;
+                break;
+            }
+
+            if (count($args) === count($possible_function_params)) {
+                $matching_param_count_callable = $possible_callable;
+            }
+
+            if ($all_args_match && (!$type_coerced || $method_id === 'max' || $method_id === 'min')) {
+                return $possible_callable;
+            }
+
+            if ($all_args_match) {
+                $matching_coerced_param_count_callable = $possible_callable;
+            }
+        }
+
+        if ($matching_coerced_param_count_callable) {
+            return $matching_coerced_param_count_callable;
+        }
+
+        if ($matching_param_count_callable) {
+            return $matching_param_count_callable;
+        }
+
+        // if we don't succeed in finding a match, set to the first possible and wait for issues below
+        return $callables[0];
+    }
+
+    /**
+     * @return non-empty-list<TCallable>|null
+     */
+    public static function getCallablesFromCallMap(string $function_id): ?array
+    {
+        $call_map_key = strtolower($function_id);
+
+        $call_map = self::getCallMap();
+
+        if (isset(self::$call_map_callables[$call_map_key])) {
+            return self::$call_map_callables[$call_map_key];
+        }
+
+        if (!isset($call_map[$call_map_key])) {
+            return null;
+        }
+
+        $call_map_functions = [];
+        $call_map_functions[] = $call_map[$call_map_key];
+
+        for ($i = 1; $i < 10; ++$i) {
+            if (!isset($call_map[$call_map_key . '\'' . $i])) {
+                break;
+            }
+
+            $call_map_functions[] = $call_map[$call_map_key . '\'' . $i];
+        }
+
+        $possible_callables = [];
+
+        foreach ($call_map_functions as $call_map_function_args) {
+            assert(isset($call_map_function_args[0]) || isset($call_map_function_args[-1]));
+            $return_type = Type::parseString($call_map_function_args[0] ?? $call_map_function_args[-1]);
+            unset($call_map_function_args[0], $call_map_function_args[-1], $call_map_function_args[-2]);
+
+            $function_params = [];
+
+            $arg_offset = 0;
+
+            /** @var array<string, string> $call_map_function_args */
+            foreach ($call_map_function_args as $arg_name => $arg_type) {
+                $by_reference = false;
+                $optional = false;
+                $variadic = false;
+
+                if ($arg_name[0] === '&') {
+                    $arg_name = substr($arg_name, 1);
+                    $by_reference = true;
+                }
+
+                if (str_ends_with($arg_name, '=')) {
+                    $arg_name = substr($arg_name, 0, -1);
+                    $optional = true;
+                }
+
+                if (str_starts_with($arg_name, '...')) {
+                    $arg_name = substr($arg_name, 3);
+                    $variadic = true;
+                }
+
+                $param_type = Type::parseString($arg_type);
+
+                $out_type = null;
+
+                if ($by_reference && false !== $p = strpos($arg_name, ' ')) {
+                    $refType = substr($arg_name, 0, $p);
+                    $arg_name = substr($arg_name, $p + 1);
+                    if ($refType === 'w') {
+                        $out_type = $param_type;
+                        $param_type = Type::getMixed();
+                    }
+                }
+
+                $function_param = new FunctionLikeParameter(
+                    $arg_name,
+                    $by_reference,
+                    $param_type,
+                    $param_type,
+                    null,
+                    null,
+                    $optional,
+                    false,
+                    $variadic,
+                );
+
+                if ($out_type) {
+                    $function_param->out_type = $out_type;
+                }
+
+                if ($arg_name === 'haystack') {
+                    $function_param->expect_variable = true;
+                }
+
+                if (isset(self::$taint_sink_map[$call_map_key][$arg_offset])) {
+                    $function_param->sinks = self::$taint_sink_map[$call_map_key][$arg_offset];
+                }
+
+                $function_param->signature_type = null;
+
+                $function_params[] = $function_param;
+
+                $arg_offset++;
+            }
+
+            $possible_callables[] = new TCallable($function_params, $return_type);
+        }
+
+        self::$call_map_callables[$call_map_key] = $possible_callables;
+
+        return $possible_callables;
+    }
+
+    /**
+     * Gets the method/function call map
+     *
+     * Entries retain their compact disk format: [0] ?? [-1] is the analysis return type.
+     * [-1] is the signature; [-2] marks tentative signatures or confirmed absence.
+     * Only string keys describe parameters.
+     *
+     * @return non-empty-array<string, array<int|string, string>>
+     * @psalm-assert !null self::$taint_sink_map
+     * @psalm-assert !null self::$call_map
+     * @psalm-suppress UnresolvableInclude
+     * @psalm-external-mutation-free
+     */
+    public static function getCallMap(): array
+    {
+        $codebase = ProjectAnalyzer::getInstance()->getCodebase();
+        $analyzer_major_version = $codebase->getMajorAnalysisPhpVersion();
+        $analyzer_minor_version = $codebase->getMinorAnalysisPhpVersion();
+
+        if (self::$call_map !== null
+            && $analyzer_major_version === self::$loaded_php_major_version
+            && $analyzer_minor_version === self::$loaded_php_minor_version
+        ) {
+            return self::$call_map;
+        }
+
+        $analyzer_version_int = min(
+            self::MAX_CALLMAP_VERSION,
+            max(
+                self::MIN_CALLMAP_VERSION,
+                (int) ($analyzer_major_version . $analyzer_minor_version),
+            ),
+        );
+
+        /** @var non-empty-array<lowercase-string, array<int|string, string>> */
+        $call_map = require(dirname(__DIR__, 4) . "/dictionaries/CallMap_$analyzer_version_int.php");
+
+        self::$call_map = $call_map;
+        // the callables of the CallMap of another version
+        self::$call_map_callables = [];
+
+        assert(!empty(self::$call_map));
+
+        self::$loaded_php_major_version = $analyzer_major_version;
+        self::$loaded_php_minor_version = $analyzer_minor_version;
+
+        /**
+         * @var non-empty-array<string, non-empty-list<int>>
+         */
+        $taint_map_data = require(dirname(__DIR__, 4) . '/dictionaries/InternalTaintSinkMap.php');
+
+        $taint_map = [];
+        foreach ($taint_map_data as $key => $value) {
+            $cased_key = strtolower($key);
+            $taint_map[$cased_key] = $value;
+        }
+
+        self::$taint_sink_map = $taint_map;
+
+        return self::$call_map;
+    }
+
+    /** The reflected native or tentative return type, independent of analysis overrides. */
+    public static function getSignatureReturnType(string $method_id): ?Union
+    {
+        $entry = self::getCallMap()[strtolower($method_id)] ?? null;
+        return isset($entry[-1]) ? Type::parseString($entry[-1]) : null;
+    }
+
+    /**
+     * @return 'native'|'tentative'|'none'|null
+     * @psalm-capabilities read-props|write-this-props|write-refs
+     */
+    public static function getReturnTypeKind(string $method_id): ?string
+    {
+        $entry = self::getCallMap()[strtolower($method_id)] ?? null;
+        if (isset($entry[-2])) {
+            return match ($entry[-2]) {
+                'tentative' => 'tentative',
+                'none' => 'none',
+                default => throw new UnexpectedValueException('Invalid return type kind for ' . $method_id),
+            };
+        }
+
+        return isset($entry[-1]) ? 'native' : null;
+    }
+
+    /**
+     * Makes the taints of the parameters of the builtin function or method $function_id that its return value holds
+     * flow into it (see dictionaries/InternalTaintFlowMap.php), except those it can't carry (see
+     * dictionaries/InternalTaintEscapeMap.php), as `@psalm-flow` and `@psalm-taint-escape` do for the builtins of the
+     * stubs.
+     */
+    public static function addReturnTaintFlows(FunctionLikeStorage $storage, string $function_id): void
+    {
+        foreach (self::getReturnTaintFlows($function_id, $storage->params) as $offset => $path_type) {
+            $storage->return_source_params[$offset] = $path_type;
+        }
+
+        self::addTaintStoreFlows($storage, $function_id);
+
+        $storage->removed_taints |= self::getReturnRemovedTaints($function_id);
+    }
+
+    /**
+     * Makes the builtin function or method $function_id write into the keyed stores or read from them as
+     * dictionaries/InternalTaintStoreMap.php says (see TaintStore)
+     *
+     * @return bool whether it does
+     */
+    public static function addTaintStoreFlows(FunctionLikeStorage $storage, string $function_id): bool
+    {
+        if (self::$taint_store_map === null) {
+            /** @var array<lowercase-string, non-empty-list<non-empty-string>> */
+            self::$taint_store_map = require(dirname(__DIR__, 4) . '/dictionaries/InternalTaintStoreMap.php');
+        }
+
+        $flows = self::$taint_store_map[strtolower($function_id)] ?? [];
+        foreach ($flows as $flow) {
+            $parsed_flow = TaintFlowAnnotation::parse($flow);
+            if (is_string($parsed_flow)) {
+                throw new UnexpectedValueException($parsed_flow . ' in the keyed store flows of ' . $function_id);
+            }
+
+            TaintStore::addFlow($storage, $parsed_flow);
+        }
+
+        return $flows !== [];
+    }
+
+    /**
+     * Whether the calls of the builtin function $function_id can return data given to its other calls: strtok() goes
+     * on through the string it was given last, inflate_add() through the data given with the same context.
+     *
+     * @psalm-pure
+     */
+    public static function keepsStateBetweenCalls(string $function_id): bool
+    {
+        return isset(self::STATEFUL_FUNCTIONS[strtolower($function_id)]);
+    }
+
+    /**
+     * The offsets, among $params, of the parameters of the builtin function or method $function_id whose taints
+     * flow into its return value => the type of the path they flow through (see dictionaries/InternalTaintFlowMap.php)
+     *
+     * @param array<int, FunctionLikeParameter> $params
+     * @return array<int, string>
+     * @psalm-capabilities read-props|read-globals|write-globals
+     */
+    public static function getReturnTaintFlows(string $function_id, array $params): array
+    {
+        if (self::$taint_flow_map === null) {
+            /** @var array<lowercase-string, array<int|non-empty-string, non-empty-string>> */
+            self::$taint_flow_map = require(dirname(__DIR__, 4) . '/dictionaries/InternalTaintFlowMap.php');
+        }
+
+        $flows = [];
+        foreach (self::$taint_flow_map[strtolower($function_id)] ?? [] as $key => $value) {
+            // a parameter flows as an argument, or through the path its entry names
+            [$param_name, $path_type] = is_int($key) ? [$value, 'arg'] : [$key, $value];
+
+            foreach ($params as $offset => $param) {
+                if ($param->name === $param_name) {
+                    $flows[$offset] = $path_type;
+                }
+            }
+        }
+
+        return $flows;
+    }
+
+    /**
+     * The taints the value the builtin function or method $function_id returns can't carry (see
+     * dictionaries/InternalTaintEscapeMap.php).
+     *
+     * @psalm-capabilities read-props|read-globals|write-globals
+     */
+    public static function getReturnRemovedTaints(string $function_id): int
+    {
+        if (self::$taint_escape_map === null) {
+            /** @var array<lowercase-string, non-empty-list<key-of<TaintKind::TAINT_NAMES>>> */
+            self::$taint_escape_map = require(dirname(__DIR__, 4) . '/dictionaries/InternalTaintEscapeMap.php');
+        }
+
+        $removed_taints = 0;
+        foreach (self::$taint_escape_map[strtolower($function_id)] ?? [] as $taint) {
+            $removed_taints |= TaintKind::TAINT_NAMES[$taint];
+        }
+
+        return $removed_taints;
+    }
+
+    /**
+     * The taints the parameter at $offset of the builtin function or method $function_id must not be given
+     * (see dictionaries/InternalTaintSinkMap.php).
+     *
+     * @psalm-capabilities read-props|write-this-props|write-refs|read-globals
+     */
+    public static function getParamTaintSinks(string $function_id, int $offset): int
+    {
+        self::getCallMap();
+
+        return self::$taint_sink_map[strtolower($function_id)][$offset] ?? 0;
+    }
+
+    /**
+     * @psalm-external-mutation-free
+     */
+    public static function inCallMap(string $key): bool
+    {
+        return isset(self::getCallMap()[strtolower($key)]);
+    }
+
+    /**
+     * The `analysis_php_version_id` that introduced a native function or method (`class::method`)
+     * which is missing from the callmap of the analysed version, or null when it is available there
+     * or its introduction cannot be dated.
+     *
+     * The callmaps are versioned, so the version is the first callmap the key appears in. Only
+     * symbols of extensions bundled with PHP are dated: the callmaps are generated with PECL
+     * extensions (swoole, redis, mongodb, ...) whose versions are unrelated to the PHP version.
+     * Such symbols are only reachable through the runtime's reflection, which tells a bundled
+     * extension apart by its version matching PHP's own.
+     */
+    public static function getIntroducingPhpVersionId(string $key): ?int
+    {
+        $key = strtolower($key);
+
+        if (isset(self::getCallMap()[$key]) || !self::isBundledWithPhp($key)) {
+            return null;
+        }
+
+        if (self::$first_callmap_versions === null) {
+            self::$first_callmap_versions = [];
+            for ($version = self::MIN_CALLMAP_VERSION; $version <= self::MAX_CALLMAP_VERSION; ++$version) {
+                $file = dirname(__DIR__, 4) . "/dictionaries/CallMap_$version.php";
+                if (!file_exists($file)) { // e.g. 75 to 79
+                    continue;
+                }
+
+                /** @var array<lowercase-string, mixed> */
+                $call_map = require($file);
+                self::$first_callmap_versions += array_fill_keys(array_keys($call_map), $version);
+            }
+        }
+
+        $version = self::$first_callmap_versions[$key] ?? null;
+
+        // a key already in the oldest callmap predates the callmaps and cannot be dated
+        if ($version === null || $version <= self::MIN_CALLMAP_VERSION) {
+            return null;
+        }
+
+        $php_version_id = intdiv($version, 10) * 10_000 + ($version % 10) * 100;
+
+        return ProjectAnalyzer::getInstance()->getCodebase()->analysis_php_version_id < $php_version_id
+            ? $php_version_id
+            : null;
+    }
+
+    private static function isBundledWithPhp(string $key): bool
+    {
+        try {
+            if (str_contains($key, '::')) {
+                $class = explode('::', $key)[0];
+                // don't autoload (and so run) project code
+                if (!class_exists($class, false) && !interface_exists($class, false)) {
+                    return false;
+                }
+                $extension = (new ReflectionClass($class))->getExtension();
+            } else {
+                if (!function_exists($key)) {
+                    return false;
+                }
+                $extension = (new ReflectionFunction($key))->getExtension();
+            }
+        } catch (ReflectionException) {
+            return false;
+        }
+
+        return $extension !== null && $extension->getVersion() === PHP_VERSION;
+    }
+}

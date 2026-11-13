@@ -1,0 +1,1938 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Internal\Codebase;
+
+use BackedEnum;
+use InvalidArgumentException;
+use Psalm\Internal\Analyzer\ClassLikeAnalyzer;
+use Psalm\Internal\MethodIdentifier;
+use Psalm\Internal\PhpVisitor\Reflector\FunctionLikeDocblockScanner;
+use Psalm\Internal\Provider\ClassLikeStorageProvider;
+use Psalm\Internal\Provider\FileReferenceProvider;
+use Psalm\Internal\Provider\FileStorageProvider;
+use Psalm\Internal\Type\IterationPurity;
+use Psalm\Internal\Type\PurityArguments;
+use Psalm\Internal\Type\TemplateDefaults;
+use Psalm\Internal\Type\TypeAlias\ClassTypeAlias;
+use Psalm\Issue\CircularReference;
+use Psalm\Issue\UndefinedTrait;
+use Psalm\IssueBuffer;
+use Psalm\Progress\Progress;
+use Psalm\Storage\Capabilities;
+use Psalm\Storage\ClassConstantStorage;
+use Psalm\Storage\ClassLikeStorage;
+use Psalm\Storage\FileStorage;
+use Psalm\Storage\FunctionLikeStorage;
+use Psalm\Storage\MethodStorage;
+use Psalm\Storage\PropertyStorage;
+use Psalm\Type\Atomic;
+use Psalm\Type\Atomic\TCapabilities;
+use Psalm\Type\Atomic\TGenericObject;
+use Psalm\Type\Atomic\TInt;
+use Psalm\Type\Atomic\TNamedObject;
+use Psalm\Type\Atomic\TNonEmptyString;
+use Psalm\Type\Atomic\TString;
+use Psalm\Type\Atomic\TTemplateParam;
+use Psalm\Type\Atomic\TTypeAlias;
+use Psalm\Type\Union;
+use UnitEnum;
+
+use function array_filter;
+use function array_flip;
+use function array_intersect_key;
+use function array_keys;
+use function array_merge;
+use function array_search;
+use function array_shift;
+use function array_splice;
+use function count;
+use function in_array;
+use function key;
+use function krsort;
+use function reset;
+use function strpos;
+use function strtolower;
+
+/**
+ * @internal
+ *
+ * Populates file and class information so that analysis can work properly
+ * @psalm-import-type CapabilitySet from Capabilities
+ */
+final class Populator
+{
+    /**
+     * The classes whose Traversable purity template has been bound (see bindIterationPurity)
+     *
+     * @var array<string, true>
+     */
+    private array $iteration_purity_bound = [];
+
+    /**
+     * @var array<lowercase-string, list<ClassLikeStorage>>
+     */
+    private array $invalid_class_storages = [];
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function __construct(
+        private readonly ClassLikeStorageProvider $classlike_storage_provider,
+        private readonly FileStorageProvider $file_storage_provider,
+        private readonly ClassLikes $classlikes,
+        private readonly FileReferenceProvider $file_reference_provider,
+        private readonly Progress $progress,
+    ) {
+    }
+
+    public function populateCodebase(): void
+    {
+        $this->progress->debug('ClassLikeStorage is populating' . "\n");
+
+        foreach ($this->classlike_storage_provider->getNew() as $class_storage) {
+            $this->populateClassLikeStorage($class_storage);
+        }
+
+        $this->populateTransitiveMixins();
+
+        // a class populated before its parents were scanned is populated again, and bound again
+        $this->iteration_purity_bound = [];
+
+        // every method's capabilities are known now: bind what consuming the generators they
+        // return, and iterating the iterators their classes are, may do
+        foreach ($this->classlike_storage_provider->getNew() as $class_storage) {
+            foreach ($class_storage->methods as $method_storage) {
+                $this->populateGeneratorPurity($method_storage, $class_storage);
+            }
+        }
+
+        foreach ($this->classlike_storage_provider->getNew() as $class_storage) {
+            $this->bindIterationPurity($class_storage);
+        }
+
+        $this->progress->debug('ClassLikeStorage is populated' . "\n");
+
+        $this->progress->debug('FileStorage is populating' . "\n");
+
+        $all_file_storage = $this->file_storage_provider->getNew();
+
+        foreach ($all_file_storage as $file_storage) {
+            $this->populateFileStorage($file_storage);
+        }
+
+        foreach ($this->classlike_storage_provider->getNew() as $class_storage) {
+            // `+=` on the typed property would copy the whole array on every merge
+            $dependents = $class_storage->dependent_classlikes;
+
+            foreach ($class_storage->dependent_classlikes as $dependent_classlike_lc => $_) {
+                try {
+                    $dependee_storage = $this->classlike_storage_provider->get($dependent_classlike_lc);
+                } catch (InvalidArgumentException) {
+                    continue;
+                }
+
+                $dependents += $dependee_storage->dependent_classlikes;
+            }
+
+            $class_storage->dependent_classlikes = $dependents;
+        }
+
+        $this->progress->debug('FileStorage is populated' . "\n");
+
+        ClassLikeStorageProvider::populated();
+        FileStorageProvider::populated();
+    }
+
+    /**
+     * Applies a `@psalm-capabilities` value naming imported type aliases, which the scanner
+     * could not resolve because the declaring class may not have been scanned yet.
+     */
+    private function resolveDeferredCapabilities(ClassLikeStorage|FunctionLikeStorage $storage): void
+    {
+        if ($storage->capabilities_type === null) {
+            return;
+        }
+
+        $storage->capabilities = $this->resolveCapabilitiesType($storage->capabilities_type) & $storage->capabilities;
+        $storage->capabilities_type = null;
+    }
+
+    /**
+     * Replaces the imported type aliases (`@psalm-import-type`) in the bounds of the templates with their types, which
+     * the scanner could not resolve: until then, a template bound by one may be a purity template too.
+     */
+    private function resolveTemplateBoundAliases(ClassLikeStorage|FunctionLikeStorage $storage): void
+    {
+        if ($storage->template_types === null) {
+            return;
+        }
+
+        $template_types = $storage->template_types;
+
+        foreach ($template_types as $template_name => $bounds) {
+            foreach ($bounds as $defining_class => $bound) {
+                if ($bound->hasTypeAlias()) {
+                    $template_types[$template_name][$defining_class] = $this->resolveTypeAliases($bound) ?? $bound;
+                }
+            }
+        }
+
+        $storage->template_types = $template_types;
+    }
+
+    /**
+     * The type with its imported type aliases replaced by their types, or null when one of them can't be resolved
+     *
+     * @psalm-mutation-free
+     */
+    private function resolveTypeAliases(Union $type, int $depth = 0): ?Union
+    {
+        $atomic_types = [];
+
+        foreach ($type->getAtomicTypes() as $atomic) {
+            if (!$atomic instanceof TTypeAlias) {
+                $atomic_types[] = $atomic;
+
+                continue;
+            }
+
+            if ($depth >= 10) {
+                return null;
+            }
+
+            try {
+                $alias_storage = $this->classlike_storage_provider->get($atomic->declaring_fq_classlike_name);
+            } catch (InvalidArgumentException) {
+                return null;
+            }
+
+            $alias = $alias_storage->type_aliases[$atomic->alias_name] ?? null;
+
+            if (!$alias instanceof ClassTypeAlias || $alias->replacement_atomic_types === []) {
+                return null;
+            }
+
+            $resolved = $this->resolveTypeAliases(new Union($alias->replacement_atomic_types), $depth + 1);
+
+            if ($resolved === null) {
+                return null;
+            }
+
+            foreach ($resolved->getAtomicTypes() as $resolved_atomic) {
+                $atomic_types[] = $resolved_atomic;
+            }
+        }
+
+        return $atomic_types === [] ? null : $type->setTypes($atomic_types);
+    }
+
+    /**
+     * Binds the purity template of the Generator (or Iterator, Traversable) a generator function-like
+     * returns to what running its body may do: its own capabilities, less reading properties, plus
+     * the purity templates it inherits its purity from, which each call binds. A generator
+     * function-like without a purity annotation keeps the default, impure.
+     */
+    private function populateGeneratorPurity(FunctionLikeStorage $storage, ?ClassLikeStorage $class_storage): void
+    {
+        if (!$storage->has_yield
+            || $storage->return_type === null
+            || $storage->capabilities === Capabilities::ALL
+        ) {
+            return;
+        }
+
+        $purity_types = [new TCapabilities($storage->capabilities & ~Capabilities::READ_PROPS)];
+
+        foreach ($storage->purity_from_templates as $template_name) {
+            $bounds = $storage->template_types[$template_name]
+                ?? $class_storage?->template_types[$template_name]
+                ?? [];
+
+            foreach ($bounds as $defining_class => $bound) {
+                $purity_types[] = new TTemplateParam($template_name, $bound, $defining_class);
+            }
+        }
+
+        $storage->return_type = IterationPurity::bindGenerators($storage->return_type, new Union($purity_types));
+    }
+
+    /**
+     * Binds the purity template of Traversable for a class implementing Iterator or IteratorAggregate
+     * that does not bind it itself, to what iterating it may do: the capabilities of its Iterator
+     * methods, or of getIterator() and of the iterator that returns. The subtyping
+     * `MyIterator <: Iterator[pure]<K, V>` and the override check of the Iterator methods rely on it.
+     */
+    private function bindIterationPurity(ClassLikeStorage $storage, int $depth = 0): void
+    {
+        if (isset($this->iteration_purity_bound[$storage->name]) || $depth > 5) {
+            return;
+        }
+
+        $this->iteration_purity_bound[$storage->name] = true;
+
+        if ($storage->is_trait
+            || !isset($storage->template_extended_params['Traversable']['TPurity'])
+            || $this->bindsIterationPurityItself($storage)
+        ) {
+            return;
+        }
+
+        if (isset($storage->template_extended_params['Iterator'])) {
+            $purity = Capabilities::NONE;
+
+            foreach (['rewind', 'valid', 'current', 'key', 'next'] as $method_name) {
+                $purity |= $this->getIterationMethodCapabilities($storage, $method_name);
+            }
+        } elseif (isset($storage->template_extended_params['IteratorAggregate'])) {
+            $purity = $this->getIterationMethodCapabilities($storage, 'getiterator');
+
+            $iterator_type = $this->getDeclaringMethodStorage($storage, 'getiterator')?->return_type;
+
+            if ($iterator_type === null) {
+                $purity = Capabilities::ALL;
+            } else {
+                foreach ($iterator_type->getAtomicTypes() as $iterator_atomic_type) {
+                    $purity |= $this->getIterationPurityOfType($iterator_atomic_type, $depth + 1);
+                }
+            }
+        } else {
+            // a Traversable the engine implements
+            return;
+        }
+
+        // the iterator interfaces only: the purity template of an iterator class it extends
+        // without binding (`IteratorIterator`) is what that class was constructed with, which
+        // defaults to impure
+        foreach ($storage->template_extended_params as $parent_name => $type_map) {
+            if (isset($type_map['TPurity'])
+                && $this->isTraversableLike($parent_name)
+                && $this->classlike_storage_provider->get($parent_name)->is_interface
+            ) {
+                $storage->template_extended_params[$parent_name]['TPurity']
+                    = new Union([new TCapabilities($purity)]);
+            }
+        }
+    }
+
+    /**
+     * Whether the class binds the purity template of an iterator interface in its own
+     * `@implements`/`@extends`.
+     *
+     * @psalm-mutation-free
+     */
+    private function bindsIterationPurityItself(ClassLikeStorage $storage): bool
+    {
+        foreach ($storage->template_extended_offsets ?? [] as $parent_name => $type_params) {
+            if (!$this->isTraversableLike($parent_name)) {
+                continue;
+            }
+
+            $parent_storage = $this->classlike_storage_provider->get($parent_name);
+            $template_name = self::getIterationPurityTemplateName($parent_storage);
+
+            if ($template_name === null) {
+                continue;
+            }
+
+            $index = array_search($template_name, array_keys($parent_storage->template_types ?? []), true);
+
+            if ($index !== false && isset($type_params[$index])) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * The purity template that iterating an object of the class is bound to: `TPurity` of the
+     * iterator interfaces, or the template of a class passing its own on to them
+     * (`@implements Iterator[P]<K, V>`), which its subclasses then bind with `@extends Base[pure]`.
+     *
+     * @psalm-mutation-free
+     */
+    private static function getIterationPurityTemplateName(ClassLikeStorage $storage): ?string
+    {
+        if (isset($storage->template_types['TPurity'])) {
+            return 'TPurity';
+        }
+
+        // the extended params chain the templates (Traversable's is Iterator's, which is the class's own)
+        $purity = $storage->template_extended_params['Traversable']['TPurity'] ?? null;
+
+        while ($purity !== null && $purity->isSingle()) {
+            $purity_atomic = $purity->getSingleAtomic();
+
+            if (!$purity_atomic instanceof TTemplateParam) {
+                return null;
+            }
+
+            if ($purity_atomic->defining_class === $storage->name) {
+                return $purity_atomic->param_name;
+            }
+
+            $purity = $storage->template_extended_params[$purity_atomic->defining_class][$purity_atomic->param_name]
+                ?? null;
+        }
+
+        return null;
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    private function isTraversableLike(string $fq_class_name): bool
+    {
+        if (strtolower($fq_class_name) === 'traversable') {
+            return true;
+        }
+
+        if (!$this->classlike_storage_provider->has($fq_class_name)) {
+            return false;
+        }
+
+        $storage = $this->classlike_storage_provider->get($fq_class_name);
+
+        return isset($storage->parent_interfaces['traversable']) || isset($storage->class_implements['traversable']);
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    private function getDeclaringMethodStorage(ClassLikeStorage $storage, string $method_name): ?MethodStorage
+    {
+        $declaring_method_id = $storage->declaring_method_ids[$method_name] ?? null;
+
+        if ($declaring_method_id === null
+            || !$this->classlike_storage_provider->has($declaring_method_id->fq_class_name)
+        ) {
+            return null;
+        }
+
+        return $this->classlike_storage_provider->get($declaring_method_id->fq_class_name)
+            ->methods[$declaring_method_id->method_name] ?? null;
+    }
+
+    /**
+     * What calling one of the methods foreach calls implicitly may do beyond the iterator itself:
+     * reading its properties is like reading an argument. A method that is missing, or whose
+     * purity depends on templates, counts for the worst.
+     *
+     * @return CapabilitySet
+     * @psalm-mutation-free
+     */
+    private function getIterationMethodCapabilities(ClassLikeStorage $storage, string $method_name): int
+    {
+        $declaring_method_id = $storage->declaring_method_ids[$method_name] ?? null;
+        $method_storage = $this->getDeclaringMethodStorage($storage, $method_name);
+
+        if ($declaring_method_id === null || $method_storage === null) {
+            return Capabilities::ALL;
+        }
+
+        $declaring_class_storage = $this->classlike_storage_provider->get($declaring_method_id->fq_class_name);
+
+        $capabilities = $method_storage->getWorstCaseCapabilities($declaring_class_storage->template_types ?? [])
+            & ~Capabilities::READ_PROPS;
+
+        // what iterating a value of the class may do to whoever iterates it, for whom the
+        // iterator's `$this` is another object
+        if (($capabilities & Capabilities::WRITE_THIS_PROPS) !== 0) {
+            $capabilities |= Capabilities::WRITE_PROPS;
+        }
+
+        return $capabilities;
+    }
+
+    /**
+     * What iterating over a value of a type getIterator() returns may do: the purity template of a
+     * Generator/Iterator type, or the one bound for a class, or anything for the rest.
+     *
+     * @return CapabilitySet
+     */
+    private function getIterationPurityOfType(Atomic $iterator_atomic_type, int $depth): int
+    {
+        if (!$iterator_atomic_type instanceof TNamedObject
+            || !$this->classlike_storage_provider->has($iterator_atomic_type->value)
+        ) {
+            return Capabilities::ALL;
+        }
+
+        $iterator_storage = $this->classlike_storage_provider->get($iterator_atomic_type->value);
+
+        $this->bindIterationPurity($iterator_storage, $depth);
+
+        if (isset($iterator_storage->template_types['TPurity'])) {
+            $index = array_search('TPurity', array_keys($iterator_storage->template_types), true);
+
+            if ($iterator_atomic_type instanceof TGenericObject && isset($iterator_atomic_type->type_params[$index])) {
+                return Capabilities::fromType($iterator_atomic_type->type_params[$index]);
+            }
+
+            return Capabilities::ALL;
+        }
+
+        if (isset($iterator_storage->template_extended_params['Traversable']['TPurity'])) {
+            return Capabilities::fromType($iterator_storage->template_extended_params['Traversable']['TPurity']);
+        }
+
+        return Capabilities::ALL;
+    }
+
+    /**
+     * @return CapabilitySet
+     * @psalm-mutation-free
+     */
+    private function resolveCapabilitiesType(Union $type, int $depth = 0): int
+    {
+        $capabilities = Capabilities::NONE;
+
+        foreach ($type->getAtomicTypes() as $atomic) {
+            if ($atomic instanceof TCapabilities) {
+                $capabilities |= $atomic->capabilities;
+            } elseif ($atomic instanceof TTemplateParam) {
+                $capabilities |= $this->resolveCapabilitiesType($atomic->as, $depth);
+            } elseif ($atomic instanceof TTypeAlias && $depth < 10) {
+                try {
+                    $alias_storage = $this->classlike_storage_provider->get($atomic->declaring_fq_classlike_name);
+                } catch (InvalidArgumentException) {
+                    return Capabilities::ALL;
+                }
+
+                $alias = $alias_storage->type_aliases[$atomic->alias_name] ?? null;
+
+                if (!$alias instanceof ClassTypeAlias || $alias->replacement_atomic_types === []) {
+                    return Capabilities::ALL;
+                }
+
+                $capabilities |= $this->resolveCapabilitiesType(
+                    new Union($alias->replacement_atomic_types),
+                    $depth + 1,
+                );
+            } else {
+                // not a set of capabilities: the most conservative reading
+                return Capabilities::ALL;
+            }
+        }
+
+        return $capabilities;
+    }
+
+    private function populateClassLikeStorage(ClassLikeStorage $storage, array $dependent_classlikes = []): void
+    {
+        if ($storage->populated) {
+            return;
+        }
+
+        $fq_classlike_name_lc = strtolower($storage->name);
+
+        if (isset($dependent_classlikes[$fq_classlike_name_lc])) {
+            if ($storage->location) {
+                IssueBuffer::maybeAdd(
+                    new CircularReference(
+                        'Circular reference discovered when loading ' . $storage->name,
+                        $storage->location,
+                    ),
+                );
+            }
+
+            return;
+        }
+
+        $storage_provider = $this->classlike_storage_provider;
+
+        $dependent_classlikes[$fq_classlike_name_lc] = true;
+
+        // a storage populated again still holds the `@method`s it inherited the last time
+        self::removeInheritedPseudoMethods($storage);
+
+        $trait_storages = [];
+
+        foreach ($storage->used_traits as $used_trait_lc => $_) {
+            $trait_storage = $this->populateDataFromTrait(
+                $storage,
+                $storage_provider,
+                $dependent_classlikes,
+                $used_trait_lc,
+            );
+
+            if ($trait_storage !== null) {
+                $trait_storages[] = $trait_storage;
+            }
+        }
+
+        // once every trait is in, so that a method of one trait wins over a `@method` of another
+        foreach ($trait_storages as $trait_storage) {
+            $this->inheritPseudoMethods($storage, $trait_storage);
+        }
+
+        if ($storage->parent_classes) {
+            $this->populateDataFromParentClass(
+                $storage,
+                $storage_provider,
+                $dependent_classlikes,
+                reset($storage->parent_classes),
+            );
+        }
+
+        if (!strpos($fq_classlike_name_lc, '\\')
+            && !isset($storage->methods['__construct'])
+            && isset($storage->methods[$fq_classlike_name_lc])
+            && !$storage->is_interface
+            && !$storage->is_trait
+        ) {
+            $storage->methods['__construct'] = $storage->methods[$fq_classlike_name_lc];
+        }
+
+        $parent_interface_storages = [];
+
+        foreach ($storage->direct_interface_parents as $parent_interface_lc => $_) {
+            $parent_interface_storage = $this->populateInterfaceDataFromParentInterface(
+                $storage,
+                $storage_provider,
+                $dependent_classlikes,
+                $parent_interface_lc,
+            );
+
+            if ($parent_interface_storage !== null) {
+                $parent_interface_storages[] = $parent_interface_storage;
+            }
+        }
+
+        // once every parent is in, so that a method the interface declares or gets from one of them wins over the
+        // `@method` of another, which doesn't have that method
+        foreach ($parent_interface_storages as $parent_interface_storage) {
+            foreach ($parent_interface_storage->pseudo_methods as $method_name => $pseudo_method) {
+                if (isset($storage->declaring_method_ids[$method_name])
+                    && !isset($parent_interface_storage->declaring_method_ids[$method_name])
+                ) {
+                    continue;
+                }
+
+                $storage->pseudo_methods[$method_name] ??= $pseudo_method;
+
+                if (isset($parent_interface_storage->declaring_pseudo_method_ids[$method_name])) {
+                    $storage->declaring_pseudo_method_ids[$method_name]
+                        ??= $parent_interface_storage->declaring_pseudo_method_ids[$method_name];
+                }
+            }
+        }
+
+        foreach ($storage->direct_class_interfaces as $implemented_interface_lc => $_) {
+            $this->populateDataFromImplementedInterface(
+                $storage,
+                $storage_provider,
+                $dependent_classlikes,
+                $implemented_interface_lc,
+            );
+        }
+
+        if ($storage->location) {
+            $file_path = $storage->location->file_path;
+
+            foreach ($storage->parent_interfaces as $parent_interface_lc) {
+                $this->file_reference_provider->addFileInheritanceToClass($file_path, $parent_interface_lc);
+            }
+
+            foreach ($storage->parent_classes as $parent_class_lc => $_) {
+                $this->file_reference_provider->addFileInheritanceToClass($file_path, $parent_class_lc);
+            }
+
+            foreach ($storage->class_implements as $implemented_interface) {
+                $this->file_reference_provider->addFileInheritanceToClass(
+                    $file_path,
+                    strtolower($implemented_interface),
+                );
+            }
+
+            foreach ($storage->used_traits as $used_trait_lc => $_) {
+                $this->file_reference_provider->addFileInheritanceToClass($file_path, $used_trait_lc);
+            }
+        }
+
+        $this->resolveDeferredCapabilities($storage);
+        $this->resolveTemplateBoundAliases($storage);
+
+        if ($storage->is_interface
+            && !$storage->has_mutations_annotation
+            && $storage->declaring_method_ids === []
+            && $storage->pseudo_methods === []
+            && $storage->pseudo_static_methods === []
+            && $storage->declaring_property_ids === []
+            && $storage->pseudo_property_get_types === []
+            && $storage->pseudo_property_set_types === []
+        ) {
+            // a marker interface does nothing: it is pure
+            $storage->is_marker_interface = true;
+            $storage->has_mutations_annotation = true;
+            $storage->capabilities = Capabilities::NONE;
+        }
+
+        foreach ($storage->methods as $method) {
+            $this->resolveTemplateBoundAliases($method);
+
+            if ($method->capabilities_type !== null) {
+                $this->resolveDeferredCapabilities($method);
+                FunctionLikeDocblockScanner::applyPurityTemplateLowerBounds($storage, $method);
+            }
+        }
+
+        if ($storage->taint_specialize) {
+            $storage->capabilities &= Capabilities::TAINT_SPECIALIZED;
+
+            foreach ($storage->properties as $property) {
+                if (!$property->is_static) {
+                    $property->readonly = true;
+                    $property->allow_private_mutation = false;
+                }
+            }
+        }
+
+        if ($storage->capabilities !== Capabilities::ALL) {
+            foreach ($storage->methods as $method) {
+                if (!$method->has_mutations_annotation) {
+                    $method->capabilities = $storage->capabilities & $method->capabilities;
+                }
+                $method->containing_class_capabilities = $storage->capabilities;
+            }
+
+            if ($storage->isMutationFree()) {
+                foreach ($storage->properties as $property) {
+                    if (!$property->is_static) {
+                        $property->readonly = true;
+                    }
+                }
+            }
+        }
+
+        if ($storage->specialize_instance) {
+            foreach ($storage->methods as $method) {
+                if (!$method->is_static) {
+                    $method->specialize_call = true;
+                }
+            }
+        }
+
+        if (!$storage->is_interface && !$storage->is_trait) {
+            foreach ($storage->methods as $method) {
+                $method->internal = [...$storage->internal, ...$method->internal];
+            }
+
+            foreach ($storage->properties as $property) {
+                $property->internal = [...$storage->internal, ...$property->internal];
+            }
+        }
+
+        $this->populateOverriddenMethods($storage, $storage_provider);
+
+        $this->progress->debug('Have populated ' . $storage->name . "\n");
+
+        $storage->populated = true;
+
+        if (isset($this->invalid_class_storages[$fq_classlike_name_lc])) {
+            foreach ($this->invalid_class_storages[$fq_classlike_name_lc] as $dependency) {
+                // Dependencies may not be fully set yet, so we have to loop through dependencies of dependencies
+                $dependencies = [strtolower($dependency->name) => true];
+                do {
+                    $current_dependency_name = key(array_splice($dependencies, 0, 1)); // Key shift
+                    $current_dependency = $storage_provider->get($current_dependency_name);
+                    $dependencies += $current_dependency->dependent_classlikes;
+
+                    if (isset($current_dependency->dependent_classlikes[$fq_classlike_name_lc])) {
+                        if ($dependency->location) {
+                            IssueBuffer::maybeAdd(
+                                new CircularReference(
+                                    'Circular reference discovered when loading ' . $dependency->name,
+                                    $dependency->location,
+                                ),
+                            );
+                        }
+
+                        continue 2;
+                    }
+                } while (!empty($dependencies));
+
+                $dependency->populated = false;
+                unset($dependency->invalid_dependencies[$fq_classlike_name_lc]);
+                $this->populateClassLikeStorage($dependency, $dependent_classlikes);
+            }
+
+            unset($this->invalid_class_storages[$fq_classlike_name_lc]);
+        }
+    }
+
+    private function populateOverriddenMethods(
+        ClassLikeStorage $storage,
+        ClassLikeStorageProvider $storage_provider,
+    ): void {
+        $interface_method_implementers = [];
+        foreach ($storage->class_implements as $interface) {
+            try {
+                $implemented_interface = strtolower(
+                    $this->classlikes->getUnAliasedName(
+                        $interface,
+                    ),
+                );
+                $implemented_interface_storage = $storage_provider->get($implemented_interface);
+            } catch (InvalidArgumentException) {
+                continue;
+            }
+
+            $implemented_interface_storage->dependent_classlikes[strtolower($storage->name)] = true;
+
+            foreach ($implemented_interface_storage->methods as $method_name => $method) {
+                if ($method->visibility === ClassLikeAnalyzer::VISIBILITY_PUBLIC) {
+                    $interface_method_implementers[$method_name][] = new MethodIdentifier(
+                        $implemented_interface_storage->name,
+                        $method_name,
+                    );
+                }
+            }
+        }
+
+        foreach ($interface_method_implementers as $method_name => $interface_method_ids) {
+            if (count($interface_method_ids) === 1) {
+                if (isset($storage->methods[$method_name])) {
+                    $method_storage = $storage->methods[$method_name];
+
+                    if ($method_storage->signature_return_type
+                        && !$method_storage->signature_return_type->isVoid()
+                        && $method_storage->return_type === $method_storage->signature_return_type
+                    ) {
+                        $interface_fqcln = $interface_method_ids[0]->fq_class_name;
+                        $interface_storage = $storage_provider->get($interface_fqcln);
+
+                        if (isset($interface_storage->methods[$method_name])) {
+                            $interface_method_storage = $interface_storage->methods[$method_name];
+
+                            if ($interface_method_storage->throws
+                                && (!$method_storage->throws || $method_storage->inheritdoc)
+                            ) {
+                                $method_storage->throws += $interface_method_storage->throws;
+                            }
+                        }
+                    }
+                }
+            }
+
+            foreach ($interface_method_ids as $interface_method_id) {
+                $storage->overridden_method_ids[$method_name][$interface_method_id->fq_class_name]
+                    = $interface_method_id;
+            }
+        }
+
+        $storage->documenting_method_ids = [];
+
+        // the storage of a method a class takes from a trait is shared by every class using the trait, so what is
+        // inherited by one class's method is recorded on the class only
+        $method_storages = $storage->methods;
+
+        foreach ($storage->declaring_method_ids as $method_name => $trait_method_id) {
+            if (isset($storage->methods[$method_name]) || !isset($storage->overridden_method_ids[$method_name])) {
+                continue;
+            }
+
+            $trait_storage = $storage_provider->get($trait_method_id->fq_class_name);
+
+            if ($trait_storage->is_trait && isset($trait_storage->methods[$trait_method_id->method_name])) {
+                $method_storages[$method_name] = $trait_storage->methods[$trait_method_id->method_name];
+            }
+        }
+
+        foreach ($method_storages as $method_name => $method_storage) {
+            $is_own_method = isset($storage->methods[$method_name]);
+            $inherited_return_type = $is_own_method ? $method_storage->inherited_return_type : false;
+
+            if (isset($storage->overridden_method_ids[$method_name])) {
+                $overridden_method_ids = $storage->overridden_method_ids[$method_name];
+
+                $candidate_overridden_ids = null;
+
+                $declaring_class_storages = [];
+
+                foreach ($overridden_method_ids as $declaring_method_id) {
+                    $declaring_class = $declaring_method_id->fq_class_name;
+                    $declaring_class_storage
+                        = $declaring_class_storages[$declaring_class]
+                        = $this->classlike_storage_provider->get($declaring_class);
+
+                    if ($candidate_overridden_ids === null) {
+                        $candidate_overridden_ids
+                            = ($declaring_class_storage->overridden_method_ids[$method_name] ?? [])
+                                + [$declaring_method_id->fq_class_name => $declaring_method_id];
+                    } else {
+                        $candidate_overridden_ids = array_intersect_key(
+                            $candidate_overridden_ids,
+                            ($declaring_class_storage->overridden_method_ids[$method_name] ?? [])
+                                + [$declaring_method_id->fq_class_name => $declaring_method_id],
+                        );
+                    }
+                }
+
+                foreach ($overridden_method_ids as $declaring_method_id) {
+                    $declaring_class = $declaring_method_id->fq_class_name;
+                    $declaring_method_name = $declaring_method_id->method_name;
+                    $declaring_class_storage = $declaring_class_storages[$declaring_class];
+
+                    $declaring_method_storage = $declaring_class_storage->methods[$declaring_method_name]
+                        ?? $declaring_class_storage->pseudo_methods[$declaring_method_name]
+                        ?? $declaring_class_storage->pseudo_static_methods[$declaring_method_name];
+
+                    if (($declaring_method_storage->has_docblock_param_types
+                            || $declaring_method_storage->has_docblock_return_type)
+                        && !$method_storage->has_docblock_param_types
+                        && !$method_storage->has_docblock_return_type
+                        && $inherited_return_type !== null
+                    ) {
+                        if (!isset($storage->documenting_method_ids[$method_name])
+                            || (string) $storage->documenting_method_ids[$method_name]
+                                === (string) $declaring_method_id
+                        ) {
+                            $storage->documenting_method_ids[$method_name] = $declaring_method_id;
+                            $inherited_return_type = true;
+                        } else {
+                            if (in_array(
+                                $storage->documenting_method_ids[$method_name]->fq_class_name,
+                                $declaring_class_storage->parent_interfaces,
+                            )) {
+                                $storage->documenting_method_ids[$method_name] = $declaring_method_id;
+                                $inherited_return_type = true;
+                            } else {
+                                $documenting_class_storage = $declaring_class_storages
+                                    [$storage->documenting_method_ids[$method_name]->fq_class_name];
+
+                                if (!in_array(
+                                    $declaring_class,
+                                    $documenting_class_storage->parent_interfaces,
+                                ) && $documenting_class_storage->is_interface
+                                ) {
+                                    unset($storage->documenting_method_ids[$method_name]);
+                                    $inherited_return_type = null;
+                                }
+                            }
+                        }
+                    }
+
+                    if (!$is_own_method) {
+                        continue;
+                    }
+
+                    // tell the declaring class it's overridden downstream
+                    $declaring_method_storage->overridden_downstream = true;
+                    $declaring_method_storage->overridden_somewhere = true;
+
+                    if ($declaring_method_storage->mutation_free_assumed) {
+                        $declaring_method_storage->capabilities = Capabilities::ALL;
+                        $declaring_method_storage->mutation_free_assumed = false;
+                    }
+
+                    if ($declaring_method_storage->throws
+                        && (!$method_storage->throws || $method_storage->inheritdoc)
+                    ) {
+                        $method_storage->throws += $declaring_method_storage->throws;
+                    }
+                }
+
+                if ($is_own_method) {
+                    $method_storage->inherited_return_type = $inherited_return_type;
+                }
+            }
+        }
+    }
+
+    private function populateDataFromTrait(
+        ClassLikeStorage $storage,
+        ClassLikeStorageProvider $storage_provider,
+        array $dependent_classlikes,
+        string $used_trait_lc,
+    ): ?ClassLikeStorage {
+        try {
+            $used_trait_lc = strtolower(
+                $this->classlikes->getUnAliasedName(
+                    $used_trait_lc,
+                ),
+            );
+            $trait_storage = $storage_provider->get($used_trait_lc);
+        } catch (InvalidArgumentException) {
+            return null;
+        }
+
+        $this->populateClassLikeStorage($trait_storage, $dependent_classlikes);
+
+        // a constructor of a trait wins over the one of the parent, which the empty one would hide
+        if (isset($trait_storage->methods['__construct'])) {
+            self::removeEmptyConstructor($storage);
+        }
+
+        $this->inheritConstantsFromTrait($storage, $trait_storage);
+        $this->inheritMethodsFromParent($storage, $trait_storage);
+        $this->inheritPropertiesFromParent($storage, $trait_storage);
+
+        // the visibility a trait gives to the methods it uses from another one, unless the class changes it again,
+        // declares the method itself or uses the one of another trait for it
+        $trait_name_lc = strtolower($trait_storage->name);
+
+        foreach ($trait_storage->trait_visibility_map as $method_name_lc => $visibility) {
+            if (isset($storage->methods[$method_name_lc])
+                || isset($storage->trait_excluded_methods[$method_name_lc][$trait_name_lc])
+            ) {
+                continue;
+            }
+
+            $storage->trait_visibility_map[$method_name_lc] ??= $visibility;
+        }
+
+        $this->extendTemplateParams($storage, $trait_storage, false);
+
+        $storage->pseudo_property_get_types += $trait_storage->pseudo_property_get_types;
+        $storage->pseudo_property_set_types += $trait_storage->pseudo_property_set_types;
+
+        return $trait_storage;
+    }
+
+    /**
+     * The empty constructor of a `@psalm-consistent-constructor` class that declares none stands for the lack of it
+     */
+    private static function removeEmptyConstructor(ClassLikeStorage $storage): void
+    {
+        if (!$storage->user_defined
+            || !isset($storage->methods['__construct'])
+            || $storage->methods['__construct']->location !== null
+        ) {
+            return;
+        }
+
+        unset(
+            $storage->methods['__construct'],
+            $storage->declaring_method_ids['__construct'],
+            $storage->inheritable_method_ids['__construct'],
+            $storage->appearing_method_ids['__construct'],
+            $storage->overridden_method_ids['__construct'],
+        );
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    private static function extendType(
+        Union $type,
+        ClassLikeStorage $storage,
+    ): Union {
+        $extended_types = [];
+
+        foreach ($type->getAtomicTypes() as $atomic_type) {
+            if ($atomic_type instanceof TTemplateParam) {
+                $referenced_type
+                    = $storage->template_extended_params[$atomic_type->defining_class][$atomic_type->param_name]
+                        ?? null;
+
+                if ($referenced_type) {
+                    foreach ($referenced_type->getAtomicTypes() as $atomic_referenced_type) {
+                        if (!$atomic_referenced_type instanceof TTemplateParam) {
+                            $extended_types[] = $atomic_referenced_type;
+                        } else {
+                            $extended_types[] = $atomic_type;
+                        }
+                    }
+                } else {
+                    $extended_types[] = $atomic_type;
+                }
+            } else {
+                $extended_types[] = $atomic_type;
+            }
+        }
+
+        return new Union($extended_types);
+    }
+
+    private function populateDataFromParentClass(
+        ClassLikeStorage $storage,
+        ClassLikeStorageProvider $storage_provider,
+        array $dependent_classlikes,
+        string $parent_storage_class,
+    ): void {
+        $parent_storage_class = strtolower(
+            $this->classlikes->getUnAliasedName(
+                $parent_storage_class,
+            ),
+        );
+
+        try {
+            $parent_storage = $storage_provider->get($parent_storage_class);
+        } catch (InvalidArgumentException) {
+            $this->progress->debug('Populator could not find dependency (' . __LINE__ . ")\n");
+
+            $storage->invalid_dependencies[$parent_storage_class] = true;
+
+            $this->invalid_class_storages[$parent_storage_class][] = $storage;
+
+            return;
+        }
+
+        $this->populateClassLikeStorage($parent_storage, $dependent_classlikes);
+
+        $storage->parent_classes = [...$storage->parent_classes, ...$parent_storage->parent_classes];
+
+        $this->extendTemplateParams($storage, $parent_storage, true);
+
+        // the empty constructor of a `@psalm-consistent-constructor` class without one stands for the lack of
+        // it: where the parent has a constructor, that is the one the class has
+        if (isset($parent_storage->declaring_method_ids['__construct'])) {
+            self::removeEmptyConstructor($storage);
+        }
+
+        $this->inheritMethodsFromParent($storage, $parent_storage);
+        $this->inheritPropertiesFromParent($storage, $parent_storage);
+
+        $storage->class_implements = [...$storage->class_implements, ...$parent_storage->class_implements];
+        $storage->invalid_dependencies = [...$storage->invalid_dependencies, ...$parent_storage->invalid_dependencies];
+
+        if ($parent_storage->has_visitor_issues) {
+            $storage->has_visitor_issues = true;
+        }
+
+        // the instances of a child class are instances of its parent class: their properties hold per-instance
+        // taints in the methods of both, which may not change them once constructed (see ClassAnalyzer)
+        $storage->taint_property_bag ??= $parent_storage->taint_property_bag;
+
+        if ($parent_storage->taint_specialize && !$storage->taint_specialize) {
+            $storage->taint_specialize = true;
+            $storage->inherits_taint_specialize = !$storage->specialize_instance;
+            $storage->specialize_instance = true;
+        }
+
+        $storage->constants = [...array_filter(
+            $parent_storage->constants,
+            static fn(ClassConstantStorage $constant): bool
+                => $constant->visibility === ClassLikeAnalyzer::VISIBILITY_PUBLIC
+                    || $constant->visibility === ClassLikeAnalyzer::VISIBILITY_PROTECTED,
+        ), ...$storage->constants];
+
+        if ($parent_storage->preserve_constructor_signature) {
+            $storage->preserve_constructor_signature = true;
+        }
+
+        if (($parent_storage->namedMixins || $parent_storage->templatedMixins)
+            && (!$storage->namedMixins || !$storage->templatedMixins)) {
+            $storage->mixin_declaring_fqcln = $parent_storage->mixin_declaring_fqcln;
+
+            if (!$storage->namedMixins) {
+                $storage->namedMixins = $parent_storage->namedMixins;
+            }
+
+            if (!$storage->templatedMixins) {
+                $storage->templatedMixins = $parent_storage->templatedMixins;
+            }
+        }
+
+        $storage->pseudo_property_get_types += $parent_storage->pseudo_property_get_types;
+        $storage->pseudo_property_set_types += $parent_storage->pseudo_property_set_types;
+
+        $parent_storage->dependent_classlikes[strtolower($storage->name)] = true;
+
+        $this->inheritPseudoMethods($storage, $parent_storage);
+
+        $parent_storage->has_children = true;
+    }
+
+    /**
+     * A public method that appears in the class, being declared there or in a used trait, and a `@method` the class
+     * already has, win over the `@method` of a used trait or parent class. A call of a method that isn't public goes
+     * through `__call` or `__callStatic` from outside the class, so the `@method` still describes it.
+     */
+    private function inheritPseudoMethods(ClassLikeStorage $storage, ClassLikeStorage $parent_storage): void
+    {
+        $fq_class_name_lc = strtolower($storage->name);
+
+        foreach ($parent_storage->pseudo_methods as $method_name => $pseudo_method) {
+            if (!$this->hasPublicMethodAppearingInClass($storage, $fq_class_name_lc, $method_name)) {
+                $storage->pseudo_methods[$method_name] ??= $pseudo_method;
+
+                if (isset($parent_storage->declaring_pseudo_method_ids[$method_name])) {
+                    $storage->declaring_pseudo_method_ids[$method_name]
+                        ??= $parent_storage->declaring_pseudo_method_ids[$method_name];
+                }
+            }
+        }
+
+        foreach ($parent_storage->pseudo_static_methods as $method_name => $pseudo_method) {
+            if (!$this->hasPublicMethodAppearingInClass($storage, $fq_class_name_lc, $method_name)) {
+                $storage->pseudo_static_methods[$method_name] ??= $pseudo_method;
+
+                if (isset($parent_storage->declaring_pseudo_static_method_ids[$method_name])) {
+                    $storage->declaring_pseudo_static_method_ids[$method_name]
+                        ??= $parent_storage->declaring_pseudo_static_method_ids[$method_name];
+                }
+            }
+        }
+    }
+
+    /**
+     * @param lowercase-string $fq_class_name_lc
+     * @psalm-capabilities read-props
+     */
+    private function hasPublicMethodAppearingInClass(
+        ClassLikeStorage $storage,
+        string $fq_class_name_lc,
+        string $method_name,
+    ): bool {
+        $appearing_method_id = $storage->appearing_method_ids[$method_name] ?? null;
+        $declaring_method_id = $storage->declaring_method_ids[$method_name] ?? null;
+
+        if ($appearing_method_id === null
+            || $declaring_method_id === null
+            || strtolower($appearing_method_id->fq_class_name) !== $fq_class_name_lc
+        ) {
+            return false;
+        }
+
+        // the visibility a `use` adaptation gives to a trait method, as in MethodVisibilityAnalyzer
+        $visibility = $storage->trait_visibility_map[$method_name]
+            ?? ($this->classlike_storage_provider->get($declaring_method_id->fq_class_name)
+                ->methods[$declaring_method_id->method_name] ?? null)?->visibility;
+
+        return $visibility === ClassLikeAnalyzer::VISIBILITY_PUBLIC;
+    }
+
+    private static function removeInheritedPseudoMethods(ClassLikeStorage $storage): void
+    {
+        $fq_class_name_lc = strtolower($storage->name);
+
+        foreach ($storage->declaring_pseudo_method_ids as $method_name => $method_id) {
+            if (strtolower($method_id->fq_class_name) !== $fq_class_name_lc) {
+                unset($storage->pseudo_methods[$method_name], $storage->declaring_pseudo_method_ids[$method_name]);
+            }
+        }
+
+        foreach ($storage->declaring_pseudo_static_method_ids as $method_name => $method_id) {
+            if (strtolower($method_id->fq_class_name) !== $fq_class_name_lc) {
+                unset(
+                    $storage->pseudo_static_methods[$method_name],
+                    $storage->declaring_pseudo_static_method_ids[$method_name],
+                );
+            }
+        }
+    }
+
+    /**
+     * Second populate pass: resolve transitive `@mixin` chains.
+     *
+     * `namedMixins` holds only the mixins a class declares or inherits from its parent, and the analyzers look
+     * members up a single hop deep. This records every named mixin reachable through a mixin's own `@mixin`
+     * chain (depth >= 2) in `transitiveNamedMixins`, so a member of a mixin-of-a-mixin resolves on the host.
+     *
+     * It runs once every class is populated, so each mixin target's `namedMixins` already contains those
+     * inherited from its parent class. `namedMixins` itself is never modified, which keeps the result
+     * independent of population order and leaves declaration-site checks on the declared mixins only.
+     */
+    private function populateTransitiveMixins(): void
+    {
+        foreach ($this->classlike_storage_provider->getNew() as $storage) {
+            if ($storage->namedMixins) {
+                $storage->transitiveNamedMixins = $this->resolveTransitiveMixins($storage);
+            }
+        }
+    }
+
+    /**
+     * Breadth-first walk of a host's `@mixin` chain, returning the mixins not already in its `namedMixins`,
+     * deepest hop first and in declaration order within a hop.
+     *
+     * Only named (non-generic) mixins are followed: a generic hop such as `@mixin Collection<T>` needs its
+     * template arguments bound per hop, so it is neither collected nor descended into. A mutual `@mixin`
+     * (A mixes B, B mixes A) terminates via the visited set.
+     *
+     * @return list<TNamedObject>
+     */
+    private function resolveTransitiveMixins(ClassLikeStorage $storage): array
+    {
+        $storage_name_lc = strtolower($storage->name);
+
+        $direct = [];
+        $queue = [];
+        foreach ($storage->namedMixins as $mixin) {
+            $direct[strtolower($this->classlikes->getUnAliasedName($mixin->value))] = true;
+            $queue[] = [$mixin, 1];
+        }
+
+        $visited = [$storage_name_lc => true];
+        $by_depth = [];
+
+        while ($queue) {
+            [$mixin, $depth] = array_shift($queue);
+
+            if ($mixin instanceof TGenericObject) {
+                continue;
+            }
+
+            $mixin_name_lc = strtolower($this->classlikes->getUnAliasedName($mixin->value));
+
+            if (isset($visited[$mixin_name_lc])) {
+                continue;
+            }
+
+            $visited[$mixin_name_lc] = true;
+
+            try {
+                $mixin_storage = $this->classlike_storage_provider->get($mixin_name_lc);
+            } catch (InvalidArgumentException) {
+                // A missing mixin target is reported as UndefinedDocblockClass where it is declared. Unlike a
+                // missing parent it is not recorded as an invalid dependency, which would turn every call on
+                // the host into MixedMethodCall.
+                continue;
+            }
+
+            // A change anywhere in the chain must invalidate the host.
+            $mixin_storage->dependent_classlikes[$storage_name_lc] = true;
+
+            if ($storage->location) {
+                $this->file_reference_provider->addFileInheritanceToClass(
+                    $storage->location->file_path,
+                    $mixin_name_lc,
+                );
+            }
+
+            if (!isset($direct[$mixin_name_lc])) {
+                $by_depth[$depth][] = $mixin;
+            }
+
+            foreach ($mixin_storage->namedMixins as $deeper_mixin) {
+                $queue[] = [$deeper_mixin, $depth + 1];
+            }
+        }
+
+        krsort($by_depth);
+
+        return array_merge(...$by_depth);
+    }
+
+    private function populateInterfaceData(
+        ClassLikeStorage $storage,
+        ClassLikeStorage $interface_storage,
+        ClassLikeStorageProvider $storage_provider,
+        array $dependent_classlikes,
+    ): void {
+        $this->populateClassLikeStorage($interface_storage, $dependent_classlikes);
+
+        // copy over any constants
+        $storage->constants = [...array_filter(
+            $interface_storage->constants,
+            static fn(ClassConstantStorage $constant): bool
+                => $constant->visibility === ClassLikeAnalyzer::VISIBILITY_PUBLIC,
+        ), ...$storage->constants];
+
+        $storage->invalid_dependencies = [
+            ...$storage->invalid_dependencies,
+            ...$interface_storage->invalid_dependencies,
+        ];
+
+        $this->extendTemplateParams($storage, $interface_storage, false);
+
+        $new_parents = array_keys($interface_storage->parent_interfaces);
+        $new_parents[] = $interface_storage->name;
+        foreach ($new_parents as $new_parent) {
+            try {
+                $new_parent = strtolower(
+                    $this->classlikes->getUnAliasedName(
+                        $new_parent,
+                    ),
+                );
+                $new_parent_interface_storage = $storage_provider->get($new_parent);
+            } catch (InvalidArgumentException) {
+                continue;
+            }
+
+            $new_parent_interface_storage->dependent_classlikes[strtolower($storage->name)] = true;
+        }
+    }
+
+    private function extendTemplateParams(
+        ClassLikeStorage $storage,
+        ClassLikeStorage $parent_storage,
+        bool $from_direct_parent,
+    ): void {
+        if ($parent_storage->yield && !$storage->yield) {
+            $storage->yield = $parent_storage->yield;
+            $storage->declaring_yield_fqcn ??= $parent_storage->name;
+        }
+        if ($parent_storage->template_types) {
+            $storage->template_extended_params[$parent_storage->name] = [];
+
+            if (isset($storage->template_extended_offsets[$parent_storage->name])) {
+                // the generic types written in the arguments get the defaults they leave out, as in any other use
+                $written_params = [];
+
+                foreach ($storage->template_extended_offsets[$parent_storage->name] as $written_param) {
+                    $written_params[] = TemplateDefaults::fillNested(
+                        $written_param,
+                        $this->classlike_storage_provider,
+                        null,
+                    );
+                }
+
+                // `@extends Foo<A>` leaving out trailing templates with a default, `@extends Foo[pure]` for a
+                // class with type templates
+                $storage->template_extended_offsets[$parent_storage->name] = PurityArguments::align(
+                    TemplateDefaults::fillTypeArguments($written_params, $parent_storage, null, true),
+                    $parent_storage,
+                );
+
+                foreach ($storage->template_extended_offsets[$parent_storage->name] as $i => $type) {
+                    $parent_template_type_names = array_keys($parent_storage->template_types);
+
+                    $mapped_name = $parent_template_type_names[$i] ?? null;
+
+                    if ($mapped_name) {
+                        $storage->template_extended_params[$parent_storage->name][$mapped_name]
+                            = $type;
+                    }
+                }
+
+                // trailing templates left out are bound to their default
+                foreach (TemplateDefaults::bindOmitted(
+                    $parent_storage,
+                    $storage->template_extended_params[$parent_storage->name],
+                    false,
+                ) as $template_name => $type) {
+                    if (!isset($storage->template_extended_params[$parent_storage->name][$template_name])) {
+                        $storage->template_extended_params[$parent_storage->name][$template_name]
+                            = $type->setProperties(['from_docblock' => true]);
+                    }
+                }
+
+                if ($parent_storage->template_extended_params) {
+                    foreach ($parent_storage->template_extended_params as $t_storage_class => $type_map) {
+                        foreach ($type_map as $i => $type) {
+                            $storage->template_extended_params[$t_storage_class][$i] = self::extendType(
+                                $type,
+                                $storage,
+                            );
+                        }
+                    }
+                }
+            } else {
+                // templates with a default are bound to it, others to their bound
+                foreach (TemplateDefaults::bindOmitted($parent_storage, [], true) as $template_name => $type) {
+                    $storage->template_extended_params[$parent_storage->name][$template_name]
+                        = $type->setProperties(['from_docblock' => false]);
+                }
+
+                if ($from_direct_parent) {
+                    if ($parent_storage->template_extended_params) {
+                        $storage->template_extended_params = array_merge(
+                            $storage->template_extended_params,
+                            $parent_storage->template_extended_params,
+                        );
+                    }
+                }
+            }
+        } elseif ($parent_storage->template_extended_params) {
+            $storage->template_extended_params = array_merge(
+                $storage->template_extended_params ?: [],
+                $parent_storage->template_extended_params,
+            );
+        }
+    }
+
+    private function populateInterfaceDataFromParentInterface(
+        ClassLikeStorage $storage,
+        ClassLikeStorageProvider $storage_provider,
+        array $dependent_classlikes,
+        string $parent_interface_lc,
+    ): ?ClassLikeStorage {
+        try {
+            $parent_interface_lc = strtolower(
+                $this->classlikes->getUnAliasedName(
+                    $parent_interface_lc,
+                ),
+            );
+            $parent_interface_storage = $storage_provider->get($parent_interface_lc);
+        } catch (InvalidArgumentException) {
+            $this->progress->debug('Populator could not find dependency (' . __LINE__ . ")\n");
+
+            $storage->invalid_dependencies[$parent_interface_lc] = true;
+            return null;
+        }
+
+        $this->populateInterfaceData($storage, $parent_interface_storage, $storage_provider, $dependent_classlikes);
+
+        $this->inheritMethodsFromParent($storage, $parent_interface_storage);
+        $this->inheritPropertiesFromParent($storage, $parent_interface_storage);
+
+        $storage->parent_interfaces = [...$parent_interface_storage->parent_interfaces, ...$storage->parent_interfaces];
+
+        if (isset($storage->parent_interfaces[strtolower(UnitEnum::class)])) {
+            $storage->declaring_property_ids['name'] = $storage->name;
+            $storage->appearing_property_ids['name'] = "{$storage->name}::\$name";
+            $storage->properties['name'] = new PropertyStorage();
+            $storage->properties['name']->type = new Union([new TNonEmptyString()]);
+        }
+        if (isset($storage->parent_interfaces[strtolower(BackedEnum::class)])) {
+            $storage->declaring_property_ids['value'] = $storage->name;
+            $storage->appearing_property_ids['value'] = "{$storage->name}::\$value";
+            $storage->properties['value'] = new PropertyStorage();
+            $storage->properties['value']->type = new Union([new TInt(), new TString()]);
+        }
+
+        return $parent_interface_storage;
+    }
+
+    private function populateDataFromImplementedInterface(
+        ClassLikeStorage $storage,
+        ClassLikeStorageProvider $storage_provider,
+        array $dependent_classlikes,
+        string $implemented_interface_lc,
+    ): void {
+        try {
+            $implemented_interface_lc = strtolower(
+                $this->classlikes->getUnAliasedName(
+                    $implemented_interface_lc,
+                ),
+            );
+            $implemented_interface_storage = $storage_provider->get($implemented_interface_lc);
+        } catch (InvalidArgumentException) {
+            $this->progress->debug('Populator could not find dependency (' . __LINE__ . ")\n");
+
+            $storage->invalid_dependencies[$implemented_interface_lc] = true;
+            return;
+        }
+
+        $this->populateInterfaceData(
+            $storage,
+            $implemented_interface_storage,
+            $storage_provider,
+            $dependent_classlikes,
+        );
+
+        $storage->class_implements = [
+            ...$storage->class_implements,
+            ...$implemented_interface_storage->parent_interfaces,
+        ];
+    }
+
+    /**
+     * @param  array<string, bool> $dependent_file_paths
+     */
+    private function populateFileStorage(FileStorage $storage, array $dependent_file_paths = []): void
+    {
+        if ($storage->populated) {
+            return;
+        }
+
+        foreach ($storage->functions as $function_storage) {
+            $this->resolveDeferredCapabilities($function_storage);
+            $this->resolveTemplateBoundAliases($function_storage);
+            $this->populateGeneratorPurity($function_storage, null);
+        }
+
+        $file_path_lc = strtolower($storage->file_path);
+
+        if (isset($dependent_file_paths[$file_path_lc])) {
+            return;
+        }
+
+        $dependent_file_paths[$file_path_lc] = true;
+
+        $all_required_file_paths = $storage->required_file_paths;
+
+        foreach ($storage->required_file_paths as $included_file_path => $_) {
+            try {
+                $included_file_storage = $this->file_storage_provider->get($included_file_path);
+            } catch (InvalidArgumentException) {
+                continue;
+            }
+
+            $this->populateFileStorage($included_file_storage, $dependent_file_paths);
+
+            $all_required_file_paths = $all_required_file_paths + $included_file_storage->required_file_paths;
+        }
+
+        foreach ($all_required_file_paths as $included_file_path => $_) {
+            try {
+                $included_file_storage = $this->file_storage_provider->get($included_file_path);
+            } catch (InvalidArgumentException) {
+                continue;
+            }
+
+            $storage->declaring_function_ids = [
+                ...$included_file_storage->declaring_function_ids,
+                ...$storage->declaring_function_ids,
+            ];
+
+            $storage->declaring_constants = [
+                ...$included_file_storage->declaring_constants,
+                ...$storage->declaring_constants,
+            ];
+        }
+
+        foreach ($storage->referenced_classlikes as $fq_class_name) {
+            try {
+                $classlike_storage = $this->classlike_storage_provider->get($fq_class_name);
+            } catch (InvalidArgumentException) {
+                continue;
+            }
+
+            if (!$classlike_storage->location) {
+                continue;
+            }
+
+            try {
+                $included_file_storage = $this->file_storage_provider->get($classlike_storage->location->file_path);
+            } catch (InvalidArgumentException) {
+                continue;
+            }
+
+            foreach ($classlike_storage->used_traits as $used_trait) {
+                try {
+                    $trait_storage = $this->classlike_storage_provider->get($used_trait);
+                } catch (InvalidArgumentException) {
+                    continue;
+                }
+
+                if (!$trait_storage->location) {
+                    continue;
+                }
+
+                try {
+                    $included_trait_file_storage = $this->file_storage_provider->get(
+                        $trait_storage->location->file_path,
+                    );
+                } catch (InvalidArgumentException) {
+                    continue;
+                }
+
+                $storage->declaring_function_ids = [
+                    ...$included_trait_file_storage->declaring_function_ids,
+                    ...$storage->declaring_function_ids,
+                ];
+            }
+
+            $storage->declaring_function_ids = [
+                ...$included_file_storage->declaring_function_ids,
+                ...$storage->declaring_function_ids,
+            ];
+        }
+
+        $storage->required_file_paths = $all_required_file_paths;
+
+        foreach ($all_required_file_paths as $required_file_path) {
+            try {
+                $required_file_storage = $this->file_storage_provider->get($required_file_path);
+            } catch (InvalidArgumentException) {
+                continue;
+            }
+
+            $required_file_storage->required_by_file_paths += [$file_path_lc => $storage->file_path];
+        }
+
+        foreach ($storage->required_classes as $required_classlike) {
+            try {
+                $classlike_storage = $this->classlike_storage_provider->get($required_classlike);
+            } catch (InvalidArgumentException) {
+                continue;
+            }
+
+            if (!$classlike_storage->location) {
+                continue;
+            }
+
+            try {
+                $required_file_storage = $this->file_storage_provider->get($classlike_storage->location->file_path);
+            } catch (InvalidArgumentException) {
+                continue;
+            }
+
+            $required_file_storage->required_by_file_paths += [$file_path_lc => $storage->file_path];
+        }
+
+        $storage->populated = true;
+    }
+
+    private function inheritConstantsFromTrait(
+        ClassLikeStorage $storage,
+        ClassLikeStorage $trait_storage,
+    ): void {
+        if (!$trait_storage->is_trait) {
+            $location = $storage->location ?? $storage->stmt_location;
+            if (!$location) {
+                return;
+            }
+
+            $trait_real_type = 'Class';
+            if ($trait_storage->is_enum) {
+                $trait_real_type = 'Enum';
+            } elseif ($trait_storage->is_interface) {
+                $trait_real_type = 'Interface';
+            }
+
+            IssueBuffer::maybeAdd(
+                new UndefinedTrait(
+                    $trait_real_type . ' ' . $trait_storage->name . ' is not a trait',
+                    $location,
+                ),
+                $storage->suppressed_issues,
+            );
+
+            return;
+        }
+
+        foreach ($trait_storage->constants as $constant_name => $class_constant_storage) {
+            $trait_alias_map_cased = array_flip($storage->trait_alias_map_cased);
+            if (isset($trait_alias_map_cased[$constant_name])) {
+                $aliased_constant_name_lc = strtolower($trait_alias_map_cased[$constant_name]);
+                $aliased_constant_name = $trait_alias_map_cased[$constant_name];
+            } else {
+                $aliased_constant_name_lc = strtolower($constant_name);
+                $aliased_constant_name = $constant_name;
+            }
+            $visibility = $storage->trait_visibility_map[$aliased_constant_name_lc]
+                ?? $class_constant_storage->visibility;
+            $final = $storage->trait_final_map[$aliased_constant_name_lc] ?? $class_constant_storage->final;
+            $storage->constants[$aliased_constant_name] = new ClassConstantStorage(
+                $class_constant_storage->type,
+                $class_constant_storage->inferred_type,
+                $visibility,
+                $class_constant_storage->location,
+                $class_constant_storage->type_location,
+                $class_constant_storage->stmt_location,
+                $class_constant_storage->deprecated,
+                $final,
+                $class_constant_storage->unresolved_node,
+                $class_constant_storage->attributes,
+                $class_constant_storage->suppressed_issues,
+                $class_constant_storage->description,
+            );
+        }
+    }
+
+    /**
+     * The names a method of the parent is inherited under: its own, unless `insteadof` excludes the parent's, and
+     * the aliases of a trait.
+     *
+     * @param lowercase-string $method_name_lc
+     * @return list<lowercase-string>
+     * @psalm-capabilities read-props
+     */
+    private static function getTraitMethodNames(
+        ClassLikeStorage $storage,
+        ClassLikeStorage $parent_storage,
+        string $method_name_lc,
+    ): array {
+        if (!$parent_storage->is_trait) {
+            return [$method_name_lc];
+        }
+
+        $parent_name_lc = strtolower($parent_storage->name);
+        $names = isset($storage->trait_excluded_methods[$method_name_lc][$parent_name_lc])
+            ? []
+            : [$method_name_lc];
+
+        foreach (array_keys($storage->trait_alias_map, $method_name_lc, true) as $alias) {
+            if (($storage->trait_alias_trait_map[$alias] ?? $parent_name_lc) === $parent_name_lc) {
+                $names[] = $alias;
+            }
+        }
+
+        return $names;
+    }
+
+    private function inheritMethodsFromParent(
+        ClassLikeStorage $storage,
+        ClassLikeStorage $parent_storage,
+    ): void {
+        $fq_class_name = $storage->name;
+        $fq_class_name_lc = strtolower($fq_class_name);
+
+        if ($parent_storage->sealed_methods !== null) {
+            $storage->sealed_methods = $parent_storage->sealed_methods;
+        }
+
+        // register where they appear (can never be in a trait)
+        foreach ($parent_storage->appearing_method_ids as $method_name_lc => $appearing_method_id) {
+            $aliased_method_names = self::getTraitMethodNames($storage, $parent_storage, $method_name_lc);
+
+            foreach ($aliased_method_names as $aliased_method_name) {
+                if (isset($storage->appearing_method_ids[$aliased_method_name])) {
+                    continue;
+                }
+
+                $implemented_method_id = new MethodIdentifier(
+                    $fq_class_name,
+                    $aliased_method_name,
+                );
+
+                $storage->appearing_method_ids[$aliased_method_name] =
+                    $parent_storage->is_trait ? $implemented_method_id : $appearing_method_id;
+
+                $this_method_id = $fq_class_name_lc . '::' . $method_name_lc;
+
+                if (isset($storage->methods[$aliased_method_name])) {
+                    $storage->potential_declaring_method_ids[$aliased_method_name] = [$this_method_id => true];
+                } else {
+                    if (isset($parent_storage->potential_declaring_method_ids[$aliased_method_name])) {
+                        $storage->potential_declaring_method_ids[$aliased_method_name]
+                            = $parent_storage->potential_declaring_method_ids[$aliased_method_name];
+                    }
+
+                    $storage->potential_declaring_method_ids[$aliased_method_name][$this_method_id] = true;
+
+                    $parent_method_id = strtolower($parent_storage->name) . '::' . $method_name_lc;
+                    $storage->potential_declaring_method_ids[$aliased_method_name][$parent_method_id] = true;
+                }
+            }
+        }
+
+        // register where they're declared
+        foreach ($parent_storage->inheritable_method_ids as $method_name_lc => $declaring_method_id) {
+            if ($method_name_lc !== '__construct'
+                || $parent_storage->preserve_constructor_signature
+                || ($this->classlike_storage_provider->get($declaring_method_id->fq_class_name)
+                    ->methods['__construct'] ?? null)?->abstract
+            ) {
+                if ($parent_storage->is_trait) {
+                    $declaring_class = $declaring_method_id->fq_class_name;
+                    $declaring_class_storage = $this->classlike_storage_provider->get($declaring_class);
+
+                    if (isset($declaring_class_storage->methods[$method_name_lc])
+                        && $declaring_class_storage->methods[$method_name_lc]->abstract
+                    ) {
+                        $storage->overridden_method_ids[$method_name_lc][$declaring_method_id->fq_class_name]
+                            = $declaring_method_id;
+                    }
+                } else {
+                    // A method can end up in $parent_storage->inheritable_method_ids
+                    // while being private -- this happens when it was originally declared in a trait, since
+                    // traits copy even private methods into every using class (see
+                    // FunctionLikeNodeScanner::$classlike_storage->is_trait carve-out). Such a private method
+                    // is not part of the externally visible API and PHP does not consider it overridable
+                    // across a real class boundary, so it must not be recorded as "overridden" here -- doing
+                    // so produced a MissingOverrideAttribute false positive whenever a subclass re-declared
+                    // (or re-imported via the same trait) a same-named private method.
+                    $declaring_class_storage = $this->classlike_storage_provider->get(
+                        $declaring_method_id->fq_class_name,
+                    );
+                    $declaring_method_storage = $declaring_class_storage->methods[$method_name_lc] ?? null;
+
+                    // A `use T { f as public; }` adaptation does not rewrite the copied method's own
+                    // visibility -- Psalm keeps it in trait_visibility_map on the using class and every
+                    // consumer overlays it (see MethodVisibilityAnalyzer). Reading only
+                    // $declaring_method_storage->visibility would therefore still see `private` for a
+                    // method the parent exposes publicly, and would wrongly drop a real override.
+                    $declaring_visibility = $parent_storage->trait_visibility_map[$method_name_lc]
+                        ?? $declaring_method_storage?->visibility;
+
+                    if ($declaring_method_storage === null
+                        || $declaring_visibility !== ClassLikeAnalyzer::VISIBILITY_PRIVATE
+                    ) {
+                        $storage->overridden_method_ids[$method_name_lc][$declaring_method_id->fq_class_name]
+                            = $declaring_method_id;
+                    }
+                }
+
+                if (isset($parent_storage->overridden_method_ids[$method_name_lc])
+                    && isset($storage->overridden_method_ids[$method_name_lc])
+                ) {
+                    $storage->overridden_method_ids[$method_name_lc]
+                        += $parent_storage->overridden_method_ids[$method_name_lc];
+                }
+            }
+
+            $aliased_method_names = self::getTraitMethodNames($storage, $parent_storage, $method_name_lc);
+
+            foreach ($aliased_method_names as $aliased_method_name) {
+                if (isset($storage->declaring_method_ids[$aliased_method_name])) {
+                    $implementing_method_id = $storage->declaring_method_ids[$aliased_method_name];
+
+                    $implementing_class_storage = $this->classlike_storage_provider->get(
+                        $implementing_method_id->fq_class_name,
+                    );
+
+                    $method = $implementing_class_storage->methods[$implementing_method_id->method_name]
+                        ?? $implementing_class_storage->pseudo_methods[$implementing_method_id->method_name]
+                        ?? $implementing_class_storage->pseudo_static_methods[$implementing_method_id->method_name];
+
+                    if (!$method->abstract
+                        || !empty($storage->methods[$implementing_method_id->method_name]->abstract)
+                    ) {
+                        continue;
+                    }
+                }
+
+                $storage->declaring_method_ids[$aliased_method_name] = $declaring_method_id;
+                $storage->inheritable_method_ids[$aliased_method_name] = $declaring_method_id;
+            }
+        }
+    }
+
+    /**
+     * A property imported from a trait is declared by the trait, not by the class using it
+     *
+     * @psalm-capabilities read-props
+     */
+    private function isPrivateProperty(ClassLikeStorage $storage, string $property_name): bool
+    {
+        $declaring_class = $storage->declaring_property_ids[$property_name] ?? null;
+
+        $declaring_storage = $declaring_class !== null
+            && strtolower($declaring_class) !== strtolower($storage->name)
+            && $this->classlike_storage_provider->has($declaring_class)
+                ? $this->classlike_storage_provider->get($declaring_class)
+                : $storage;
+
+        return isset($declaring_storage->properties[$property_name])
+            && $declaring_storage->properties[$property_name]->visibility === ClassLikeAnalyzer::VISIBILITY_PRIVATE;
+    }
+
+    private function inheritPropertiesFromParent(
+        ClassLikeStorage $storage,
+        ClassLikeStorage $parent_storage,
+    ): void {
+        if ($parent_storage->sealed_properties !== null) {
+            $storage->sealed_properties = $parent_storage->sealed_properties;
+        }
+
+        // register where they appear (can never be in a trait)
+        foreach ($parent_storage->appearing_property_ids as $property_name => $appearing_property_id) {
+            if (isset($storage->appearing_property_ids[$property_name])) {
+                continue;
+            }
+
+            if (!$parent_storage->is_trait && $this->isPrivateProperty($parent_storage, $property_name)) {
+                continue;
+            }
+
+            $implemented_property_id = $storage->name . '::$' . $property_name;
+
+            $storage->appearing_property_ids[$property_name] =
+                $parent_storage->is_trait ? $implemented_property_id : $appearing_property_id;
+        }
+
+        // register where they're declared
+        foreach ($parent_storage->declaring_property_ids as $property_name => $declaring_property_class) {
+            if (isset($storage->declaring_property_ids[$property_name])) {
+                continue;
+            }
+
+            if (!$parent_storage->is_trait && $this->isPrivateProperty($parent_storage, $property_name)) {
+                continue;
+            }
+
+            $storage->declaring_property_ids[$property_name] = $declaring_property_class;
+        }
+
+        // register where they're declared
+        foreach ($parent_storage->inheritable_property_ids as $property_name => $inheritable_property_id) {
+            if (!$parent_storage->is_trait && $this->isPrivateProperty($parent_storage, $property_name)) {
+                continue;
+            }
+
+            if (!$parent_storage->is_trait) {
+                $storage->overridden_property_ids[$property_name][] = $inheritable_property_id;
+            }
+
+            $storage->inheritable_property_ids[$property_name] = $inheritable_property_id;
+        }
+    }
+}

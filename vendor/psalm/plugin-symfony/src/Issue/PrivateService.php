@@ -1,0 +1,17 @@
+<?php
+
+namespace Psalm\SymfonyPsalmPlugin\Issue;
+
+use Psalm\CodeLocation;
+use Psalm\Issue\PluginIssue;
+
+final class PrivateService extends PluginIssue
+{
+    /**
+     * @psalm-capabilities read-props
+     */
+    public function __construct(string $id, CodeLocation $code_location)
+    {
+        parent::__construct(sprintf('Private service "%s" used in container::get()', $id), $code_location);
+    }
+}

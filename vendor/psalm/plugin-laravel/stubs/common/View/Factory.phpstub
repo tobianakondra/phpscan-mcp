@@ -1,0 +1,58 @@
+<?php
+
+namespace Illuminate\View;
+
+class Factory implements \Illuminate\Contracts\View\Factory
+{
+    // View data ($data, $mergeData) is intentionally NOT marked as @psalm-taint-sink html.
+    // Blade auto-escapes all {{ $var }} expressions via htmlspecialchars(), so passing
+    // user input as view data is safe for the common case.
+    // Real XSS requires {!! $var !!} (raw output), which Psalm cannot detect because it
+    // does not parse .blade.php files. Marking view data as an html sink causes massive
+    // false positives with no corresponding detection benefit.
+    // See: https://github.com/psalm/psalm-plugin-laravel/issues/684
+
+    /**
+     * A user-controlled view name selects which blade template gets compiled and executed.
+     * FileViewFinder normalizes it before joining a configured view path, so unlike
+     * `file()`'s path argument it cannot escape to an arbitrary file — include only.
+     *
+     * @psalm-taint-sink include $view
+     */
+    public function make($view, $data = [], $mergeData = []) {}
+
+    /**
+     * @psalm-taint-sink file $path
+     * @psalm-taint-sink include $path
+     */
+    public function file($path, $data = [], $mergeData = []) {}
+
+    // Everything below forwards its view name to make(), so each name param carries the
+    // same include sink. Verified against Illuminate\View\Factory.
+
+    /**
+     * @psalm-taint-sink include $views
+     */
+    public function first(array $views, $data = [], $mergeData = []) {}
+
+    /**
+     * @psalm-taint-sink include $view
+     */
+    public function renderWhen($condition, $view, $data = [], $mergeData = []) {}
+
+    /**
+     * @psalm-taint-sink include $view
+     */
+    public function renderUnless($condition, $view, $data = [], $mergeData = []) {}
+
+    /**
+     * $empty is a view name too, unless it is the `raw|` literal form: the else-branch
+     * calls make($empty).
+     *
+     * @psalm-taint-sink include $view
+     * @psalm-taint-sink include $empty
+     */
+    public function renderEach($view, $data, $iterator, $empty = 'raw|') {}
+
+    public function share($key, $value = null) {}
+}

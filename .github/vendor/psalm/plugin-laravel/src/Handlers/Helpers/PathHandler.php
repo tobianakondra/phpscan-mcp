@@ -1,0 +1,124 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\LaravelPlugin\Handlers\Helpers;
+
+use Closure;
+use PhpParser\Node\Scalar\String_;
+use Psalm\LaravelPlugin\Bootstrap\ApplicationProvider;
+use Psalm\LaravelPlugin\Internal\Arg;
+use Psalm\Plugin\EventHandler\Event\FunctionReturnTypeProviderEvent;
+use Psalm\Plugin\EventHandler\Event\MethodReturnTypeProviderEvent;
+use Psalm\Plugin\EventHandler\FunctionReturnTypeProviderInterface;
+use Psalm\Plugin\EventHandler\MethodReturnTypeProviderInterface;
+use Psalm\Type\Atomic\TLiteralString;
+use Psalm\Type\Atomic\TString;
+use Psalm\Type\Union;
+
+final class PathHandler implements FunctionReturnTypeProviderInterface, MethodReturnTypeProviderInterface
+{
+    /**
+     * @inheritDoc
+     * @see https://laravel.com/docs/master/helpers#paths
+     * @psalm-pure
+     */
+    #[\Override]
+    public static function getFunctionIds(): array
+    {
+        return [
+            'app_path',
+            'base_path',
+            'config_path',
+            'database_path',
+            'lang_path',
+            'resource_path',
+            'public_path',
+            'storage_path',
+        ];
+    }
+
+    /** @inheritDoc */
+    #[\Override]
+    public static function getFunctionReturnType(FunctionReturnTypeProviderEvent $event): \Psalm\Type\Union
+    {
+        $function_id = $event->getFunctionId();
+
+        return self::resolveReturnType($event->getCallArgs(), static function (array $args = []) use (
+            $function_id,
+        ): mixed {
+            return $function_id(...$args);
+        });
+    }
+
+    /** @inheritDoc */
+    #[\Override]
+    public static function getClassLikeNames(): array
+    {
+        return [
+            ApplicationProvider::getAppFullyQualifiedClassName(),
+        ];
+    }
+
+    /** @inheritDoc */
+    #[\Override]
+    public static function getMethodReturnType(MethodReturnTypeProviderEvent $event): ?Union
+    {
+        $methods = [
+            'path',
+            'basepath',
+            'configpath',
+            'databasepath',
+            'langpath',
+            'resourcepath',
+            'publicpath',
+            'storagepath',
+        ];
+
+        $method_name_lowercase = $event->getMethodNameLowercase();
+
+        if (!\in_array($method_name_lowercase, $methods, true)) {
+            return null;
+        }
+
+        /**
+         * @psalm-suppress MissingClosureReturnType
+         */
+        return self::resolveReturnType($event->getCallArgs(), static function (array $args) use (
+            $method_name_lowercase,
+        ) {
+            return ApplicationProvider::getApp()->{$method_name_lowercase}(...$args);
+        });
+    }
+
+    /**
+     * @param list<\PhpParser\Node\Arg> $call_args
+     * @param \Closure[_](list<string>=): mixed $closure
+     *
+     * @psalm-capabilities read-props
+     */
+    private static function resolveReturnType(array $call_args, \Closure $closure): Union
+    {
+        // we're going to do some dynamic analysis here. Were going to invoke the closure that is wrapping the
+        // app method or the global function in order to determine the literal string path that is returned
+        // so that we can inform psalm of where the files live.
+        $argument = '';
+
+        $first_argument = Arg::nodeAt($call_args, 0);
+        if ($first_argument instanceof String_) {
+            $argument = $first_argument->value;
+        }
+
+        $result = $closure([$argument]);
+
+        if (!$result || !\is_string($result)) {
+            return new Union([
+                new TString(),
+            ]);
+        }
+
+        return new Union([
+            TLiteralString::make($result),
+        ]);
+    }
+}

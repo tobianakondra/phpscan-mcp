@@ -1,0 +1,57 @@
+<?php
+
+namespace Illuminate\Foundation\Console;
+
+use Illuminate\Contracts\Console\Kernel as KernelContract;
+
+// Taint annotations for the concrete Kernel class.
+// Psalm does not inherit taint annotations from the Contracts\Console\Kernel interface,
+// so this class must be annotated separately (see also Contracts/Console/Kernel.phpstub for the contract).
+class Kernel implements KernelContract
+{
+    /**
+     * Run an Artisan console command by name.
+     *
+     * @param  \Symfony\Component\Console\Command\Command|string  $command
+     * @param  array  $parameters
+     * @param  \Symfony\Component\Console\Output\OutputInterface|null  $outputBuffer
+     * @return int
+     *
+     * @psalm-taint-sink shell $command
+     */
+    public function call(\Symfony\Component\Console\Command\Command|string $command, array $parameters = [], $outputBuffer = null) {}
+
+    /**
+     * Queue an Artisan console command by name.
+     *
+     * @param  string  $command
+     * @param  array  $parameters
+     * @return \Illuminate\Foundation\Bus\PendingDispatch
+     *
+     * @psalm-taint-sink shell $command
+     */
+    public function queue($command, array $parameters = []) {}
+
+    /**
+     * Get all of the commands registered with the console.
+     *
+     * Forwards Symfony's Application::all(), which keys commands by name. A numeric name
+     * becomes an int key.
+     *
+     * @return array<array-key, \Symfony\Component\Console\Command\Command>
+     */
+    public function all() {}
+
+    /**
+     * Register a Closure based command with the application.
+     *
+     * At runtime ClosureCommand::execute() binds the callback to the command instance, so `$this`
+     * inside the closure is the ClosureCommand.
+     *
+     * @param  string  $signature
+     * @param  \Closure  $callback
+     * @param-closure-this \Illuminate\Foundation\Console\ClosureCommand $callback
+     * @return \Illuminate\Foundation\Console\ClosureCommand
+     */
+    public function command($signature, \Closure $callback) {}
+}

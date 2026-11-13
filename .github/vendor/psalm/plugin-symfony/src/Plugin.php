@@ -1,0 +1,200 @@
+<?php
+
+namespace Psalm\SymfonyPsalmPlugin;
+
+use Doctrine\Common\Annotations\AnnotationRegistry;
+use Psalm\Exception\ConfigException;
+use Psalm\Plugin\PluginEntryPointInterface;
+use Psalm\Plugin\PluginFixableIssuesInterface;
+use Psalm\Plugin\RegistrationInterface;
+use Psalm\SymfonyPsalmPlugin\Handler\AnnotationHandler;
+use Psalm\SymfonyPsalmPlugin\Handler\AutowireCallableHandler;
+use Psalm\SymfonyPsalmPlugin\Handler\ConsoleHandler;
+use Psalm\SymfonyPsalmPlugin\Handler\ContainerDependencyHandler;
+use Psalm\SymfonyPsalmPlugin\Handler\ContainerHandler;
+use Psalm\SymfonyPsalmPlugin\Handler\DoctrineQueryBuilderHandler;
+use Psalm\SymfonyPsalmPlugin\Handler\DoctrineRepositoryHandler;
+use Psalm\SymfonyPsalmPlugin\Handler\FrameworkCallsHandler;
+use Psalm\SymfonyPsalmPlugin\Handler\HeaderBagHandler;
+use Psalm\SymfonyPsalmPlugin\Handler\ParameterBagHandler;
+use Psalm\SymfonyPsalmPlugin\Handler\RequiredPropertyHandler;
+use Psalm\SymfonyPsalmPlugin\Handler\RequiredSetterHandler;
+use Psalm\SymfonyPsalmPlugin\Handler\RouterHandler;
+use Psalm\SymfonyPsalmPlugin\Handler\ServiceLocatorHandler;
+use Psalm\SymfonyPsalmPlugin\Issue\InvalidConsoleArgumentValue;
+use Psalm\SymfonyPsalmPlugin\Issue\InvalidConsoleOptionValue;
+use Psalm\SymfonyPsalmPlugin\Issue\RepositoryStringShortcut;
+use Psalm\SymfonyPsalmPlugin\Provider\FormGetErrorsReturnTypeProvider;
+use Psalm\SymfonyPsalmPlugin\Symfony\ContainerMeta;
+use Psalm\SymfonyPsalmPlugin\Twig\AnalyzedTemplatesTainter;
+use Psalm\SymfonyPsalmPlugin\Twig\CachedTemplatesMapping;
+use Psalm\SymfonyPsalmPlugin\Twig\CachedTemplatesTainter;
+use Psalm\SymfonyPsalmPlugin\Twig\TemplateFileAnalyzer;
+use Psalm\SymfonyPsalmPlugin\Twig\TwigUtils;
+use Symfony\Component\DependencyInjection\Exception\ServiceNotFoundException;
+use Symfony\Component\HttpKernel\Kernel;
+
+/**
+ * @psalm-suppress UnusedClass
+ */
+final class Plugin implements PluginEntryPointInterface, PluginFixableIssuesInterface
+{
+    #[\Override]
+    public function getFixableIssues(?\SimpleXMLElement $config = null): array
+    {
+        return [
+            InvalidConsoleArgumentValue::class,
+            InvalidConsoleOptionValue::class,
+            RepositoryStringShortcut::class,
+        ];
+    }
+
+    #[\Override]
+    public function __invoke(RegistrationInterface $registration, ?\SimpleXMLElement $config = null): void
+    {
+        require_once __DIR__.'/Handler/HeaderBagHandler.php';
+        require_once __DIR__.'/Handler/ContainerHandler.php';
+        require_once __DIR__.'/Handler/ConsoleHandler.php';
+        require_once __DIR__.'/Handler/ContainerDependencyHandler.php';
+        require_once __DIR__.'/Handler/RequiredPropertyHandler.php';
+        require_once __DIR__.'/Handler/RequiredSetterHandler.php';
+        require_once __DIR__.'/Handler/RouterHandler.php';
+        require_once __DIR__.'/Handler/FrameworkCallsHandler.php';
+        require_once __DIR__.'/Handler/ServiceLocatorHandler.php';
+        require_once __DIR__.'/Handler/AutowireCallableHandler.php';
+        require_once __DIR__.'/Provider/FormGetErrorsReturnTypeProvider.php';
+
+        $registration->registerHooksFromClass(HeaderBagHandler::class);
+        $registration->registerHooksFromClass(ConsoleHandler::class);
+        $registration->registerHooksFromClass(ContainerDependencyHandler::class);
+        $registration->registerHooksFromClass(RequiredPropertyHandler::class);
+        $registration->registerHooksFromClass(RequiredSetterHandler::class);
+        $registration->registerHooksFromClass(RouterHandler::class);
+        $registration->registerHooksFromClass(FrameworkCallsHandler::class);
+        $registration->registerHooksFromClass(ServiceLocatorHandler::class);
+        ServiceLocatorHandler::init(null);
+        $registration->registerHooksFromClass(AutowireCallableHandler::class);
+        AutowireCallableHandler::init(null);
+
+        if (class_exists(\Doctrine\ORM\QueryBuilder::class)) {
+            require_once __DIR__.'/Handler/DoctrineQueryBuilderHandler.php';
+            $registration->registerHooksFromClass(DoctrineQueryBuilderHandler::class);
+
+            require_once __DIR__.'/Handler/DoctrineRepositoryHandler.php';
+            $registration->registerHooksFromClass(DoctrineRepositoryHandler::class);
+        }
+
+        if (class_exists(AnnotationRegistry::class)) {
+            if (method_exists(AnnotationRegistry::class, 'registerLoader')) {
+                AnnotationRegistry::registerLoader('class_exists');
+            }
+
+            require_once __DIR__.'/Handler/AnnotationHandler.php';
+            $registration->registerHooksFromClass(AnnotationHandler::class);
+        }
+
+        if (isset($config->containerXml)) {
+            $containerMeta = new ContainerMeta((array) $config->containerXml);
+            ContainerHandler::init($containerMeta);
+            RouterHandler::init($containerMeta);
+            ServiceLocatorHandler::init($containerMeta);
+            AutowireCallableHandler::init($containerMeta);
+
+            try {
+                /** @psalm-var list<array{class-string, ?class-string}> $extensionClasses */
+                $extensionClasses = array_filter(array_map(function (array $m) use ($containerMeta) {
+                    if ('addExtension' !== $m[0]) {
+                        return null;
+                    }
+
+                    try {
+                        $definition = $containerMeta->get($m[1][0]);
+                        $class = $definition->getClass();
+                    } catch (ServiceNotFoundException $e) {
+                        return null;
+                    }
+
+                    // Twig >= 3.21: the extension is built from the runtime class given as its argument
+                    return null === $class ? null : [$class, \Twig\Extension\AttributeExtension::class === $class ? ($definition->getArguments()[0] ?? null) : null];
+                }, $containerMeta->get('twig')->getMethodCalls()));
+                TemplateFileAnalyzer::initExtensions($extensionClasses);
+            } catch (ServiceNotFoundException $e) {
+            }
+
+            require_once __DIR__.'/Handler/ParameterBagHandler.php';
+            ParameterBagHandler::init($containerMeta);
+            $registration->registerHooksFromClass(ParameterBagHandler::class);
+        }
+
+        $registration->registerHooksFromClass(ContainerHandler::class);
+
+        $symfonyMajorVersion = (string) ($config->symfonyMajorVersion ?? Kernel::MAJOR_VERSION);
+
+        $this->addStubs($registration, __DIR__.'/Stubs/common');
+        $this->addStubs($registration, __DIR__.'/Stubs/'.$symfonyMajorVersion);
+        $this->addStubs($registration, __DIR__.'/Stubs/php');
+
+        if (isset($config->twigCachePath)) {
+            $twig_cache_path = getcwd().DIRECTORY_SEPARATOR.ltrim((string) $config->twigCachePath, DIRECTORY_SEPARATOR);
+            if (!is_dir($twig_cache_path) || !is_readable($twig_cache_path)) {
+                throw new ConfigException(sprintf('The twig cache directory %s is missing or not readable.', $twig_cache_path));
+            }
+
+            require_once __DIR__.'/Twig/CachedTemplatesTainter.php';
+            $registration->registerHooksFromClass(CachedTemplatesTainter::class);
+
+            require_once __DIR__.'/Twig/CachedTemplatesMapping.php';
+            $registration->registerHooksFromClass(CachedTemplatesMapping::class);
+            CachedTemplatesMapping::setCachePath($twig_cache_path);
+        }
+
+        require_once __DIR__.'/Twig/AnalyzedTemplatesTainter.php';
+        foreach ($config->twigRenderMethod ?? [] as $renderMethod) {
+            $method = explode('::', trim((string) $renderMethod));
+            $templateArgument = (int) ($renderMethod['templateArgument'] ?? 0);
+            $contextArgument = (int) ($renderMethod['contextArgument'] ?? 1);
+            $templateDirectoryArgument = isset($renderMethod['templateDirectoryArgument']) ? (int) $renderMethod['templateDirectoryArgument'] : null;
+            if (2 !== count($method) || '' === $method[0] || '' === $method[1] || $templateArgument < 0 || $contextArgument < 0 || (null !== $templateDirectoryArgument && $templateDirectoryArgument < 0)) {
+                throw new ConfigException(sprintf('The twig render method %s is not of the form Class::method with arguments counted from 0.', (string) $renderMethod));
+            }
+
+            AnalyzedTemplatesTainter::addRenderMethod($method[0], $method[1], $templateArgument, $contextArgument, $templateDirectoryArgument);
+        }
+        $registration->registerHooksFromClass(AnalyzedTemplatesTainter::class);
+        foreach ($config->twigConstant ?? [] as $constant) {
+            $name = trim((string) ($constant['name'] ?? ''));
+            if ('' === $name) {
+                throw new ConfigException('A twig constant has no name.');
+            }
+
+            TwigUtils::addConstant($name, (string) $constant);
+        }
+
+        if (isset($config->twigRootPath)) {
+            $twig_root_path = trim((string) $config->twigRootPath, DIRECTORY_SEPARATOR);
+            $real_path = getcwd().DIRECTORY_SEPARATOR.$twig_root_path;
+            if (!is_dir($real_path) || !is_readable($real_path)) {
+                throw new ConfigException(sprintf('The twig templates root directory %s is missing or not readable.', $twig_root_path));
+            }
+
+            TemplateFileAnalyzer::setTemplateRootPath($twig_root_path);
+        }
+
+        $registration->registerHooksFromClass(FormGetErrorsReturnTypeProvider::class);
+    }
+
+    private function addStubs(RegistrationInterface $registration, string $path): void
+    {
+        if (!is_dir($path)) {
+            // e.g., looking for stubs for version 3, but there aren't any at time of writing, so don't try and load them.
+            return;
+        }
+
+        $a = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($path));
+        foreach ($a as $file) {
+            if (!$file->isDir()) {
+                $registration->addStubFile($file->getPathname());
+            }
+        }
+    }
+}

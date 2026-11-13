@@ -1,0 +1,675 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\LaravelPlugin\Handlers\Validation;
+
+use Psalm\Internal\Analyzer\ProjectAnalyzer;
+use Psalm\LaravelPlugin\Internal\Arg;
+use Psalm\Plugin\EventHandler\Event\MethodReturnTypeProviderEvent;
+use Psalm\Plugin\EventHandler\MethodReturnTypeProviderInterface;
+use Psalm\Type;
+use Psalm\Type\Atomic\TInt;
+use Psalm\Type\Atomic\TKeyedArray;
+use Psalm\Type\Atomic\TLiteralString;
+use Psalm\Type\Atomic\TNamedObject;
+use Psalm\Type\Union;
+
+/**
+ * Narrows return types of validation methods based on declared rules:
+ *
+ * - FormRequest::validated()         → array shape or single field type from rules()
+ * - FormRequest::safe([...])         → partial array shape for specified keys
+ * - Request::validate([...])         → array shape from inline rules argument
+ * - ValidatedInput::input('field')   → single field type (via generic TRequest parameter)
+ * - ValidatedInput::integer('field') → int component, same integer-cast gate stack
+ * - $this->input()/$this->integer()/$this->boolean() (or $request->...) →
+ *   single field type, gated on presence (see {@see resolveSelfAccessorRule})
+ *
+ * ValidatedInput is generic: ValidatedInput<TRequest of FormRequest>. When safe() returns
+ * ValidatedInput<static>, the template parameter carries the concrete FormRequest class,
+ * enabling type narrowing on ValidatedInput accessor methods.
+ *
+ * Psalm keeps the stub's `@psalm-taint-source` on a call whose return type this handler
+ * provides. `Request::validate()` is a `@method` pseudo-method without one, so
+ * {@see ValidationTaintHandler} sources it.
+ *
+ * Architecture follows {@see \Psalm\LaravelPlugin\Handlers\Console\CommandArgumentHandler}.
+ */
+final class ValidatedTypeHandler implements MethodReturnTypeProviderInterface
+{
+    /**
+     * @return list<string>
+     * @psalm-pure
+     */
+    #[\Override]
+    public static function getClassLikeNames(): array
+    {
+        return [
+            \Illuminate\Foundation\Http\FormRequest::class,
+            \Illuminate\Http\Request::class,
+            \Illuminate\Support\ValidatedInput::class,
+            // input() is declared on the InteractsWithInput trait, not on
+            // FormRequest/Request directly. Without this entry Psalm's method
+            // provider only matches the declaring class chain, so the
+            // resolveSelfInput dispatch below never fires for
+            // `$this->input(...)` inside a FormRequest subclass. See #1015.
+            \Illuminate\Http\Concerns\InteractsWithInput::class,
+            // Same #1015 reasoning — integer()/float()/boolean()/string()/str()
+            // also live on a trait, not FormRequest/Request directly.
+            \Illuminate\Support\Traits\InteractsWithData::class,
+        ];
+    }
+
+    /** @inheritDoc */
+    #[\Override]
+    public static function getMethodReturnType(MethodReturnTypeProviderEvent $event): ?Union
+    {
+        // ValidatedInput methods — resolve via generic TRequest parameter.
+        // Use getFqClasslikeName() (declaring class) instead of getCalledFqClasslikeName()
+        // because the declaring class is always ValidatedInput, while the called class
+        // may not resolve to ValidatedInput when called through template/generic types.
+        if ($event->getFqClasslikeName() === \Illuminate\Support\ValidatedInput::class) {
+            return self::resolveValidatedInputMethod($event);
+        }
+
+        return match ($event->getMethodNameLowercase()) {
+            'validated' => self::resolveValidated($event),
+            'safe' => self::resolveSafe($event),
+            'validate' => self::resolveInlineValidate($event),
+            'input' => self::resolveSelfInput($event),
+            'integer' => self::resolveSelfInteger($event),
+            'boolean' => self::resolveSelfBoolean($event),
+            default => null,
+        };
+    }
+
+    /**
+     * $this->input('field') → rule type, via {@see resolveSelfAccessorRule()}.
+     * Covers `$this->input(...)` inside the FormRequest itself (also
+     * prepareForValidation/withValidator/etc.) — see #1015.
+     *
+     * Taint is restored in {@see ValidatedFieldReadResolver} (the stub's
+     * @psalm-taint-source is dropped when a return-type override fires).
+     * integer() needs none: it was never a taint source.
+     */
+    private static function resolveSelfInput(MethodReturnTypeProviderEvent $event): ?Union
+    {
+        $resolved = self::resolveSelfAccessorRule($event);
+
+        if ($resolved === null) {
+            return null;
+        }
+
+        [, $rules] = $resolved;
+
+        return self::resolveFieldType($rules, $event->getCallArgs(), $event);
+    }
+
+    /**
+     * $this->integer('field') → int component (TIntRange/TLiteralInt/TInt),
+     * via {@see resolveSelfAccessorRule()} for presence + rules() lookup.
+     * $default is never unioned in — with presence guaranteed it's never
+     * consulted, unlike validated($key, $default).
+     *
+     * Nullable bail (kept out of the shared helper): (int) null = 0, which
+     * can fall outside the range even with presence guaranteed — unlike
+     * input(), where null is a legitimately valid raw return value.
+     *
+     * Explicit-integer gate: only narrows when the field's rule includes a
+     * literal `integer` — (int) projects float/string atomics onto int, so
+     * e.g. `accepted` alone (TLiteralInt(1) in its type) or `numeric` (any
+     * float) would otherwise infer a value the cast can't actually produce
+     * ((int) "yes" = 0, (int) "0.5" = 0). Only `integer` forces the raw
+     * value to already be int-formatted, making the cast lossless.
+     *
+     * Falls through to plain `int` when the field is unknown, absent-
+     * capable, nullable, has no explicit `integer` rule, or has no int
+     * component.
+     */
+    private static function resolveSelfInteger(MethodReturnTypeProviderEvent $event): ?Union
+    {
+        $resolved = self::resolveSelfAccessorRule($event);
+
+        if ($resolved === null) {
+            return null;
+        }
+
+        [$rule] = $resolved;
+
+        if (!$rule->hasIntegerRule || $rule->type->isNullable()) {
+            return null;
+        }
+
+        return self::extractIntComponent($rule->type);
+    }
+
+    /**
+     * $this->boolean('field') → TTrue/TFalse literal, when the field's rules
+     * unconditionally require `accepted` or `declined` (#1234 follow-up item 6).
+     *
+     * Sound because boolean() is `filter_var(..., FILTER_VALIDATE_BOOLEAN)`:
+     * every value Laravel's `accepted` rule admits (yes/on/1/"1"/true/"true")
+     * filters to true, and every `declined`-admitted value (no/off/0/"0"/
+     * false/"false") filters to false — see
+     * `Illuminate\Validation\Concerns\ValidatesAttributes::validateAccepted()`
+     * / `validateDeclined()`. `accepted_if`/`declined_if` are conditional and
+     * never set {@see ResolvedRule::$hasAcceptedRule}/`$hasDeclinedRule` (see
+     * {@see \Psalm\LaravelPlugin\Handlers\Validation\ValidationRuleAnalyzer::resolveRuleSegments()}),
+     * so they fall through here too.
+     *
+     * Nullable bail (same rationale as resolveSelfInteger()):
+     * `filter_var(null, FILTER_VALIDATE_BOOLEAN) = false`, which falls
+     * outside a claimed literal `true`.
+     *
+     * Falls through to plain `bool` when the field is unknown, absent-
+     * capable, nullable, or has no unconditional accepted/declined rule.
+     */
+    private static function resolveSelfBoolean(MethodReturnTypeProviderEvent $event): ?Union
+    {
+        $resolved = self::resolveSelfAccessorRule($event);
+
+        if ($resolved === null) {
+            return null;
+        }
+
+        [$rule] = $resolved;
+
+        if ($rule->type->isNullable()) {
+            return null;
+        }
+
+        if ($rule->hasAcceptedRule && !$rule->hasDeclinedRule) {
+            return Type::getTrue();
+        }
+
+        if ($rule->hasDeclinedRule && !$rule->hasAcceptedRule) {
+            return Type::getFalse();
+        }
+
+        return null;
+    }
+
+    /**
+     * Shared prefix for resolveSelfInput()/resolveSelfInteger()/resolveSelfBoolean():
+     * resolves the rule-covered field for `$this->...`/`$request->...`.
+     *
+     * Presence gate: narrows only when the rule unconditionally guarantees
+     * the field exists (required/present/accepted/declined, no `sometimes`)
+     * — an absent field's fallback default isn't derived from the rule.
+     *
+     * Pre-validation caveat (applies to every caller): reads before the
+     * validator runs (prepareForValidation() etc.) trust the rule anyway,
+     * same tradeoff as validated().
+     *
+     * @return array{0: ResolvedRule, 1: array<string, ResolvedRule>}|null
+     */
+    private static function resolveSelfAccessorRule(MethodReturnTypeProviderEvent $event): ?array
+    {
+        $callArgs = $event->getCallArgs();
+
+        if ($callArgs === []) {
+            return null;
+        }
+
+        // Cheap literal-key check first — avoids the rules() AST walk for
+        // the common dynamic-key case.
+        $nodeTypeProvider = $event->getSource()->getNodeTypeProvider();
+        $firstArgType = $nodeTypeProvider->getType($callArgs[0]->value);
+
+        if (!$firstArgType instanceof Union || !$firstArgType->isSingleStringLiteral()) {
+            return null;
+        }
+
+        $rules = self::getRulesForSelfAccessor($event);
+
+        if ($rules === null) {
+            return null;
+        }
+
+        $key = $firstArgType->getSingleStringLiteral()->value;
+        $rule = $rules[$key] ?? null;
+
+        // sometimes|required: field can be absent even when required.
+        if ($rule === null || !$rule->guaranteesPresence()) {
+            return null;
+        }
+
+        return [$rule, $rules];
+    }
+
+    /**
+     * rules() for a self-accessor call site, called from
+     * {@see resolveSelfAccessorRule()}.
+     *
+     * Inheritance gate: InteractsWithInput/InteractsWithData are also used
+     * by plain Request — only narrow genuine FormRequest subclasses.
+     *
+     * @return array<string, ResolvedRule>|null
+     */
+    private static function getRulesForSelfAccessor(MethodReturnTypeProviderEvent $event): ?array
+    {
+        $calledClass = $event->getCalledFqClasslikeName();
+
+        if ($calledClass === null) {
+            return null;
+        }
+
+        try {
+            $codebase = ProjectAnalyzer::getInstance()->getCodebase();
+        } catch (\RuntimeException|\Error) {
+            return null;
+        }
+
+        try {
+            $isFormRequest
+                = $calledClass === \Illuminate\Foundation\Http\FormRequest::class
+                || $codebase->classExtends($calledClass, \Illuminate\Foundation\Http\FormRequest::class);
+        } catch (\Psalm\Exception\UnpopulatedClasslikeException|\InvalidArgumentException) {
+            return null;
+        }
+
+        if (!$isFormRequest) {
+            return null;
+        }
+
+        // classExtends succeeded, so Psalm has metadata; narrow to class-string.
+        /** @var class-string $calledClass */
+        return ValidationRuleAnalyzer::getRulesForFormRequest($calledClass);
+    }
+
+    /**
+     * Int-family atomics (TIntRange/TLiteralInt/TInt) only; drops numeric-
+     * string/float siblings, mirroring what (int) cares about. Null (→
+     * plain `int` stub) when there's no int component.
+     *
+     * @psalm-pure
+     */
+    private static function extractIntComponent(Union $type): ?Union
+    {
+        $intAtomics = [];
+
+        foreach ($type->getAtomicTypes() as $atomic) {
+            if ($atomic instanceof TInt) {
+                $intAtomics[] = $atomic;
+            }
+        }
+
+        if ($intAtomics === []) {
+            return null;
+        }
+
+        return new Union($intAtomics);
+    }
+
+    /**
+     * FormRequest::validated() → full array shape or single field type.
+     */
+    private static function resolveValidated(MethodReturnTypeProviderEvent $event): ?Union
+    {
+        $rules = self::getRulesForCalledClass($event);
+
+        if ($rules === null) {
+            return null;
+        }
+
+        $callArgs = $event->getCallArgs();
+
+        // validated() with no args → full array shape
+        if ($callArgs === []) {
+            return self::buildArrayShape($rules);
+        }
+
+        // validated('field') with literal string key → single field type
+        return self::resolveFieldType($rules, $callArgs, $event);
+    }
+
+    /**
+     * FormRequest::safe(['key1', 'key2']) → partial array shape for specified keys.
+     *
+     * safe() without args falls through to the stub return type (ValidatedInput<static>|array).
+     */
+    private static function resolveSafe(MethodReturnTypeProviderEvent $event): ?Union
+    {
+        $callArgs = $event->getCallArgs();
+
+        if ($callArgs === []) {
+            return null; // Fall through to stub — returns ValidatedInput<static>
+        }
+
+        $rules = self::getRulesForCalledClass($event);
+
+        if ($rules === null) {
+            return null;
+        }
+
+        // safe(['key1', 'key2']) → extract literal string keys from the array argument
+        $argType = Arg::typeAt($callArgs, $event->getSource(), 0);
+
+        if (!$argType instanceof Union) {
+            return null;
+        }
+
+        $keys = [];
+
+        foreach ($argType->getAtomicTypes() as $atomic) {
+            if ($atomic instanceof TKeyedArray) {
+                foreach ($atomic->properties as $property) {
+                    foreach ($property->getAtomicTypes() as $keyAtomic) {
+                        if ($keyAtomic instanceof TLiteralString) {
+                            $keys[] = $keyAtomic->value;
+                        }
+                    }
+                }
+            }
+        }
+
+        if ($keys === []) {
+            return null;
+        }
+
+        // Build partial shape containing only the requested keys
+        $filtered = [];
+
+        foreach ($keys as $key) {
+            if (isset($rules[$key])) {
+                $filtered[$key] = $rules[$key];
+            }
+        }
+
+        return self::buildArrayShape($filtered);
+    }
+
+    /**
+     * Request::validate(['field' => 'rules']) → array shape from inline rules.
+     */
+    private static function resolveInlineValidate(MethodReturnTypeProviderEvent $event): ?Union
+    {
+        $callArgs = $event->getCallArgs();
+
+        if ($callArgs === []) {
+            return null;
+        }
+
+        $rules = ValidationRuleAnalyzer::getRulesFromValidateArgs($callArgs);
+
+        if ($rules === null) {
+            return null;
+        }
+
+        return self::buildArrayShape($rules);
+    }
+
+    /**
+     * ValidatedInput::input('field'), ::integer('field'), ::str('field'), etc.
+     * → resolve via TRequest template.
+     *
+     * When safe() returns ValidatedInput<StoreUserRequest>, Psalm carries the template
+     * parameter. We extract it here to look up the FormRequest's rules.
+     *
+     * float()/boolean() get no arm here: no float-range type exists to narrow
+     * to, and ValidatedInput's boolean() has no literal-precision case —
+     * ValidatedInput can only be built from already-validated data, so
+     * there's no separate "unvalidated read" surface to cover.
+     */
+    private static function resolveValidatedInputMethod(MethodReturnTypeProviderEvent $event): ?Union
+    {
+        $methodName = $event->getMethodNameLowercase();
+
+        // str()/string() always return Stringable, collect() always returns
+        // Collection, regardless of the validation rule — let those fall
+        // through to the stub return type.
+        if ($methodName !== 'input' && $methodName !== 'integer') {
+            return null;
+        }
+
+        $callArgs = $event->getCallArgs();
+
+        if ($callArgs === []) {
+            return null;
+        }
+
+        // Extract the FormRequest class from the generic TRequest parameter
+        $templateParams = $event->getTemplateTypeParameters();
+
+        if ($templateParams === null || !isset($templateParams[0])) {
+            return null;
+        }
+
+        $formRequestClass = self::extractClassFromUnion($templateParams[0]);
+
+        if ($formRequestClass === null) {
+            return null;
+        }
+
+        $rules = ValidationRuleAnalyzer::getRulesForFormRequest($formRequestClass);
+
+        if ($rules === null) {
+            return null;
+        }
+
+        if ($methodName === 'integer') {
+            return self::resolveValidatedInputInteger($rules, $callArgs, $event);
+        }
+
+        return self::resolveFieldType($rules, $callArgs, $event);
+    }
+
+    /**
+     * ValidatedInput::integer('field') → int component, mirroring
+     * {@see resolveSelfInteger()}'s gate stack (explicit `integer` rule +
+     * guaranteed presence + non-nullable).
+     *
+     * Presence still needs an explicit check here even though ValidatedInput
+     * only ever holds validated data: an optional (non-`required`) field's
+     * rule is satisfied by the field being entirely ABSENT from validated()
+     * output, in which case ValidatedInput::integer() falls back to its own
+     * `$default` (0) — the same "(int) $default = 0 escapes the range"
+     * hazard {@see resolveSelfAccessorRule()} guards against for the live
+     * Request, just reached via a missing array key instead of a raw null.
+     *
+     * @param array<string, ResolvedRule> $rules
+     * @param list<\PhpParser\Node\Arg> $callArgs
+     */
+    private static function resolveValidatedInputInteger(
+        array $rules,
+        array $callArgs,
+        MethodReturnTypeProviderEvent $event,
+    ): ?Union {
+        $nodeTypeProvider = $event->getSource()->getNodeTypeProvider();
+        $firstArgType = $nodeTypeProvider->getType($callArgs[0]->value);
+
+        if (!$firstArgType instanceof Union || !$firstArgType->isSingleStringLiteral()) {
+            return null;
+        }
+
+        $key = $firstArgType->getSingleStringLiteral()->value;
+        $rule = $rules[$key] ?? null;
+
+        if ($rule === null || !$rule->guaranteesPresence() || !$rule->hasIntegerRule || $rule->type->isNullable()) {
+            return null;
+        }
+
+        return self::extractIntComponent($rule->type);
+    }
+
+    /**
+     * Extract a class-string from a Union type (e.g., from a template parameter).
+     *
+     * @return class-string|null
+     *
+     * @psalm-pure
+     */
+    private static function extractClassFromUnion(Union $union): ?string
+    {
+        foreach ($union->getAtomicTypes() as $atomic) {
+            if ($atomic instanceof TNamedObject) {
+                /** @psalm-var class-string */
+                return $atomic->value;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Resolve rules for the concrete FormRequest subclass being analyzed.
+     *
+     * @return array<string, ResolvedRule>|null
+     */
+    private static function getRulesForCalledClass(MethodReturnTypeProviderEvent $event): ?array
+    {
+        /** @var class-string|null $calledClass */
+        $calledClass = $event->getCalledFqClasslikeName();
+
+        if ($calledClass === null) {
+            return null;
+        }
+
+        return ValidationRuleAnalyzer::getRulesForFormRequest($calledClass);
+    }
+
+    /**
+     * Resolve type for a single field by literal string key.
+     *
+     * @param array<string, ResolvedRule> $rules
+     * @param list<\PhpParser\Node\Arg> $callArgs
+     */
+    private static function resolveFieldType(
+        array $rules,
+        array $callArgs,
+        MethodReturnTypeProviderEvent $event,
+    ): ?Union {
+        $nodeTypeProvider = $event->getSource()->getNodeTypeProvider();
+        $firstArgType = $nodeTypeProvider->getType($callArgs[0]->value);
+
+        if ($firstArgType instanceof Union && $firstArgType->isSingleStringLiteral()) {
+            $key = $firstArgType->getSingleStringLiteral()->value;
+
+            if (isset($rules[$key])) {
+                $fieldType = $rules[$key]->type;
+
+                // If a default value is provided — validated($key, $default) —
+                // the return type can be either the validated rule type or
+                // the type of the default expression.
+                if (isset($callArgs[1])) {
+                    $defaultType = $nodeTypeProvider->getType($callArgs[1]->value);
+
+                    if ($defaultType instanceof Union) {
+                        $fieldType = Type::combineUnionTypes($fieldType, $defaultType);
+                    }
+                }
+
+                return $fieldType;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Build a TKeyedArray shape from resolved rules.
+     *
+     * @param array<string, ResolvedRule> $rules
+     */
+    private static function buildArrayShape(array $rules): ?Union
+    {
+        if ($rules === []) {
+            return null;
+        }
+
+        $root = new ValidationRuleNode();
+
+        foreach ($rules as $field => $resolvedRule) {
+            $segments = \explode('.', $field);
+            self::insertIntoTree($root, $segments, $resolvedRule);
+        }
+
+        return self::buildUnionFromTree($root);
+    }
+
+    /**
+     * Insert a resolved rule into a nested tree structure based on dot-notation segments.
+     *
+     * @param list<string> $segments
+     */
+    private static function insertIntoTree(ValidationRuleNode $node, array $segments, ResolvedRule $resolvedRule): void
+    {
+        $key = \array_shift($segments);
+
+        if ($key === null) {
+            return;
+        }
+
+        $node->children[$key] ??= new ValidationRuleNode();
+
+        if ($segments === []) {
+            $node->children[$key]->rule = $resolvedRule;
+        } else {
+            self::insertIntoTree($node->children[$key], $segments, $resolvedRule);
+        }
+    }
+
+    /**
+     * Recursively convert a nested tree into TKeyedArray Union types.
+     *
+     * Wildcard patterns (tags.*, items.*.id) are already resolved by
+     * ValidationRuleAnalyzer::resolveRules() before reaching this method,
+     * so this method only handles plain dot-notation nesting.
+     *
+     * Known limitation: when all descendants of an intermediate node are optional
+     * (sometimes/no required), the parent group could be absent from validated() output,
+     * but we don't mark it as possibly_undefined. Fixing this would require checking
+     * all descendants recursively — deferred for simplicity.
+     *
+     * @psalm-mutation-free
+     */
+    private static function buildUnionFromTree(ValidationRuleNode $node): ?Union
+    {
+        if ($node->children === []) {
+            return null;
+        }
+
+        /** @var array<string, Union> $properties */
+        $properties = [];
+
+        foreach ($node->children as $key => $child) {
+            if ($key === '*') {
+                continue;
+            }
+
+            // Leaf node — has a rule but no nested children.
+            if ($child->children === []) {
+                if ($child->rule === null) {
+                    continue;
+                }
+
+                $fieldType = $child->rule->type;
+                if (!$child->rule->guaranteesPresence()) {
+                    $fieldType = $fieldType->setPossiblyUndefined(true);
+                }
+
+                $properties[$key] = $fieldType;
+                continue;
+            }
+
+            // Branch node — recurse into nested children.
+            $nested = self::buildUnionFromTree($child);
+
+            if ($nested instanceof Union) {
+                if ($child->rule !== null && !$child->rule->guaranteesPresence()) {
+                    $nested = $nested->setPossiblyUndefined(true);
+                }
+
+                $properties[$key] = $nested;
+            }
+        }
+
+        if ($properties === []) {
+            return null;
+        }
+
+        /** @var non-empty-array<string, Union> $properties */
+        return new Union([TKeyedArray::make($properties)]);
+    }
+}

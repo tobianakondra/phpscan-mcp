@@ -1,0 +1,32 @@
+# ImpureByReferenceAssignment
+
+Emitted when assigning a passed-by-reference variable inside a function or method without the `write-refs` capability.
+
+```php
+<?php
+
+/**
+ * @psalm-pure
+ */
+function foo(string &$a): string {
+    $a = "B";
+    return $a;
+}
+```
+
+## How to fix
+
+Just remove the mutating assignment:
+
+```php
+<?php
+
+/**
+ * @psalm-pure
+ */
+function foo(string &$a): string {
+    return $a;
+}
+```
+
+See [by-reference arguments](../../annotating_code/purity_model.md#by-reference-arguments) in the purity model.

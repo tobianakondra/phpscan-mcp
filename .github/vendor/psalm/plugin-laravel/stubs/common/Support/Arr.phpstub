@@ -1,0 +1,16 @@
+<?php
+
+namespace Illuminate\Support;
+
+/**
+ * Empty re-declaration kept on purpose: it DECLARES `Illuminate\Support\Arr` for projects whose
+ * analyzed vendor does not reflect `illuminate/support` (e.g. slim libraries like
+ * laravel/socialite), where every `Arr::` reference would be `UndefinedClass`.
+ *
+ * `random()` is not stubbed: its reflected conditional already resolves. The `Macroable` trait
+ * is copied verbatim per stub convention; every static helper merges from reflection.
+ */
+class Arr
+{
+    use Traits\Macroable;
+}

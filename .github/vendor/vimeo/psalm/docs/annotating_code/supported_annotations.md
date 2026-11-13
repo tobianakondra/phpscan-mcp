@@ -1,0 +1,847 @@
+# Supported docblock annotations
+
+Psalm supports a wide range of docblock annotations.
+
+## PHPDoc tags
+
+Psalm uses the following PHPDoc tags to understand your code:
+
+- [`@var`](https://docs.phpdoc.org/guide/references/phpdoc/tags/var.html)
+  Used for specifying the types of properties and variables
+- [`@return`](https://docs.phpdoc.org/guide/references/phpdoc/tags/return.html)
+  Used for specifying the return types of functions, methods and closures. On a constructor, it
+  gives the type of the object `new` creates (see [Constructors](purity_model.md#constructors))
+- [`@param`](https://docs.phpdoc.org/guide/references/phpdoc/tags/param.html)
+  Used for specifying types of parameters passed to functions, methods and closures
+- [`@property`](https://docs.phpdoc.org/guide/references/phpdoc/tags/property.html)
+  Used to specify what properties can be accessed on an object that uses `__get` and `__set`
+- [`@property-read`](https://docs.phpdoc.org/guide/references/phpdoc/tags/property.html)
+  Used to specify what properties can be read on object that uses `__get`
+- [`@property-write`](https://docs.phpdoc.org/guide/references/phpdoc/tags/property.html)
+  Used to specify what properties can be written on object that uses `__set`
+- [`@method`](https://docs.phpdoc.org/guide/references/phpdoc/tags/method.html)
+  Used to specify which magic methods are available on object that uses `__call`.
+- [`@deprecated`](https://docs.phpdoc.org/guide/references/phpdoc/tags/deprecated.html)
+  Used to mark functions, methods, classes and interfaces as being deprecated
+- [`@internal`](https://docs.phpdoc.org/guide/references/phpdoc/tags/internal.html)
+   Used to mark classes, functions and properties that are internal to an application or library.
+- [`@mixin`](#mixins)
+    Used to tell Psalm that the current class proxies the methods and properties of the referenced class.
+
+### Off-label usage of the `@var` tag
+
+The `@var` tag is supposed to only be used for properties. Psalm, taking a lead from PHPStorm and other static analysis tools, allows its use inline in the form `@var Type [VariableReference]`.
+
+If `VariableReference` is provided, it should be of the form `$variable` or `$variable->property`. If used above an assignment, Psalm checks whether the `VariableReference` matches the variable being assigned. If they differ, Psalm will assign the `Type` to `VariableReference` and use it in the expression below.
+
+If no `VariableReference` is given, the annotation tells Psalm that the right-hand side of the expression, whether an assignment or a return, is of type `Type`.
+
+```php
+<?php
+/** @var string */
+$a = $_GET['foo'];
+
+/** @var string $b */
+$b = $_GET['bar'];
+
+function bat(): string {
+    /** @var string */
+    return $_GET['bat'];
+}
+```
+### @mixins
+
+Adding `@mixin` to a classes docblock tells Psalm that the class proxies will proxy the methods and properties of the referenced class.
+
+```php
+class A
+{
+    public string $a = 'A';
+ 
+    public function doA(): void
+    {
+    }
+}
+
+/**
+ * @mixin A
+ */
+class B
+{
+    public string $b = 'B';
+
+    public function doB(): void
+    {
+    }
+
+    public function __call($name, $arguments)
+    {
+        (new A())->$name(...$arguments);
+    }
+    
+    public function __get($name)
+    {
+        (new A())->$name;
+    }
+}
+
+$b = new B();
+$b->doB();
+$b->doA(); // works
+echo $b->b;
+echo $b->a; // works
+```
+
+Mixins are followed transitively: if `B` mixes in `A` and `C` mixes in `B`, members of `A` are also available on `C`.
+Chains are only followed through non-generic mixins; a generic hop such as `@mixin Collection<T>` is not traversed.
+
+
+## Psalm-specific tags
+
+There are a number of custom tags that determine how Psalm treats your code.
+
+### `@psalm-consistent-constructor`
+
+See [UnsafeInstantiation](../running_psalm/issues/UnsafeInstantiation.md)
+
+### `@psalm-consistent-templates`
+
+See [UnsafeGenericInstantiation](../running_psalm/issues/UnsafeGenericInstantiation.md)
+
+### `@param-out`, `@psalm-param-out`
+
+This is used to specify that a by-ref type is different from the one that entered. In the function below the first param can be null, but once the function has executed the by-ref value is not null.
+
+```php
+<?php
+/**
+ * @param-out string $s
+ */
+function addFoo(?string &$s) : void {
+    if ($s === null) {
+        $s = "hello";
+    }
+    $s .= "foo";
+}
+```
+
+### `@param-closure-this`, `@psalm-param-closure-this`, `@phpstan-param-closure-this`
+
+This binds `$this` to a specific class type inside a `Closure` or arrow-function expression passed directly as an argument. Use it when the receiving function or method runs the callback with `Closure::bind` / `Closure::call` so that `$this` resolves to a different object than the caller's `$this`. The bound type may be a class name (including a generic type such as `Box<int>`), `$this`, `static`, `self`, `parent`, or a class-level template parameter.
+
+```php
+<?php
+class Macroable {
+    /**
+     * @param-closure-this static $macro
+     */
+    public static function macro(string $name, Closure $macro): void {
+        // store $macro and later run $macro->call($instance)
+    }
+}
+
+class Builder extends Macroable {
+    public int $value = 42;
+}
+
+Builder::macro('grab', function (): int {
+    // $this is Builder here, not the outer scope
+    return $this->value;
+});
+```
+
+Inside the callback, class scope follows the bound type: `self::` refers to that class and `parent::` to its parent. Property types retain the bound class's generic arguments rather than using the caller's property types.
+
+The tag is ignored when it cannot name one known class to bind to (a union such as `A|B`, or a class Psalm has not seen), and when the argument is a static closure, since PHP cannot rebind one.
+
+### `@psalm-var`, `@psalm-param`, `@psalm-return`, `@psalm-property`, `@psalm-property-read`, `@psalm-property-write`, `@psalm-method`
+
+When specifying types in a format not supported by phpDocumentor ([but supported by Psalm](#type-syntax)) you may wish to prepend `@psalm-` to the PHPDoc tag, so as to avoid confusing your IDE. If a `@psalm`-prefixed tag is given, Psalm will use it in place of its non-prefixed counterpart.
+
+### `@psalm-ignore-var`
+
+This annotation is used to ignore the `@var` annotation written in the same docblock. Some IDEs don't fully understand complex types like generics. To take advantage of such IDE's auto-completion, you may sometimes want to use explicit `@var` annotations even when psalm can infer the type just fine. This weakens the effectiveness of type checking in many cases since the explicit `@var` annotation overrides the types inferred by psalm. As psalm ignores the `@var` annotation which is co-located with `@psalm-ignore-var`, IDEs can use the type specified by the `@var` for auto-completion, while psalm can still use its own inferred type for type checking.
+
+```php
+<?php
+/** @return iterable<array-key,\DateTime> $f */
+function getTimes(int $n): iterable {
+    while ($n--) {
+        yield new \DateTime();
+    }
+};
+/**
+ * @var \Datetime[] $times
+ * @psalm-ignore-var
+ */
+$times = getTimes(3);
+// this trace shows "iterable<array-key, DateTime>" instead of "array<array-key, Datetime>"
+/** @psalm-trace $times */
+foreach ($times as $time) {
+    echo $time->format('Y-m-d H:i:s.u') . PHP_EOL;
+}
+```
+
+### `@psalm-suppress SomeIssueName`
+
+This annotation is used to suppress issues. It can be used in function docblocks, class docblocks and also inline, applying to the following statement.
+
+Function docblock example:
+
+```php
+<?php
+/**
+ * @psalm-suppress PossiblyNullOperand
+ */
+function addString(?string $s) {
+    echo "hello " . $s;
+}
+```
+
+Inline example:
+
+```php
+<?php
+function addString(?string $s) {
+    /** @psalm-suppress PossiblyNullOperand */
+    echo "hello " . $s;
+}
+```
+
+`@psalm-suppress all` can be used to suppress all issues instead of listing them individually.
+
+Suppressing an unused-code issue (such as `UnusedClass` or `PossiblyUnusedMethod`) only silences the report for that symbol — it does not mark the symbol as used, so code that is only referenced from it is still reported as unused. Redundant `@psalm-suppress` annotations, in any docblock (including on classes, interfaces, traits and enums), are reported by [`--find-unused-psalm-suppress`](../running_psalm/issues/UnusedPsalmSuppress.md).
+
+### `@psalm-assert`, `@psalm-assert-if-true`, `@psalm-assert-if-false`, `@psalm-if-this-is` and `@psalm-this-out`
+
+See [Adding assertions](adding_assertions.md).
+
+### `@psalm-ignore-nullable-return`
+
+This can be used to tell Psalm not to worry if a function/method returns null. It’s a bit of a hack, but occasionally useful for scenarios where you either have a very high confidence of a non-null value, or some other function guarantees a non-null value for that particular code path.
+
+```php
+<?php
+class Foo {}
+function takesFoo(Foo $f): void {}
+
+/** @psalm-ignore-nullable-return */
+function getFoo(): ?Foo {
+  return rand(0, 10000) > 1 ? new Foo() : null;
+}
+
+takesFoo(getFoo());
+```
+
+### `@psalm-ignore-falsable-return`
+
+This provides the same, but for `false`. Psalm uses this internally for functions like `preg_replace`, which can return false if the given input has encoding errors, but where 99.9% of the time the function operates as expected.
+
+### `@psalm-seal-properties`, `@psalm-no-seal-properties`, `@seal-properties`, `@no-seal-properties`
+
+If you have a magic property getter/setter, you can use `@psalm-seal-properties` to instruct Psalm to disallow getting and setting any properties not contained in a list of `@property` (or `@property-read`/`@property-write`) annotations.
+This is automatically enabled with the configuration option `sealAllProperties` and can be disabled for a class with `@psalm-no-seal-properties`
+
+```php
+<?php
+/**
+ * @property string $foo
+ * @seal-properties
+ */
+class A {
+     public function __get(string $name): ?string {
+          if ($name === "foo") {
+               return "hello";
+          }
+     }
+
+     public function __set(string $name, $value): void {}
+}
+
+$a = new A();
+$a->bar = 5; // this call fails
+```
+
+### `@method` overloads
+
+A magic method can have several `@method` (or `@psalm-method`) lines of the same name: Psalm uses the first one whose parameters accept the arguments of the call, or reports the issues against the last one when none does. A `@psalm-method` of a name replaces the `@method`s of that name.
+
+```php
+<?php
+/**
+ * @method PagedResult search(LimitedQuery $query)
+ * @method PlainResult search(UnlimitedQuery $query)
+ * @method int count(string $table)
+ * @method string count(int $table, int $limit)
+ */
+class Searcher {
+    public function __call(string $name, array $args): object {}
+}
+
+$searcher = new Searcher();
+$searcher->search(new LimitedQuery())->getPageCount();   // no issue
+$searcher->search(new LimitedQuery())->getAllRecords();  // UndefinedMethod
+$searcher->search(new UnlimitedQuery())->getAllRecords(); // no issue
+$searcher->count("users");                                // int
+$searcher->count(1, 2);                                   // string
+$searcher->count(1.5);                                    // InvalidArgument, TooFewArguments
+```
+
+### `@psalm-seal-methods`, `@psalm-no-seal-methods`, `@seal-methods`, `@no-seal-methods`
+
+If you have a magic method caller, you can use `@psalm-seal-methods` to instruct Psalm to disallow calling any methods not contained in a list of `@method` annotations.
+This is automatically enabled with the configuration option `sealAllMethods` and can be disabled for a class with `@psalm-no-seal-methods`
+
+```php
+<?php
+/**
+ * @method foo(): string
+ * @seal-methods
+ */
+class A {
+     public function __call(string $name, array $args) {
+          if ($name === "foo") {
+               return "hello";
+          }
+     }
+ }
+
+$a = new A();
+$b = $a->bar(); // this call fails
+```
+
+### `@psalm-stub-override`
+
+Used in a [stub file](../running_psalm/configuration.md#stubs) on a class, interface, trait or method that is meant to replace an existing declaration. Psalm stops with an error if there is nothing to replace, so a stub cannot silently go stale (a renamed class, a wrong namespace, a removed method).
+
+```php
+<?php
+// stub file
+/** @psalm-stub-override */
+class ArrayObject {
+    /** @psalm-stub-override */
+    public function count(): int {} // fine: ArrayObject::count() exists
+
+    /** @psalm-stub-override */
+    public function nope(): int {} // error: ArrayObject::nope is marked as stub override, but no original counterpart found
+}
+```
+
+### `@psalm-internal`
+
+Used to mark a class, property or function as internal to a given namespace or class or even method. 
+Psalm treats this slightly differently to the PHPDoc `@internal` tag. For `@internal`,
+an issue is raised if the calling code is in a namespace completely unrelated to the namespace of the calling code,
+i.e. not sharing the first element of the namespace.
+
+In contrast for `@psalm-internal`, the docblock line must specify a namespace. An issue is raised if the calling code
+is not within the given namespace.
+
+```php
+<?php
+namespace A\B {
+    /**
+     * @internal
+     * @psalm-internal A\B
+     */
+    class Foo { }
+}
+
+namespace A\B\C {
+    class Bat {
+        public function batBat(): void {
+            $a = new \A\B\Foo(); // this is fine
+        }
+    }
+}
+
+namespace A {
+    class B {
+        public function batBat(): void {
+            $a = new \A\B\Foo(); // this is fine
+        }
+    }
+}
+
+namespace A\C {
+    class Bat {
+        public function batBat(): void {
+            $a = new \A\B\Foo(); // error
+        }
+    }
+}
+
+namespace X {
+    class Foo {        
+        /**
+         * @psalm-internal Y\Bat::batBat
+         */
+        public static function barBar(): void {
+        }
+    }
+}
+
+namespace Y {
+    class Bat {
+        public function batBat() : void {
+            \X\Foo::barBar(); // this is fine
+        }
+        public function fooFoo(): void {
+            \X\Foo::barBar(); // error
+        }
+    }
+}
+```
+
+### `@psalm-readonly` and `@readonly`
+
+Used to annotate a property that can only be written to in its defining class's constructor.
+
+```php
+<?php
+class B {
+  /** @readonly */
+  public string $s;
+
+  public function __construct(string $s) {
+    $this->s = $s;
+  }
+}
+
+$b = new B("hello");
+echo $b->s;
+$b->s = "boo"; // disallowed
+```
+
+### Purity and capabilities
+
+Psalm tracks the side effects a function, method or closure may have as a set of capabilities:
+`read-props`, `write-this-props`, `write-props`, `read-globals`, `write-globals`, `write-refs`, `io`
+and `time`, with `pure` for none of them and `impure` for all of them. [The Purity Model](purity_model.md)
+explains what each capability allows, how calls are charged and how purity templates work. The
+annotations are listed below.
+
+### `@psalm-pure` and `@psalm-impure`
+
+`@psalm-pure` on a function or method gives it no capabilities: its result depends only on its
+arguments. On a class, it applies to every method and bans the use of properties. `@psalm-impure`
+on a function or method gives it every capability, the default for unannotated code, written out.
+See [Annotations](purity_model.md#annotations).
+
+### `@psalm-capabilities`
+
+`@psalm-capabilities <set>` on a function, method or closure gives the capabilities it may use,
+separated by `|` or commas, as in `@psalm-capabilities read-props|write-this-props`. The set may be
+a [type alias](purity_model.md#capability-aliases). On a class or interface, it is a
+[contract](purity_model.md#class-level-contracts) for every method of the class and of the classes
+extending or implementing it. See [Capabilities](purity_model.md#capabilities).
+
+### `@psalm-immutable`
+
+Used to annotate a class where every property is treated by consumers as `@psalm-readonly` and every instance method is treated as `@psalm-capabilities read-props` (see [Annotations](purity_model.md#annotations)).
+
+```php
+<?php
+/**
+ * @psalm-immutable
+ */
+abstract class Foo
+{
+    public string $baz;
+
+    abstract public function bar(): int;
+}
+
+/**
+ * @psalm-immutable
+ */
+final class ChildClass extends Foo
+{
+    public function __construct(string $baz)
+    {
+        $this->baz = $baz;
+    }
+
+    public function bar(): int
+    {
+        return 0;
+    }
+}
+
+$anonymous = new /** @psalm-immutable */ class extends Foo
+{
+    public string $baz = "B";
+
+    public function bar(): int
+    {
+        return 1;
+    }
+};
+```
+
+### `@psalm-mutable`
+
+Used to annotate a class where at least one property is mutable: this is the default behavior, but it can be explicitly marked for clarity.
+
+### `@psalm-purity-template`
+
+`@psalm-purity-template P` on a class, function or method declares a purity template: a template
+parameter whose values are capability sets rather than types. It is used as the purity of a
+callable (`Closure[P](int): int`) or as the purity argument of a class (`Box[P]<int>`,
+`@extends Box[pure]`). Bounds and a default are written as a chain,
+`@psalm-purity-template lower <= P(default) <= upper`, and `Closure[_](...)` in a `@param` type
+declares an unnamed one. See [Purity templates](purity_model.md#purity-templates).
+
+### Iterators and generators
+
+`Traversable`, `Iterator`, `IteratorAggregate`, `Generator` and `iterable` have a purity template,
+`TPurity`: what iterating over them may do, as in `Iterator[pure]<int, string>` or
+`iterable[pure]<int, string>` (`impure` by default). See
+[Iterators and generators](purity_model.md#iterators-and-generators).
+
+### `@psalm-purity-from-template`
+
+`@psalm-purity-from-template P` on a function or method: each call needs the function-like's own
+capabilities plus whatever `P`, a purity template or a type template bound to a closure type, is
+bound to at that call. See
+[`@psalm-purity-from-template`](purity_model.md#psalm-purity-from-template).
+
+### `@psalm-allow-private-mutation`
+
+Used to annotate readonly properties that can be mutated in a private context. With this, public properties can be read from another class but only be mutated within a method of its own class.
+
+```php
+<?php
+class Counter {
+  /**
+   * @readonly
+   * @psalm-allow-private-mutation
+   */
+  public int $count = 0;
+
+  public function increment() : void {
+    $this->count++;
+  }
+}
+
+$counter = new Counter();
+echo $counter->count; // outputs 0
+$counter->increment(); // Method can mutate property
+echo $counter->count; // outputs 1
+$counter->count = 5; // This will fail, as it's mutating a property directly
+```
+
+### `@psalm-readonly-allow-private-mutation`
+
+This is a shorthand for the property annotations `@readonly` and `@psalm-allow-private-mutation`.
+
+```php
+<?php
+class Counter {
+  /**
+   * @psalm-readonly-allow-private-mutation
+   */
+  public int $count = 0;
+
+  public function increment() : void {
+    $this->count++;
+  }
+}
+
+$counter = new Counter();
+echo $counter->count; // outputs 0
+$counter->increment(); // Method can mutate property
+echo $counter->count; // outputs 1
+$counter->count = 5; // This will fail, as it's mutating a property directly
+```
+
+### `@psalm-trace`
+
+You can use this annotation to trace inferred type (applied to the *next* statement).
+
+```php
+<?php
+
+/** @psalm-trace $username */
+$username = $_GET['username']; // prints something like "test.php:4 $username: mixed"
+
+```
+
+*Note*: it throws [special low-level issue](../running_psalm/issues/Trace.md).
+To see it, you can set the global `errorLevel` to 1, or invoke Psalm with
+`--show-info=true`, but both these solutions will probably result in a lot of
+output. Another solution is to selectively bump the error level of the issue,
+so that you only get one more error:
+
+```xml
+<!-- psalm.xml -->
+<issueHandlers>
+  <Trace errorLevel="error"/>
+</issueHandlers>
+```
+
+### `@psalm-check-type`
+
+You can use this annotation to ensure the inferred type matches what you expect.
+
+```php
+<?php
+
+/** @psalm-check-type $foo = int */
+$foo = 1; // No issue
+
+/** @psalm-check-type $bar = int */
+$bar = "not-an-int"; // Checked variable $bar = int does not match $bar = 'not-an-int'
+```
+
+### `@psalm-check-type-exact`
+
+Like `@psalm-check-type`, but checks the exact type of the variable without allowing subtypes.
+
+```php
+<?php
+
+/** @psalm-check-type-exact $foo = int */
+$foo = 1; // Checked variable $foo = int does not match $foo = 1
+```
+
+### `@psalm-taint-*`
+
+See [Security Analysis annotations](../security_analysis/annotations.md).
+
+### `@psalm-type`
+
+This allows you to define an alias for another type.
+
+```php
+<?php
+/**
+ * @psalm-type PhoneType = array{phone: string}
+ */
+class Phone {
+    /**
+     * @psalm-return PhoneType
+     */
+    public function toArray(): array {
+        return ["phone" => "Nokia"];
+    }
+}
+```
+
+### `@psalm-import-type`
+
+You can use this annotation to import a type defined with [`@psalm-type`](#psalm-type) if it was defined somewhere else.
+
+```php
+<?php
+/**
+ * @psalm-import-type PhoneType from Phone
+ */
+class User {
+    /**
+     * @psalm-return PhoneType
+     */
+    public function toArray(): array {
+        return array_merge([], (new Phone())->toArray());
+    }
+}
+```
+
+You can also alias a type when you import it:
+
+```php
+<?php
+/**
+ * @psalm-import-type PhoneType from Phone as MyPhoneTypeAlias
+ */
+class User {
+    /**
+     * @psalm-return MyPhoneTypeAlias
+     */
+    public function toArray(): array {
+        return array_merge([], (new Phone())->toArray());
+    }
+}
+```
+
+### `@psalm-require-extends`
+
+The `@psalm-require-extends` annotation allows you to define the requirements that a trait imposes on the using class.
+
+Psalm also reads the `@phpstan-require-extends` spelling. When a docblock has both, `@psalm-require-extends` is used.
+
+```php
+<?php
+abstract class DatabaseModel {
+  // methods, properties, etc.
+}
+
+/**
+ * @psalm-require-extends DatabaseModel
+ */
+trait SoftDeletingTrait {
+  // useful but scoped functionality, that depends on methods/properties from DatabaseModel
+}
+
+
+class MyModel extends DatabaseModel {
+  // valid
+  use SoftDeletingTrait;
+}
+
+class NormalClass {
+  // triggers an error
+  use SoftDeletingTrait;
+}
+```
+
+### `@psalm-require-implements`
+
+Behaves the same way as `@psalm-require-extends`, but for interfaces.
+
+Psalm also reads the `@phpstan-require-implements` spelling. When a docblock has both, only the `@psalm-require-implements` tags are used.
+
+### `@no-named-arguments`
+
+This will prevent access to the function or method tagged with named parameters (by emitting a `NamedArgumentNotAllowed` issue).
+
+Incidentally, it will change the inferred type for the following code:
+```php
+<?php
+    function a(int ...$a){
+        var_dump($a);
+    }
+```
+The type of `$a` is `array<array-key, int>` without `@no-named-arguments` but becomes `list<int>` with it, because it excludes the case where the offset would be a string with the name of the parameter
+
+### `@psalm-ignore-variable-property` and `@psalm-ignore-variable-method`
+
+Instructs Psalm to ignore variable property fetch / variable method call when looking for dead code.
+```php
+class Foo
+{
+    // this property can be deleted by Psalter,
+    // as potential reference in get() is ignored
+    public string $bar = 'bar';
+
+    public function get(string $name): mixed
+    {
+        /** @psalm-ignore-variable-property */
+        return $this->{$name};
+    }
+}
+```
+When Psalm encounters variable property, it treats all properties in given class as potentially referenced.
+With `@psalm-ignore-variable-property` annotation, this reference is ignored.
+
+While `PossiblyUnusedProperty` would be emitted in both cases, using `@psalm-ignore-variable-property`
+would allow [Psalter](../manipulating_code/fixing.md) to delete `Foo::$bar`.
+
+`@psalm-ignore-variable-method` behaves the same way, but for variable method calls.
+
+### `@psalm-yield`
+
+Used to specify the type of value which will be sent back to a generator when an annotated object instance is yielded.
+
+```php
+<?php
+/**
+ * @template-covariant TValue
+ * @psalm-yield TValue
+ */
+interface Promise {}
+
+/**
+ * @template-covariant TValue
+ * @template-implements Promise<TValue>
+ */
+class Success implements Promise {
+    /**
+     * @psalm-param TValue $value
+     */
+    public function __construct($value) {}
+}
+
+/**
+ * @return Promise<string>
+ */
+function fetch(): Promise {
+    return new Success('{"data":[]}');
+}
+
+function decode(): Generator {
+    $data = yield fetch();
+
+    // this is fine, Psalm knows that $data is a string
+    return json_decode($data);
+}
+```
+Psalm only reads the types: at runtime a coroutine runner (for instance the one of amphp or Revolt) has to resume the generator with the value of the yielded object.
+
+This annotation supports only generic types, meaning that e.g. `@psalm-yield string` would be ignored.
+
+### `@api`, `@psalm-api`
+
+Used to tell Psalm that a class or method is used, even if no references to it can be
+found. Unused issues will be suppressed.
+
+For example, in frameworks, controllers are often invoked "magically" without
+any explicit references to them in your code. You should mark these classes with
+`@psalm-api`.
+```php
+/**
+ * @psalm-api
+ */
+class UnreferencedClass {}
+```
+
+When an [`Unused*` issue](../running_psalm/issues.md) is reported, there are only
+two correct fix paths:
+
+ * The symbol is genuinely **public surface** — consumed from outside the
+   analysed codebase, e.g. a library entry point, or a class instantiated only
+   by a framework, container or plugin loader. Mark it with `@api`/`@psalm-api`.
+   Use this *only* for real public surface.
+ * Otherwise the symbol is **dead code** — remove it, along with anything that
+   was only reachable through it.
+
+For a reported method or property, `@api` may be placed either on that member or
+on the whole class, but marking the **whole class** is almost always the right
+choice: an externally-consumed member belongs to an externally-consumed class,
+and one class-level annotation then covers its entire public API. Conversely, if
+a member is reported as unused inside a class that is *not* marked `@api`, it is
+almost always genuinely dead code — remove it rather than annotating the lone
+member. Annotating an individual member is only correct in the uncommon case
+where the class is not public API but that one member genuinely is.
+
+A class that implements an interface (or extends a class) defined outside the
+project is treated as public surface automatically, since it can be instantiated
+and invoked through that external type: its overriding methods are considered
+used without an explicit `@api`.
+
+Do not reach for `@psalm-suppress UnusedClass` (or another `Unused*`
+suppression) in place of `@api`: as noted above, a suppression only silences the
+report, it does not mark the symbol as used, so symbols it references may still
+be reported as unused.
+
+### `@psalm-inheritors`
+
+Used to tell Psalm that a class can only be extended by a certain subset of classes.
+
+For example, 
+```php
+<?php
+/**
+ * @psalm-inheritors FooClass|BarClass
+ */
+class BaseClass {}
+class FooClass extends BaseClass {}
+class BarClass extends BaseClass {}
+class BazClass extends BaseClass {} // this is an error
+```
+
+## Type Syntax
+
+Psalm supports PHPDoc’s [type syntax](https://docs.phpdoc.org/guide/guides/types.html), and also the [proposed PHPDoc PSR type syntax](https://github.com/php-fig/fig-standards/blob/master/proposed/phpdoc.md#appendix-a-types).
+
+A detailed write-up is found in [Typing in Psalm](typing_in_psalm.md)

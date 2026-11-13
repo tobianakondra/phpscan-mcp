@@ -1,0 +1,2898 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Internal\Type;
+
+use InvalidArgumentException;
+use LogicException;
+use Psalm\Codebase;
+use Psalm\Exception\TypeParseTreeException;
+use Psalm\Internal\Analyzer\ProjectAnalyzer;
+use Psalm\Internal\Analyzer\Statements\Expression\ArrayAnalyzer;
+use Psalm\Internal\Type\Comparator\AtomicTypeComparator;
+use Psalm\Internal\Type\ParseTree;
+use Psalm\Internal\Type\ParseTree\CallableParamTree;
+use Psalm\Internal\Type\ParseTree\CallableTree;
+use Psalm\Internal\Type\ParseTree\CallableWithReturnTypeTree;
+use Psalm\Internal\Type\ParseTree\ConditionalTree;
+use Psalm\Internal\Type\ParseTree\EncapsulationTree;
+use Psalm\Internal\Type\ParseTree\FieldEllipsis;
+use Psalm\Internal\Type\ParseTree\GenericTree;
+use Psalm\Internal\Type\ParseTree\IntersectionTree;
+use Psalm\Internal\Type\ParseTree\KeyedArrayPropertyTree;
+use Psalm\Internal\Type\ParseTree\KeyedArrayTree;
+use Psalm\Internal\Type\ParseTree\MethodTree;
+use Psalm\Internal\Type\ParseTree\MethodWithReturnTypeTree;
+use Psalm\Internal\Type\ParseTree\NullableTree;
+use Psalm\Internal\Type\ParseTree\TemplateAsTree;
+use Psalm\Internal\Type\ParseTree\TemplateIsTree;
+use Psalm\Internal\Type\ParseTree\UnionTree;
+use Psalm\Internal\Type\ParseTree\Value;
+use Psalm\Internal\Type\PurityWildcard;
+use Psalm\Storage\Capabilities;
+use Psalm\Storage\FunctionLikeParameter;
+use Psalm\Type;
+use Psalm\Type\Atomic;
+use Psalm\Type\Atomic\Scalar;
+use Psalm\Type\Atomic\TArray;
+use Psalm\Type\Atomic\TArrayKey;
+use Psalm\Type\Atomic\TBool;
+use Psalm\Type\Atomic\TCallable;
+use Psalm\Type\Atomic\TCallableObject;
+use Psalm\Type\Atomic\TCallableString;
+use Psalm\Type\Atomic\TClassConstant;
+use Psalm\Type\Atomic\TClassString;
+use Psalm\Type\Atomic\TClassStringMap;
+use Psalm\Type\Atomic\TClosedResource;
+use Psalm\Type\Atomic\TClosure;
+use Psalm\Type\Atomic\TConditional;
+use Psalm\Type\Atomic\TDecimalIntString;
+use Psalm\Type\Atomic\TFalse;
+use Psalm\Type\Atomic\TFloat;
+use Psalm\Type\Atomic\TGenericObject;
+use Psalm\Type\Atomic\TGlobalConstant;
+use Psalm\Type\Atomic\TInt;
+use Psalm\Type\Atomic\TIntMask;
+use Psalm\Type\Atomic\TIntMaskOf;
+use Psalm\Type\Atomic\TIntRange;
+use Psalm\Type\Atomic\TIntersection;
+use Psalm\Type\Atomic\TIterable;
+use Psalm\Type\Atomic\TKeyOf;
+use Psalm\Type\Atomic\TKeyedArray;
+use Psalm\Type\Atomic\TLiteralClassString;
+use Psalm\Type\Atomic\TLiteralFloat;
+use Psalm\Type\Atomic\TLiteralInt;
+use Psalm\Type\Atomic\TLiteralString;
+use Psalm\Type\Atomic\TMixed;
+use Psalm\Type\Atomic\TNamedObject;
+use Psalm\Type\Atomic\TNever;
+use Psalm\Type\Atomic\TNonDecimalIntString;
+use Psalm\Type\Atomic\TNonEmptyArray;
+use Psalm\Type\Atomic\TNull;
+use Psalm\Type\Atomic\TNumeric;
+use Psalm\Type\Atomic\TNumericString;
+use Psalm\Type\Atomic\TObject;
+use Psalm\Type\Atomic\TObjectWithProperties;
+use Psalm\Type\Atomic\TPropertiesOf;
+use Psalm\Type\Atomic\TResource;
+use Psalm\Type\Atomic\TScalar;
+use Psalm\Type\Atomic\TString;
+use Psalm\Type\Atomic\TTemplateIndexedAccess;
+use Psalm\Type\Atomic\TTemplateKeyOf;
+use Psalm\Type\Atomic\TTemplateParam;
+use Psalm\Type\Atomic\TTemplateParamClass;
+use Psalm\Type\Atomic\TTemplatePropertiesOf;
+use Psalm\Type\Atomic\TTemplateValueOf;
+use Psalm\Type\Atomic\TTrue;
+use Psalm\Type\Atomic\TTypeAlias;
+use Psalm\Type\Atomic\TUnknownClassString;
+use Psalm\Type\Atomic\TValueOf;
+use Psalm\Type\TypeNode;
+use Psalm\Type\Union;
+
+use function array_all;
+use function array_any;
+use function array_key_exists;
+use function array_key_first;
+use function array_keys;
+use function array_map;
+use function array_merge;
+use function array_pop;
+use function array_shift;
+use function array_unique;
+use function array_unshift;
+use function array_values;
+use function assert;
+use function chr;
+use function constant;
+use function count;
+use function defined;
+use function end;
+use function explode;
+use function hexdec;
+use function in_array;
+use function is_int;
+use function is_numeric;
+use function ltrim;
+use function octdec;
+use function preg_match;
+use function preg_replace;
+use function reset;
+use function str_contains;
+use function str_ends_with;
+use function str_starts_with;
+use function stripslashes;
+use function strlen;
+use function strpos;
+use function strtolower;
+use function strtr;
+use function substr;
+
+use const PHP_INT_MAX;
+
+/**
+ * @psalm-suppress InaccessibleProperty Allowed during construction
+ * @internal
+ * @psalm-import-type CapabilitySet from Capabilities
+ */
+final class TypeParser
+{
+    /**
+     * Parses a string type representation
+     *
+     * @param  list<array{0: string, 1: int, 2?: string}> $type_tokens
+     * @param  array<string, array<string, Union>> $template_type_map
+     * @param  array<string, TypeAlias> $type_aliases
+     * @param  bool $allow_purity_wildcard whether the type may contain the `_` purity: only a
+     *         parameter's type, where it stands for a purity template bound by the caller
+     */
+    public static function parseTokens(
+        array $type_tokens,
+        ?int $analysis_php_version_id = null,
+        array $template_type_map = [],
+        array $type_aliases = [],
+        bool $from_docblock = false,
+        bool $allow_purity_wildcard = false,
+    ): Union {
+        if (count($type_tokens) === 1) {
+            $only_token = $type_tokens[0];
+
+            // Note: valid identifiers can include class names or $this
+            if (!preg_match('@^(\$this|\\\\?[a-zA-Z_\x7f-\xff][\\\\\-0-9a-zA-Z_\x7f-\xff]*)$@', $only_token[0])) {
+                if (!is_numeric($only_token[0])
+                    && str_contains($only_token[0], '\'')
+                    && str_contains($only_token[0], '"')
+                ) {
+                    throw new TypeParseTreeException("Invalid type '$only_token[0]'");
+                }
+            } else {
+                $only_token[0] = TypeTokenizer::fixScalarTerms($only_token[0], $analysis_php_version_id);
+
+                $atomic = Atomic::create(
+                    $only_token[0],
+                    $analysis_php_version_id,
+                    $template_type_map,
+                    $type_aliases,
+                    0,
+                    strlen($only_token[0]),
+                    isset($only_token[2]) && $only_token[2] !== $only_token[0] ? $only_token[2] : null,
+                    $from_docblock,
+                );
+
+                return new Union([$atomic], ['from_docblock' => $from_docblock]);
+            }
+        }
+
+        $parse_tree = (new ParseTreeCreator($type_tokens))->create();
+        $codebase = ProjectAnalyzer::getInstance()->getCodebase();
+        $parsed_type = self::getTypeFromTree(
+            $parse_tree,
+            $codebase,
+            $analysis_php_version_id,
+            $template_type_map,
+            $type_aliases,
+            $from_docblock,
+        );
+
+        if (!($parsed_type instanceof Union)) {
+            $parsed_type = new Union([$parsed_type], ['from_docblock' => $from_docblock]);
+        }
+
+        if (!$allow_purity_wildcard) {
+            foreach ($type_tokens as $type_token) {
+                if ($type_token[0] === PurityWildcard::NAME && PurityWildcard::contains($parsed_type)) {
+                    throw new TypeParseTreeException(
+                        'The purity `_` can only be used in the type of a parameter',
+                    );
+                }
+            }
+        }
+
+        return $parsed_type;
+    }
+
+    /**
+     * @param  array<string, array<string, Union>> $template_type_map
+     * @param  array<string, TypeAlias>            $type_aliases
+     * @throws TypeParseTreeException
+     */
+    private static function getTypeFromConditionalTree(
+        ConditionalTree $parse_tree,
+        Codebase $codebase,
+        array $template_type_map,
+        array $type_aliases,
+        bool $from_docblock,
+    ): TConditional {
+        $subject_type = null;
+
+        if ($parse_tree->condition->subject !== null) {
+            $template_param_name = self::findTemplateName(
+                $parse_tree->condition->subject,
+                $template_type_map,
+            );
+
+            if ($template_param_name === null) {
+                throw new TypeParseTreeException('The type before is must depend on a template');
+            }
+
+            $subject_type = self::getTypeFromTree(
+                $parse_tree->condition->subject,
+                $codebase,
+                null,
+                $template_type_map,
+                $type_aliases,
+                $from_docblock,
+            );
+
+            if ($subject_type instanceof Atomic) {
+                $subject_type = new Union([$subject_type], ['from_docblock' => $from_docblock]);
+            }
+        } else {
+            $template_param_name = $parse_tree->condition->param_name;
+        }
+
+        if (!isset($template_type_map[$template_param_name])) {
+            throw new TypeParseTreeException('Unrecognized template \'' . $template_param_name . '\'');
+        }
+
+        if (count($parse_tree->children) !== 2) {
+            throw new TypeParseTreeException('Invalid conditional');
+        }
+
+        if (count($parse_tree->condition->children) !== 1) {
+            throw new TypeParseTreeException('Invalid conditional, expected type after is');
+        }
+
+        $first_class = array_keys($template_type_map[$template_param_name])[0];
+
+        $condition_tree = $parse_tree->condition->children[0];
+
+        $conditional_type = self::isFalsyKeyword($condition_tree)
+            ? self::getFalsyUnion($from_docblock)
+            : self::getTypeFromTree(
+                $condition_tree,
+                $codebase,
+                null,
+                $template_type_map,
+                $type_aliases,
+                $from_docblock,
+            );
+
+        $if_type = self::getTypeFromTree(
+            $parse_tree->children[0],
+            $codebase,
+            null,
+            $template_type_map,
+            $type_aliases,
+            $from_docblock,
+        );
+
+        $else_type = self::getTypeFromTree(
+            $parse_tree->children[1],
+            $codebase,
+            null,
+            $template_type_map,
+            $type_aliases,
+            $from_docblock,
+        );
+
+        if ($conditional_type instanceof Atomic) {
+            $conditional_type = new Union([$conditional_type], ['from_docblock' => $from_docblock]);
+        }
+
+        if ($if_type instanceof Atomic) {
+            $if_type = new Union([$if_type], ['from_docblock' => $from_docblock]);
+        }
+
+        if ($else_type instanceof Atomic) {
+            $else_type = new Union([$else_type], ['from_docblock' => $from_docblock]);
+        }
+
+        if ($parse_tree->condition->negated) {
+            [$if_type, $else_type] = [$else_type, $if_type];
+        }
+
+        return new TConditional(
+            $template_param_name,
+            $first_class,
+            $template_type_map[$template_param_name][$first_class],
+            $conditional_type,
+            $if_type,
+            $else_type,
+            $from_docblock,
+            $subject_type,
+        );
+    }
+
+    /**
+     * `empty` is an alias of `never`, which no value is of; as a condition `empty` and `falsy` mean PHP's `empty()`.
+     * The token as written tells the keyword from a class named `falsy`, e.g. `\falsy`, an alias or `falsy::VALUE`.
+     *
+     * @psalm-mutation-free
+     */
+    private static function isFalsyKeyword(ParseTree $parse_tree): bool
+    {
+        if (!$parse_tree instanceof Value) {
+            return false;
+        }
+
+        $keyword = $parse_tree->text ?? $parse_tree->value;
+
+        return ($keyword === 'empty' || $keyword === 'falsy')
+            && ($parse_tree->value === $keyword || str_ends_with($parse_tree->value, '\\' . $keyword));
+    }
+
+    /**
+     * The values `empty()` is true for
+     *
+     * @psalm-pure
+     */
+    private static function getFalsyUnion(bool $from_docblock): Union
+    {
+        return new Union([
+            new TFalse($from_docblock),
+            new TLiteralInt(0, $from_docblock),
+            new TLiteralFloat(0.0, $from_docblock),
+            TLiteralString::make('', $from_docblock),
+            TLiteralString::make('0', $from_docblock),
+            new TNull($from_docblock),
+            Type::getEmptyArrayAtomic(),
+        ], ['from_docblock' => $from_docblock]);
+    }
+
+    /**
+     * The first template a type depends on
+     *
+     * @param array<string, array<string, Union>> $template_type_map
+     * @psalm-mutation-free
+     */
+    private static function findTemplateName(ParseTree $parse_tree, array $template_type_map): ?string
+    {
+        if (($parse_tree instanceof Value || $parse_tree instanceof GenericTree)
+            && isset($template_type_map[$parse_tree->value])
+        ) {
+            return $parse_tree->value;
+        }
+
+        foreach ($parse_tree->children as $child_tree) {
+            $template_name = self::findTemplateName($child_tree, $template_type_map);
+
+            if ($template_name !== null) {
+                return $template_name;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param  array<string, array<string, Union>> $template_type_map
+     * @param  array<string, TypeAlias>            $type_aliases
+     * @return  Atomic|Union
+     */
+    public static function getTypeFromTree(
+        ParseTree $parse_tree,
+        Codebase  $codebase,
+        ?int      $analysis_php_version_id = null,
+        array     $template_type_map = [],
+        array     $type_aliases = [],
+        bool      $from_docblock = false,
+    ): TypeNode {
+        if ($parse_tree instanceof GenericTree) {
+            return self::getTypeFromGenericTree(
+                $parse_tree,
+                $codebase,
+                $template_type_map,
+                $type_aliases,
+                $from_docblock,
+            );
+        }
+
+        if ($parse_tree instanceof UnionTree) {
+            return self::getTypeFromUnionTree(
+                $parse_tree,
+                $codebase,
+                $template_type_map,
+                $type_aliases,
+                $from_docblock,
+            );
+        }
+
+        if ($parse_tree instanceof IntersectionTree) {
+            return self::getTypeFromIntersectionTree(
+                $parse_tree,
+                $codebase,
+                $template_type_map,
+                $type_aliases,
+                $from_docblock,
+            );
+        }
+
+        if ($parse_tree instanceof KeyedArrayTree) {
+            return self::getTypeFromKeyedArrayTree(
+                $parse_tree,
+                $codebase,
+                $template_type_map,
+                $type_aliases,
+                $from_docblock,
+            );
+        }
+
+        if ($parse_tree instanceof CallableWithReturnTypeTree) {
+            $callable_type = self::getTypeFromTree(
+                $parse_tree->children[0],
+                $codebase,
+                null,
+                $template_type_map,
+                $type_aliases,
+                $from_docblock,
+            );
+
+            if (!$callable_type instanceof TCallable && !$callable_type instanceof TClosure) {
+                throw new InvalidArgumentException('Parsing callable tree node should return TCallable');
+            }
+
+            if (!isset($parse_tree->children[1])) {
+                throw new TypeParseTreeException('Invalid return type');
+            }
+
+            $return_type = self::getTypeFromTree(
+                $parse_tree->children[1],
+                $codebase,
+                null,
+                $template_type_map,
+                $type_aliases,
+                $from_docblock,
+            );
+
+            $callable_type->return_type = $return_type instanceof Union
+                ? $return_type
+                : new Union([$return_type], ['from_docblock' => $from_docblock])
+            ;
+
+            return $callable_type;
+        }
+
+        if ($parse_tree instanceof CallableTree) {
+            return self::getTypeFromCallableTree(
+                $parse_tree,
+                $codebase,
+                $template_type_map,
+                $type_aliases,
+                $from_docblock,
+            );
+        }
+
+        if ($parse_tree instanceof EncapsulationTree) {
+            if (!$parse_tree->terminated) {
+                throw new TypeParseTreeException('Unterminated parentheses');
+            }
+
+            if (!isset($parse_tree->children[0])) {
+                throw new TypeParseTreeException('Empty parentheses');
+            }
+
+            return self::getTypeFromTree(
+                $parse_tree->children[0],
+                $codebase,
+                null,
+                $template_type_map,
+                $type_aliases,
+                $from_docblock,
+            );
+        }
+
+        if ($parse_tree instanceof NullableTree) {
+            if (!isset($parse_tree->children[0])) {
+                throw new TypeParseTreeException('Misplaced question mark');
+            }
+
+            $non_nullable_type = self::getTypeFromTree(
+                $parse_tree->children[0],
+                $codebase,
+                null,
+                $template_type_map,
+                $type_aliases,
+                $from_docblock,
+            );
+
+            if ($non_nullable_type instanceof Union) {
+                $non_nullable_type = $non_nullable_type->getBuilder()->addType(new TNull($from_docblock))->freeze();
+
+                return $non_nullable_type;
+            }
+
+            return TypeCombiner::combine([
+                new TNull($from_docblock),
+                $non_nullable_type,
+            ]);
+        }
+
+        if ($parse_tree instanceof MethodTree
+            || $parse_tree instanceof MethodWithReturnTypeTree
+        ) {
+            throw new TypeParseTreeException('Misplaced brackets');
+        }
+
+        if ($parse_tree instanceof TemplateAsTree) {
+            $result = new TTemplateParam(
+                $parse_tree->param_name,
+                new Union([new TNamedObject($parse_tree->as)]),
+                'class-string-map',
+                [],
+                $from_docblock,
+            );
+            return $result;
+        }
+
+        if ($parse_tree instanceof ConditionalTree) {
+            return self::getTypeFromConditionalTree(
+                $parse_tree,
+                $codebase,
+                $template_type_map,
+                $type_aliases,
+                $from_docblock,
+            );
+        }
+
+        if ($parse_tree instanceof TemplateIsTree) {
+            throw new TypeParseTreeException('Invalid conditional, expected ? after is');
+        }
+
+        if (!$parse_tree instanceof Value) {
+            throw new InvalidArgumentException('Unrecognised parse tree type ' . $parse_tree::class);
+        }
+
+        if ($parse_tree->value[0] === '"' || $parse_tree->value[0] === '\'') {
+            return Type::getAtomicStringFromLiteral(
+                self::unescapeStringLiteral(substr($parse_tree->value, 1, -1), $parse_tree->value[0]),
+                $from_docblock,
+            );
+        }
+
+        if (strpos($parse_tree->value, '::')) {
+            [$fq_classlike_name, $const_name] = explode('::', $parse_tree->value);
+
+            if (isset($template_type_map[$fq_classlike_name]) && $const_name === 'class') {
+                $first_class = array_keys($template_type_map[$fq_classlike_name])[0];
+
+                return self::getGenericParamClass(
+                    $fq_classlike_name,
+                    $template_type_map[$fq_classlike_name][$first_class],
+                    $first_class,
+                    $from_docblock,
+                );
+            }
+
+            if ($const_name === 'class') {
+                return new TLiteralClassString($fq_classlike_name, false, $from_docblock);
+            }
+
+            return new TClassConstant($fq_classlike_name, $const_name, $from_docblock);
+        }
+
+        if (preg_match('/^\-?(0|[1-9][0-9]*)(\.[0-9]{1,})$/', $parse_tree->value)) {
+            return new TLiteralFloat((float) $parse_tree->value, $from_docblock);
+        }
+
+        if (preg_match('/^\-?(0|[1-9]([0-9_]*[0-9])?)$/', $parse_tree->value)) {
+            return new TLiteralInt((int) strtr($parse_tree->value, ['_' => '']), $from_docblock);
+        }
+
+        // global constants matching a wildcard, e.g. `PHP_URL_*`
+        if (str_contains($parse_tree->value, '*')
+            && preg_match('@^\\\\?(?:[\w\x7f-\xff]+\\\\)*[a-zA-Z_\x7f-\xff][\w*\x7f-\xff]*$@', $parse_tree->value)
+        ) {
+            return new TGlobalConstant(
+                ltrim($parse_tree->value, '\\'),
+                $parse_tree->text !== null && !str_contains($parse_tree->text, '\\') ? $parse_tree->text : null,
+                $from_docblock,
+            );
+        }
+
+        if (!preg_match('@^(\$this|\\\\?[a-zA-Z_\x7f-\xff][\\\\\-0-9a-zA-Z_\x7f-\xff]*)$@', $parse_tree->value)) {
+            throw new TypeParseTreeException('Invalid type \'' . $parse_tree->value . '\'');
+        }
+
+        $atomic_type_string = TypeTokenizer::fixScalarTerms($parse_tree->value, $analysis_php_version_id);
+
+        return Atomic::create(
+            $atomic_type_string,
+            $analysis_php_version_id,
+            $template_type_map,
+            $type_aliases,
+            $parse_tree->offset_start,
+            $parse_tree->offset_end,
+            $parse_tree->text,
+            $from_docblock,
+        );
+    }
+
+    /**
+     * @psalm-capabilities read-props|write-this-props|write-refs
+     */
+    private static function getGenericParamClass(
+        string $param_name,
+        Union &$as,
+        string $defining_class,
+        bool $from_docblock = false,
+    ): TTemplateParamClass {
+        if ($as->hasMixed()) {
+            return new TTemplateParamClass(
+                $param_name,
+                'object',
+                null,
+                $defining_class,
+                $from_docblock,
+            );
+        }
+
+        foreach ($as->getAtomicTypes() as $t) {
+            if ($t instanceof TObject) {
+                return new TTemplateParamClass(
+                    $param_name,
+                    'object',
+                    null,
+                    $defining_class,
+                    $from_docblock,
+                );
+            }
+
+            if ($t instanceof TIterable) {
+                $traversable = new TGenericObject(
+                    'Traversable',
+                    $t->type_params,
+                    false,
+                    false,
+                    [],
+                    $from_docblock,
+                );
+
+                $as = $as->getBuilder()->substitute(new Union([$t]), new Union([$traversable]))->freeze();
+
+                return new TTemplateParamClass(
+                    $param_name,
+                    $traversable->value,
+                    $traversable,
+                    $defining_class,
+                    $from_docblock,
+                );
+            }
+
+            if ($t instanceof TTemplateParam) {
+                $t_atomic_type = count($t->as->getAtomicTypes()) === 1 ? $t->as->getSingleAtomic() : null;
+
+                if (!$t_atomic_type instanceof TNamedObject) {
+                    $t_atomic_type = null;
+                }
+
+                return new TTemplateParamClass(
+                    $t->param_name,
+                    $t_atomic_type->value ?? 'object',
+                    $t_atomic_type,
+                    $t->defining_class,
+                    $from_docblock,
+                );
+            }
+
+            if (!$t instanceof TNamedObject) {
+                throw new TypeParseTreeException(
+                    'Invalid templated classname \'' . $t->getId() . '\'',
+                );
+            }
+
+            return new TTemplateParamClass(
+                $param_name,
+                $t->value,
+                $t,
+                $defining_class,
+                $from_docblock,
+            );
+        }
+
+        throw new LogicException('Should never get here');
+    }
+
+    /**
+     * @param non-empty-list<int>  $potential_ints
+     * @return non-empty-list<TLiteralInt>
+     * @psalm-pure
+     */
+    public static function getComputedIntsFromMask(array $potential_ints, bool $from_docblock = false): array
+    {
+        /** @var list<int> */
+        $potential_values = [];
+
+        foreach ($potential_ints as $ith) {
+            $new_values = [];
+
+            $new_values[] = $ith;
+
+            if ($ith !== 0) {
+                foreach ($potential_values as $potential_value) {
+                    $new_values[] = $ith | $potential_value;
+                }
+            }
+
+            $potential_values = [...$new_values, ...$potential_values];
+        }
+
+        array_unshift($potential_values, 0);
+        $potential_values = array_unique($potential_values);
+
+        return array_map(
+            static fn($int): TLiteralInt => new TLiteralInt($int, $from_docblock),
+            array_values($potential_values),
+        );
+    }
+
+    /**
+     * @param  array<string, array<string, Union>> $template_type_map
+     * @param  array<string, TypeAlias> $type_aliases
+     * @throws TypeParseTreeException
+     * @psalm-suppress ComplexMethod to be refactored
+     */
+    private static function getTypeFromGenericTree(
+        GenericTree $parse_tree,
+        Codebase $codebase,
+        array $template_type_map,
+        array $type_aliases,
+        bool $from_docblock = false,
+    ): Atomic|Union {
+        $generic_type = $parse_tree->value;
+
+        $purity_trees = $parse_tree->purity?->children ?? [];
+
+        // `T[K]`, with templates T and K: an indexed access
+        if ($parse_tree->children === []
+            && count($purity_trees) === 1
+            && $purity_trees[0] instanceof Value
+            && isset($template_type_map[$generic_type])
+        ) {
+            return self::getTypeFromIndexedAccess(
+                $generic_type,
+                $purity_trees[0]->value,
+                $template_type_map,
+                $from_docblock,
+            );
+        }
+
+        if (in_array($generic_type, ['Closure', '\\Closure', 'pure-Closure', 'impure-Closure'], true)
+            || in_array($generic_type, ['callable', 'pure-callable', 'impure-callable'], true)
+        ) {
+            // `Closure[purity]` / `callable[purity]` without a parameter list
+            if ($parse_tree->children !== [] || count($purity_trees) !== 1) {
+                throw new TypeParseTreeException(
+                    $generic_type . ' takes no type parameters, and its purity is given in brackets'
+                    . ' (e.g. ' . $generic_type . '[pure] or ' . $generic_type . '[io](int): void)',
+                );
+            }
+
+            [$n, $purity] = self::getCallablePurity(
+                $generic_type,
+                $purity_trees[0],
+                $codebase,
+                $template_type_map,
+                $type_aliases,
+                $from_docblock,
+            );
+
+            if (in_array(strtolower($n), ['closure', '\\closure'], true)) {
+                return new TClosure(null, null, $purity, [], [], $from_docblock);
+            }
+
+            return new TCallable(null, null, $purity, $from_docblock);
+        }
+
+        $purity_params = [];
+
+        foreach ($purity_trees as $purity_tree) {
+            // `Traversable[_]<K, V>`: see getCallablePurity()
+            if ($purity_tree instanceof Value && $purity_tree->value === PurityWildcard::NAME) {
+                $purity_params[] = PurityWildcard::placeholder($from_docblock);
+
+                continue;
+            }
+
+            $purity_type = self::getTypeFromTree(
+                $purity_tree,
+                $codebase,
+                null,
+                $template_type_map,
+                $type_aliases,
+                $from_docblock,
+            );
+
+            $purity_type = $purity_type instanceof Union
+                ? $purity_type
+                : new Union([$purity_type], ['from_docblock' => $from_docblock]);
+
+            if (!Capabilities::isPurityType($purity_type)) {
+                throw new TypeParseTreeException(
+                    $generic_type . '[' . $purity_type->getId() . '] is not valid: the arguments in brackets'
+                    . ' must be capability sets (e.g. pure, write-props|io) or templates declared with'
+                    . ' @psalm-purity-template',
+                );
+            }
+
+            $purity_params[] = $purity_type;
+        }
+
+        $generic_params = [];
+
+        foreach ($parse_tree->children as $i => $child_tree) {
+            $tree_type = self::getTypeFromTree(
+                $child_tree,
+                $codebase,
+                null,
+                $template_type_map,
+                $type_aliases,
+                $from_docblock,
+            );
+
+            if ($generic_type === 'class-string-map'
+                && $i === 0
+            ) {
+                if ($tree_type instanceof TTemplateParam) {
+                    $template_type_map[$tree_type->param_name] = ['class-string-map' => $tree_type->as];
+                } elseif ($tree_type instanceof TNamedObject) {
+                    $template_type_map[$tree_type->value] = ['class-string-map' => Type::getObject()];
+                }
+            }
+
+            $tree_type = $tree_type instanceof Union
+                ? $tree_type
+                : new Union([$tree_type], ['from_docblock' => $from_docblock]);
+
+            if (Capabilities::isPurityArgument($tree_type)) {
+                throw new TypeParseTreeException(
+                    'Purity arguments are given in brackets, before the type parameters: '
+                    . $generic_type . '[' . $tree_type->getId() . ']<...> instead of '
+                    . $generic_type . '<..., ' . $tree_type->getId() . '>',
+                );
+            }
+
+            $generic_params[] = $tree_type;
+        }
+
+        $generic_type_value = TypeTokenizer::fixScalarTerms($generic_type);
+
+        if ($purity_params !== []) {
+            return self::getTypeWithPurityArguments(
+                $generic_type_value,
+                $generic_params,
+                $purity_params,
+                $from_docblock,
+            );
+        }
+
+        if (($generic_type_value === 'array'
+                || $generic_type_value === 'non-empty-array'
+                || $generic_type_value === 'associative-array')
+            && count($generic_params) === 1
+        ) {
+            array_unshift($generic_params, new Union([new TArrayKey($from_docblock)]));
+        } elseif (count($generic_params) === 1
+            && in_array(
+                $generic_type_value,
+                ['iterable', 'Traversable', 'Iterator', 'IteratorAggregate', 'arraylike-object'],
+                true,
+            )
+        ) {
+            array_unshift($generic_params, new Union([new TMixed(false, $from_docblock)]));
+        } elseif ($generic_type_value === 'Generator') {
+            if (count($generic_params) === 1) {
+                array_unshift($generic_params, new Union([new TMixed(false, $from_docblock)]));
+            }
+
+            for ($i = 0, $l = 4 - count($generic_params); $i < $l; ++$i) {
+                $generic_params[] = new Union([new TMixed(false, $from_docblock)]);
+            }
+        }
+
+        if (!$generic_params) {
+            throw new TypeParseTreeException('No generic params provided for type');
+        }
+
+        if ($generic_type_value === 'array'
+            || $generic_type_value === 'associative-array'
+            || $generic_type_value === 'non-empty-array'
+        ) {
+            if ($generic_type_value !== 'non-empty-array') {
+                $generic_type_value = 'array';
+            }
+
+            if ($generic_params[0]->isMixed()) {
+                $generic_params[0] = Type::getArrayKey($from_docblock);
+            }
+
+            if (count($generic_params) !== 2) {
+                throw new TypeParseTreeException('Too many template parameters for '.$generic_type_value);
+            }
+
+            if ($type_aliases !== []) {
+                $intersection_types = self::resolveTypeAliases(
+                    $codebase,
+                    $generic_params[0]->getAtomicTypes(),
+                );
+
+                if ($intersection_types !== []) {
+                    $generic_params[0] = $generic_params[0]->setTypes($intersection_types);
+                }
+            }
+
+            foreach ($generic_params[0]->getAtomicTypes() as $key => $atomic_type) {
+                if ($atomic_type instanceof TLiteralString
+                    && ($string_to_int = ArrayAnalyzer::getLiteralArrayKeyInt($atomic_type->value)) !== false
+                ) {
+                    $builder = $generic_params[0]->getBuilder();
+                    $builder->removeType($key);
+                    $generic_params[0] = $builder->addType(new TLiteralInt($string_to_int, $from_docblock))->freeze();
+                    continue;
+                }
+
+                // PHP casts a decimal int string key to an int
+                if ($atomic_type instanceof TDecimalIntString) {
+                    $builder = $generic_params[0]->getBuilder();
+                    $builder->removeType($key);
+                    $generic_params[0] = $builder->addType(new TInt($from_docblock))->freeze();
+                    continue;
+                }
+
+                if ($atomic_type instanceof TInt
+                    || $atomic_type instanceof TString
+                    || $atomic_type instanceof TArrayKey
+                    || $atomic_type instanceof TClassConstant // @todo resolve and check types
+                    || $atomic_type instanceof TGlobalConstant
+                    || $atomic_type instanceof TMixed
+                    || $atomic_type instanceof TNever
+                    || $atomic_type instanceof TTemplateParam
+                    || $atomic_type instanceof TTemplateIndexedAccess
+                    || $atomic_type instanceof TTemplateValueOf
+                    || $atomic_type instanceof TTemplateKeyOf
+                    || $atomic_type instanceof TTemplateParamClass
+                    || $atomic_type instanceof TTypeAlias
+                    || $atomic_type instanceof TValueOf
+                    || $atomic_type instanceof TConditional
+                    || $atomic_type instanceof TKeyOf
+                    || !$from_docblock
+                ) {
+                    continue;
+                }
+
+                if ($codebase->register_stub_files || $codebase->register_autoload_files) {
+                    $builder = $generic_params[0]->getBuilder();
+                    $builder->removeType($key);
+
+                    if (count($generic_params[0]->getAtomicTypes()) <= 1) {
+                        $builder = $builder->addType(new TArrayKey($from_docblock));
+                    }
+
+                    $generic_params[0] = $builder->freeze();
+                    continue;
+                }
+
+                throw new TypeParseTreeException('Invalid array key type ' . $atomic_type->getKey());
+            }
+
+            return $generic_type_value === 'array'
+                ? new TArray($generic_params, $from_docblock)
+                : new TNonEmptyArray($generic_params, null, null, 'non-empty-array', $from_docblock)
+            ;
+        }
+
+        if ($generic_type_value === 'arraylike-object') {
+            $array_access = new TGenericObject('ArrayAccess', $generic_params, false, false, [], $from_docblock);
+            $countable = new TNamedObject('Countable', false, false, [], $from_docblock);
+            return new TGenericObject(
+                'Traversable',
+                $generic_params,
+                false,
+                false,
+                [
+                    $array_access->getKey() => $array_access,
+                    $countable->getKey() => $countable,
+                ],
+                $from_docblock,
+            );
+        }
+
+        if ($generic_type_value === 'iterable') {
+            if (count($generic_params) > 2) {
+                throw new TypeParseTreeException('Too many template parameters for iterable');
+            }
+            return new TIterable($generic_params, [], $from_docblock);
+        }
+
+        if ($generic_type_value === 'list') {
+            if (count($generic_params) > 1) {
+                throw new TypeParseTreeException('Too many template parameters for list');
+            }
+            return Type::getListAtomic($generic_params[0], $from_docblock);
+        }
+
+        if ($generic_type_value === 'non-empty-list') {
+            return Type::getNonEmptyListAtomic($generic_params[0], $from_docblock);
+        }
+
+        if ($generic_type_value === 'class-string'
+            || $generic_type_value === 'interface-string'
+            || $generic_type_value === 'enum-string'
+        ) {
+            $class_name = $generic_params[0]->getId(false);
+
+            if (isset($template_type_map[$class_name])) {
+                $first_class = array_keys($template_type_map[$class_name])[0];
+
+                return self::getGenericParamClass(
+                    $class_name,
+                    $template_type_map[$class_name][$first_class],
+                    $first_class,
+                    $from_docblock,
+                );
+            }
+
+            $types = [];
+            foreach ($generic_params[0]->getAtomicTypes() as $type) {
+                if ($type instanceof TNamedObject) {
+                    $types[] = new TClassString($type->value, $type, false, false, false, $from_docblock);
+                    continue;
+                }
+
+                if ($type instanceof TCallableObject) {
+                    $types[] = new TUnknownClassString($type, false, $from_docblock);
+                    continue;
+                }
+
+                throw new TypeParseTreeException('class-string param can only target to named or callable objects');
+            }
+
+            assert(
+                $types !== [],
+                'Since `Union` cannot be empty and all non-supported atomics lead to thrown exception,'
+                .' we can safely assert that the types array is non-empty.',
+            );
+
+            return new Union($types);
+        }
+
+        if ($generic_type_value === 'class-string-map') {
+            if (count($generic_params) !== 2) {
+                throw new TypeParseTreeException(
+                    'There should only be two params for class-string-map, '
+                    . count($generic_params) . ' provided',
+                );
+            }
+
+            $template_marker_parts = array_values($generic_params[0]->getAtomicTypes());
+
+            $template_marker = $template_marker_parts[0];
+
+            $template_as_type = null;
+
+            if ($template_marker instanceof TNamedObject) {
+                $template_param_name = $template_marker->value;
+            } elseif ($template_marker instanceof TTemplateParam) {
+                $template_param_name = $template_marker->param_name;
+                $template_as_type = $template_marker->as->getSingleAtomic();
+
+                if (!$template_as_type instanceof TNamedObject) {
+                    throw new TypeParseTreeException(
+                        'Unrecognised as type',
+                    );
+                }
+            } else {
+                throw new TypeParseTreeException(
+                    'Unrecognised class-string-map templated param',
+                );
+            }
+
+            return new TClassStringMap(
+                $template_param_name,
+                $template_as_type,
+                $generic_params[1],
+                $from_docblock,
+            );
+        }
+
+        if (in_array($generic_type_value, TPropertiesOf::tokenNames())) {
+            if (count($generic_params) !== 1) {
+                throw new TypeParseTreeException($generic_type_value . ' requires exactly one parameter.');
+            }
+
+            $param_name = (string) $generic_params[0];
+
+            if (isset($template_type_map[$param_name])
+                && ($defining_class = array_key_first($template_type_map[$param_name])) !== null
+            ) {
+                $template_param = $generic_params[0]->getSingleAtomic();
+                if (!$template_param instanceof TTemplateParam) {
+                    throw new TypeParseTreeException(
+                        $generic_type_value . '<' . $param_name . '> must be a TTemplateParam.',
+                    );
+                }
+                if ($template_param->getIntersectionTypes()) {
+                    throw new TypeParseTreeException(
+                        $generic_type_value . '<' . $param_name . '> must be a TTemplateParam'
+                        . ' with no intersection types.',
+                    );
+                }
+
+                return new TTemplatePropertiesOf(
+                    $param_name,
+                    $defining_class,
+                    $template_param,
+                    TPropertiesOf::filterForTokenName($generic_type_value),
+                    $from_docblock,
+                );
+            }
+
+            $param_union_types = array_values($generic_params[0]->getAtomicTypes());
+
+            if (count($param_union_types) > 1) {
+                throw new TypeParseTreeException('Union types are not allowed in ' . $generic_type_value . ' param');
+            }
+
+            if (!$param_union_types[0] instanceof TNamedObject) {
+                throw new TypeParseTreeException('Param should be a named object in ' . $generic_type_value);
+            }
+
+            return new TPropertiesOf(
+                $param_union_types[0],
+                TPropertiesOf::filterForTokenName($generic_type_value),
+                $from_docblock,
+            );
+        }
+
+        if ($generic_type_value === 'key-of') {
+            $param_name = $generic_params[0]->getId(false);
+
+            if (isset($template_type_map[$param_name])
+                && ($defining_class = array_key_first($template_type_map[$param_name])) !== null
+            ) {
+                return new TTemplateKeyOf(
+                    $param_name,
+                    $defining_class,
+                    $generic_params[0],
+                    $from_docblock,
+                );
+            }
+
+            if (!TKeyOf::isViableTemplateType($generic_params[0])) {
+                throw new TypeParseTreeException(
+                    'Untemplated key-of param ' . $param_name . ' should be an array',
+                );
+            }
+
+            return new TKeyOf($generic_params[0], $from_docblock);
+        }
+
+        if ($generic_type_value === 'value-of') {
+            $param_name = $generic_params[0]->getId(false);
+
+            if (isset($template_type_map[$param_name])
+                && ($defining_class = array_key_first($template_type_map[$param_name])) !== null
+            ) {
+                return new TTemplateValueOf(
+                    $param_name,
+                    $defining_class,
+                    $generic_params[0],
+                    $from_docblock,
+                );
+            }
+
+            if (!TValueOf::isViableTemplateType($generic_params[0])) {
+                throw new TypeParseTreeException(
+                    'Untemplated value-of param ' . $param_name . ' should be an array',
+                );
+            }
+
+            return new TValueOf($generic_params[0]);
+        }
+
+        if ($generic_type_value === 'int-mask') {
+            $atomic_types = [];
+
+            foreach ($generic_params as $generic_param) {
+                if (!$generic_param->isSingle()) {
+                    throw new TypeParseTreeException(
+                        'int-mask types must all be non-union',
+                    );
+                }
+
+                $generic_param_atomics = $generic_param->getAtomicTypes();
+
+                $atomic_type = reset($generic_param_atomics);
+
+                if ($atomic_type instanceof TNamedObject) {
+                    if (defined($atomic_type->value)) {
+                        /** @var mixed */
+                        $constant_value = constant($atomic_type->value);
+
+                        if (!is_int($constant_value)) {
+                            throw new TypeParseTreeException(
+                                'int-mask types must all be integer values',
+                            );
+                        }
+
+                        $atomic_type = new TLiteralInt($constant_value, $from_docblock);
+                    } else {
+                        throw new TypeParseTreeException(
+                            'int-mask types must all be integer values',
+                        );
+                    }
+                }
+
+                if (!$atomic_type instanceof TLiteralInt
+                    && !($atomic_type instanceof TClassConstant
+                        && !str_contains($atomic_type->const_name, '*'))
+                ) {
+                    throw new TypeParseTreeException(
+                        'int-mask types must all be integer values or scalar class constants',
+                    );
+                }
+
+                $atomic_types[] = $atomic_type;
+            }
+
+            $potential_ints = [];
+            $int_mask_bits = 0;
+
+            foreach ($atomic_types as $atomic_type) {
+                if (!$atomic_type instanceof TLiteralInt) {
+                    return new TIntMask($atomic_types, $from_docblock);
+                }
+
+                $potential_ints[] = $atomic_type->value;
+                $int_mask_bits |= $atomic_type->value;
+            }
+
+            return new Union(
+                self::getComputedIntsFromMask($potential_ints, $from_docblock),
+                ['int_mask_bits' => $int_mask_bits],
+            );
+        }
+
+        if ($generic_type_value === 'int-mask-of') {
+            $param_union_types = array_values($generic_params[0]->getAtomicTypes());
+
+            if (count($param_union_types) > 1) {
+                throw new TypeParseTreeException('Union types are not allowed in value-of type');
+            }
+
+            $param_type = $param_union_types[0];
+
+            if (!$param_type instanceof TClassConstant
+                && !$param_type instanceof TValueOf
+                && !$param_type instanceof TKeyOf
+            ) {
+                throw new TypeParseTreeException(
+                    'Invalid reference passed to int-mask-of',
+                );
+            } elseif ($param_type instanceof TClassConstant
+                && !str_contains($param_type->const_name, '*')
+            ) {
+                throw new TypeParseTreeException(
+                    'Class constant passed to int-mask-of must be a wildcard type',
+                );
+            }
+
+            return new TIntMaskOf($param_type, $from_docblock);
+        }
+
+        if ($generic_type_value === 'int') {
+            if (count($generic_params) !== 2) {
+                throw new TypeParseTreeException('int range must have 2 params');
+            }
+            assert(count($parse_tree->children) === 2);
+
+            /** @psalm-mutation-free */
+            $get_int_range_bound = static function (
+                ParseTree $parse_tree,
+                Union $generic_param,
+                string $bound_name,
+            ): ?int {
+                if (!$parse_tree instanceof Value
+                    || count($generic_param->getAtomicTypes()) > 1
+                    || (!$generic_param->getSingleAtomic() instanceof TLiteralInt
+                        && $parse_tree->value !== $bound_name
+                        && $parse_tree->text !== $bound_name
+                    )
+                ) {
+                    throw new TypeParseTreeException(
+                        "Invalid type \"{$generic_param->getId()}\" as int $bound_name boundary",
+                    );
+                }
+                $generic_param_atomic = $generic_param->getSingleAtomic();
+                return $generic_param_atomic instanceof TLiteralInt ? $generic_param_atomic->value : null;
+            };
+
+            $min_bound = $get_int_range_bound($parse_tree->children[0], $generic_params[0], TIntRange::BOUND_MIN);
+            $max_bound = $get_int_range_bound($parse_tree->children[1], $generic_params[1], TIntRange::BOUND_MAX);
+
+            if ($min_bound === null && $max_bound === null) {
+                return new TInt($from_docblock);
+            }
+
+            if (is_int($min_bound) && is_int($max_bound) && $min_bound > $max_bound) {
+                throw new TypeParseTreeException(
+                    "Min bound can't be greater than max bound, int<$min_bound, $max_bound> given",
+                );
+            }
+
+            if (is_int($min_bound) && is_int($max_bound) && $min_bound > $max_bound) {
+                throw new TypeParseTreeException(
+                    "Min bound can't be greater than max bound, int<$min_bound, $max_bound> given",
+                );
+            }
+
+            return new TIntRange($min_bound, $max_bound, $from_docblock);
+        }
+
+        if (isset(TypeTokenizer::PSALM_RESERVED_WORDS[$generic_type_value])
+            && $generic_type_value !== 'self'
+            && $generic_type_value !== 'static'
+        ) {
+            throw new TypeParseTreeException('Cannot create generic object with reserved word');
+        }
+
+        return new TGenericObject($generic_type_value, $generic_params, false, false, [], $from_docblock);
+    }
+
+    /**
+     * An iterable or generic object given purity arguments in brackets (`iterable[pure]<int>`,
+     * `Traversable[pure]<int, string>`, `Foo[io]`).
+     *
+     * @param list<Union> $generic_params
+     * @param non-empty-list<Union> $purity_params
+     * @throws TypeParseTreeException
+     * @psalm-pure
+     */
+    private static function getTypeWithPurityArguments(
+        string $generic_type_value,
+        array $generic_params,
+        array $purity_params,
+        bool $from_docblock,
+    ): TIterable|TGenericObject {
+        if (isset(TypeTokenizer::PSALM_RESERVED_WORDS[$generic_type_value])
+            && !in_array($generic_type_value, ['iterable', 'self', 'static'], true)
+        ) {
+            throw new TypeParseTreeException(
+                $generic_type_value . ' takes no purity arguments: only iterable, Closure, callable and'
+                . ' classes with purity templates do',
+            );
+        }
+
+        $generic_type_value_lc = strtolower($generic_type_value);
+
+        if ($generic_type_value_lc === 'iterable') {
+            if (count($purity_params) > 1) {
+                throw new TypeParseTreeException('Too many purity arguments for iterable');
+            }
+
+            if (count($generic_params) > 2) {
+                throw new TypeParseTreeException('Too many template parameters for iterable');
+            }
+
+            // the key type may be left out, and both
+            $value_type = array_pop($generic_params) ?? new Union([new TMixed(false, $from_docblock)]);
+            $key_type = array_pop($generic_params) ?? new Union([new TMixed(false, $from_docblock)]);
+
+            return new TIterable([$key_type, $value_type], [], $from_docblock, $purity_params[0]);
+        }
+
+        // the key type of the iterators, and the send and return types of a generator, may be left
+        // out as when there are no purity arguments, and the key and value types too
+        if (in_array($generic_type_value_lc, ['traversable', 'iterator', 'iteratoraggregate'], true)
+            || ($generic_type_value_lc === 'generator' && count($generic_params) < 2)
+        ) {
+            while (count($generic_params) < 2) {
+                array_unshift($generic_params, new Union([new TMixed(false, $from_docblock)]));
+            }
+        }
+
+        if ($generic_type_value_lc === 'generator') {
+            while (count($generic_params) < 4) {
+                $generic_params[] = new Union([new TMixed(false, $from_docblock)]);
+            }
+        }
+
+        // the purity templates of a class come after its type templates; the type parameters of a
+        // class left out are filled in once the class is known (see TypeExpander)
+        return new TGenericObject(
+            $generic_type_value,
+            [...$generic_params, ...$purity_params],
+            false,
+            false,
+            [],
+            $from_docblock,
+        );
+    }
+
+    /**
+     * @param  array<string, array<string, Union>> $template_type_map
+     * @param  array<string, TypeAlias> $type_aliases
+     * @throws TypeParseTreeException
+     */
+    private static function getTypeFromUnionTree(
+        UnionTree $parse_tree,
+        Codebase $codebase,
+        array $template_type_map,
+        array $type_aliases,
+        bool $from_docblock,
+    ): Union {
+        $has_null = false;
+
+        $atomic_types = [];
+
+        $int_mask_bits = null;
+
+        foreach ($parse_tree->children as $child_tree) {
+            if ($child_tree instanceof NullableTree) {
+                if (!isset($child_tree->children[0])) {
+                    throw new TypeParseTreeException('Invalid ? character');
+                }
+
+                $atomic_type = self::getTypeFromTree(
+                    $child_tree->children[0],
+                    $codebase,
+                    null,
+                    $template_type_map,
+                    $type_aliases,
+                    $from_docblock,
+                );
+                $has_null = true;
+            } else {
+                $atomic_type = self::getTypeFromTree(
+                    $child_tree,
+                    $codebase,
+                    null,
+                    $template_type_map,
+                    $type_aliases,
+                    $from_docblock,
+                );
+            }
+
+            if ($atomic_type instanceof Union) {
+                foreach ($atomic_type->getAtomicTypes() as $type) {
+                    $atomic_types[] = $type;
+                }
+
+                // e.g. `int-mask<1, 2>|null`
+                if ($atomic_type->int_mask_bits !== null) {
+                    $int_mask_bits = ($int_mask_bits ?? 0) | $atomic_type->int_mask_bits;
+                }
+
+                continue;
+            }
+
+            $atomic_types[] = $atomic_type;
+        }
+
+        if ($has_null) {
+            $atomic_types[] = new TNull($from_docblock);
+        }
+
+        if (!$atomic_types) {
+            throw new TypeParseTreeException(
+                'No atomic types found',
+            );
+        }
+
+        $union = TypeCombiner::combine($atomic_types);
+
+        return $int_mask_bits !== null && IntMask::fits($union, $int_mask_bits)
+            ? $union->setProperties(['int_mask_bits' => $int_mask_bits])
+            : $union;
+    }
+
+    /**
+     * @param  array<string, array<string, Union>> $template_type_map
+     * @param  array<string, TypeAlias> $type_aliases
+     * @throws TypeParseTreeException
+     */
+    private static function getTypeFromIntersectionTree(
+        IntersectionTree $parse_tree,
+        Codebase $codebase,
+        array $template_type_map,
+        array $type_aliases,
+        bool $from_docblock,
+    ): Atomic|Union {
+        $members = [];
+        $member_types = [];
+        $only_object_types = true;
+
+        foreach ($parse_tree->children as $name => $child_tree) {
+            $type = self::getTypeFromTree(
+                $child_tree,
+                $codebase,
+                null,
+                $template_type_map,
+                $type_aliases,
+                $from_docblock,
+            );
+
+            if ($type instanceof Union) {
+                // e.g. `(A|B)&C`, or an `int-mask<…>`
+                $only_object_types = false;
+                $members[$name] = array_values($type->getAtomicTypes());
+                $member_types[] = $type;
+                continue;
+            }
+
+            if (!$type instanceof Atomic) {
+                throw new TypeParseTreeException('Invalid intersection member');
+            }
+
+            $member_types[] = new Union([$type], ['from_docblock' => $from_docblock]);
+
+            if (!self::isObjectIntersectionMember($type)
+                && !$type instanceof TArray
+                && !$type instanceof TKeyedArray
+                && !$type instanceof TTypeAlias
+            ) {
+                $only_object_types = false;
+            }
+
+            $members[$name] = [$type];
+        }
+
+        if ($members === [] || $member_types === []) {
+            return new TMixed();
+        }
+
+        // keyed arrays are merged, with a generic array as their fallback
+        if ($only_object_types
+            && !array_all(
+                $members,
+                static fn(array $member): bool => $member[0] instanceof TArray,
+            )
+        ) {
+            return self::intersectObjectTypes(
+                array_map(static fn(array $member): Atomic => $member[0], $members),
+                $codebase,
+                $from_docblock,
+            );
+        }
+
+        if (array_any(
+            $members,
+            static fn(array $member): bool => array_any($member, self::hasUnresolvedReference(...)),
+        )) {
+            // intersected once the class constants and type aliases it refers to are known
+            return new TIntersection($member_types, $from_docblock);
+        }
+
+        $atomic_types = self::intersectTypes(array_values($members), $codebase, $from_docblock);
+
+        if ($atomic_types === []) {
+            throw new TypeParseTreeException('No value has all the types of the intersection');
+        }
+
+        return count($atomic_types) === 1
+            ? $atomic_types[0]
+            : TypeCombiner::combine($atomic_types)->setProperties(['from_docblock' => $from_docblock]);
+    }
+
+    /**
+     * @param non-empty-array<array-key, Atomic> $intersection_types
+     * @throws TypeParseTreeException
+     */
+    private static function intersectObjectTypes(
+        array $intersection_types,
+        Codebase $codebase,
+        bool $from_docblock,
+    ): Atomic {
+        $first_type = reset($intersection_types);
+        $last_type = end($intersection_types);
+
+        $onlyTKeyedArray = $first_type instanceof TKeyedArray
+            || $last_type instanceof TKeyedArray;
+
+        foreach ($intersection_types as $intersection_type) {
+            if (!$intersection_type instanceof TKeyedArray
+                && ($intersection_type !== $first_type
+                    || !$first_type instanceof TArray)
+                && ($intersection_type !== $last_type
+                    || !$last_type instanceof TArray)
+            ) {
+                $onlyTKeyedArray = false;
+                break;
+            }
+        }
+
+        if ($onlyTKeyedArray) {
+            /**
+             * @var array<TKeyedArray> $intersection_types
+             * @var TKeyedArray $first_type
+             * @var TKeyedArray $last_type
+             */
+            return self::getTypeFromKeyedArrays(
+                $codebase,
+                $intersection_types,
+                $first_type,
+                $last_type,
+                $from_docblock,
+            );
+        }
+
+        $keyed_intersection_types = self::extractKeyedIntersectionTypes(
+            $codebase,
+            $intersection_types,
+        );
+
+        $intersect_static = false;
+
+        if (isset($keyed_intersection_types['static'])) {
+            unset($keyed_intersection_types['static']);
+            $intersect_static = true;
+        }
+
+        if ($keyed_intersection_types === [] && $intersect_static) {
+            return new TNamedObject('static', false, false, [], $from_docblock);
+        }
+
+        $first_type = array_shift($keyed_intersection_types);
+        assert($first_type !== null);
+
+        // Keyed array intersection are merged together and are not combinable with object-types
+        if ($first_type instanceof TKeyedArray) {
+            // assume all types are keyed arrays
+            array_unshift($keyed_intersection_types, $first_type);
+            /** @var TKeyedArray $last_type */
+            $last_type = end($keyed_intersection_types);
+
+            /** @var array<TKeyedArray> $keyed_intersection_types */
+            return self::getTypeFromKeyedArrays(
+                $codebase,
+                $keyed_intersection_types,
+                $first_type,
+                $last_type,
+                $from_docblock,
+            );
+        }
+
+        if ($intersect_static
+            && $first_type instanceof TNamedObject
+        ) {
+            $first_type->is_static = true;
+        }
+
+        if ($keyed_intersection_types) {
+            /** @var non-empty-array<string,TIterable|TNamedObject|TCallableObject|TTemplateParam|TObjectWithProperties> $keyed_intersection_types */
+            return $first_type->setIntersectionTypes($keyed_intersection_types);
+        }
+
+        return $first_type;
+    }
+
+    /**
+     * The types of the values having one of the types of each member of an intersection, none when no value does
+     *
+     * @param non-empty-list<list<Atomic>> $members
+     * @return list<Atomic>
+     * @throws TypeParseTreeException if Psalm has no type for the intersection
+     */
+    public static function intersectTypes(array $members, Codebase $codebase, bool $from_docblock): array
+    {
+        $atomic_types = array_shift($members);
+
+        foreach ($members as $member) {
+            $atomic_types = self::intersectAtomicTypeLists($atomic_types, $member, $codebase, $from_docblock);
+        }
+
+        return $atomic_types;
+    }
+
+    /**
+     * Whether a type refers to class constants, global constants or type aliases, which are only known once every
+     * file is scanned
+     *
+     * @psalm-pure
+     */
+    public static function hasUnresolvedReference(Atomic $type): bool
+    {
+        if ($type instanceof TConditional) {
+            return array_any($type->if_type->getAtomicTypes(), self::hasUnresolvedReference(...))
+                || array_any($type->else_type->getAtomicTypes(), self::hasUnresolvedReference(...));
+        }
+
+        return $type instanceof TClassConstant
+            || $type instanceof TValueOf
+            || $type instanceof TKeyOf
+            || $type instanceof TIntMask
+            || $type instanceof TIntMaskOf
+            || $type instanceof TTypeAlias
+            || $type instanceof TPropertiesOf
+            || $type instanceof TGlobalConstant
+            || $type instanceof TIntersection;
+    }
+
+    /**
+     * The types of the values having one of $types_1 and one of $types_2
+     *
+     * @param list<Atomic> $types_1
+     * @param list<Atomic> $types_2
+     * @return list<Atomic>
+     * @throws TypeParseTreeException if Psalm has no type for the intersection
+     */
+    private static function intersectAtomicTypeLists(
+        array $types_1,
+        array $types_2,
+        Codebase $codebase,
+        bool $from_docblock,
+    ): array {
+        foreach ([[$types_1, $types_2], [$types_2, $types_1]] as [$types, $other_types]) {
+            foreach ($types as $i => $type) {
+                if (!$type instanceof TConditional) {
+                    continue;
+                }
+
+                // `(T is A ? B : C) & D` is `(T is A ? B & D : C & D)`, a branch with no values being `never`
+                $intersected_types = [
+                    $type->setTypes(
+                        null,
+                        null,
+                        self::getUnionOrNever(
+                            self::intersectAtomicTypeLists(
+                                array_values($type->if_type->getAtomicTypes()),
+                                $other_types,
+                                $codebase,
+                                $from_docblock,
+                            ),
+                            $from_docblock,
+                        ),
+                        self::getUnionOrNever(
+                            self::intersectAtomicTypeLists(
+                                array_values($type->else_type->getAtomicTypes()),
+                                $other_types,
+                                $codebase,
+                                $from_docblock,
+                            ),
+                            $from_docblock,
+                        ),
+                    ),
+                ];
+
+                unset($types[$i]);
+
+                if ($types === []) {
+                    return $intersected_types;
+                }
+
+                return [
+                    ...$intersected_types,
+                    ...self::intersectAtomicTypeLists(array_values($types), $other_types, $codebase, $from_docblock),
+                ];
+            }
+        }
+
+        $intersected_types = [];
+
+        foreach ($types_1 as $type_1) {
+            foreach ($types_2 as $type_2) {
+                foreach (self::intersectAtomicTypes($type_1, $type_2, $codebase, $from_docblock) as $type) {
+                    $intersected_types[] = $type;
+                }
+            }
+        }
+
+        return $intersected_types;
+    }
+
+    /**
+     * @param list<Atomic> $atomic_types
+     */
+    private static function getUnionOrNever(array $atomic_types, bool $from_docblock): Union
+    {
+        return $atomic_types === []
+            ? Type::getNever($from_docblock)
+            : TypeCombiner::combine($atomic_types)->setProperties(['from_docblock' => $from_docblock]);
+    }
+
+    /**
+     * The types of the values having both types: none when no value has both
+     *
+     * @return list<Atomic>
+     * @throws TypeParseTreeException if Psalm has no type for the intersection
+     */
+    private static function intersectAtomicTypes(
+        Atomic $type_1,
+        Atomic $type_2,
+        Codebase $codebase,
+        bool $from_docblock,
+    ): array {
+        if (self::hasUnresolvedReference($type_1) || self::hasUnresolvedReference($type_2)) {
+            throw self::getUnrepresentableIntersectionException($type_1, $type_2);
+        }
+
+        if ($type_1::class === TMixed::class) {
+            return [$type_2];
+        }
+
+        if ($type_2::class === TMixed::class) {
+            return [$type_1];
+        }
+
+        if ($type_1->getId() === $type_2->getId()) {
+            return [$type_1];
+        }
+
+        if (($type_1 instanceof Scalar || $type_1 instanceof TCallable)
+            && ($type_2 instanceof Scalar || $type_2 instanceof TCallable)
+            && ($type_1 instanceof Scalar || $type_2 instanceof Scalar)
+        ) {
+            return self::intersectScalarTypes($type_1, $type_2, $codebase, $from_docblock);
+        }
+
+        if (($type_1 instanceof TTemplateParam && $type_2 instanceof Scalar)
+            || ($type_2 instanceof TTemplateParam && $type_1 instanceof Scalar)
+        ) {
+            throw self::getUnrepresentableIntersectionException($type_1, $type_2);
+        }
+
+        if ($type_1 instanceof TArray && $type_2 instanceof TArray) {
+            return self::intersectArrayTypes($type_1, $type_2, $codebase, $from_docblock);
+        }
+
+        if ($type_1 instanceof TArray && $type_2 instanceof TKeyedArray) {
+            if (self::isMixedArray($type_1)) {
+                return [$type_2];
+            }
+
+            throw self::getUnrepresentableIntersectionException($type_1, $type_2);
+        }
+
+        if ($type_1 instanceof TKeyedArray && $type_2 instanceof TArray) {
+            if (self::isMixedArray($type_2)) {
+                return [$type_1];
+            }
+
+            throw self::getUnrepresentableIntersectionException($type_1, $type_2);
+        }
+
+        if ($type_1 instanceof TKeyedArray && $type_2 instanceof TKeyedArray) {
+            try {
+                return [self::intersectObjectTypes([$type_1, $type_2], $codebase, $from_docblock)];
+            } catch (TypeParseTreeException) {
+                // keyed arrays with incompatible properties
+                return [];
+            }
+        }
+
+        if (self::isObjectIntersectionMember($type_1) && self::isObjectIntersectionMember($type_2)) {
+            return [self::intersectObjectTypes([$type_1, $type_2], $codebase, $from_docblock)];
+        }
+
+        $kind_1 = self::getValueKind($type_1);
+        $kind_2 = self::getValueKind($type_2);
+
+        if ($kind_1 !== null && $kind_2 !== null && $kind_1 !== $kind_2) {
+            // e.g. an object and a scalar, or an array and null
+            return [];
+        }
+
+        throw self::getUnrepresentableIntersectionException($type_1, $type_2);
+    }
+
+    /**
+     * The kind of the values of a type, values of different kinds being different
+     *
+     * @psalm-pure
+     */
+    private static function getValueKind(Atomic $type): ?string
+    {
+        return match (true) {
+            $type instanceof Scalar => 'scalar',
+            $type instanceof TNamedObject,
+            $type instanceof TObject,
+            $type instanceof TObjectWithProperties => 'object',
+            $type instanceof TArray,
+            $type instanceof TKeyedArray => 'array',
+            $type instanceof TNull => 'null',
+            $type instanceof TResource,
+            $type instanceof TClosedResource => 'resource',
+            default => null,
+        };
+    }
+
+    /**
+     * @return list<TArray>
+     * @throws TypeParseTreeException if Psalm has no type for the intersection
+     */
+    private static function intersectArrayTypes(
+        TArray $type_1,
+        TArray $type_2,
+        Codebase $codebase,
+        bool $from_docblock,
+    ): array {
+        if (self::isMixedArray($type_1)) {
+            return [$type_2];
+        }
+
+        if (self::isMixedArray($type_2)) {
+            return [$type_1];
+        }
+
+        [$key_type_1, $value_type_1] = $type_1->type_params;
+        [$key_type_2, $value_type_2] = $type_2->type_params;
+
+        $key_type = self::intersectUnions($key_type_1, $key_type_2, $codebase, $from_docblock);
+        $value_type = self::intersectUnions($value_type_1, $value_type_2, $codebase, $from_docblock);
+
+        if ($key_type->isNever() || $value_type->isNever()) {
+            // only the empty array has both types
+            return $type_1 instanceof TNonEmptyArray || $type_2 instanceof TNonEmptyArray
+                ? []
+                : [new TArray([Type::getNever($from_docblock), Type::getNever($from_docblock)], $from_docblock)];
+        }
+
+        return [
+            $type_1 instanceof TNonEmptyArray || $type_2 instanceof TNonEmptyArray
+                ? new TNonEmptyArray([$key_type, $value_type], null, null, 'non-empty-array', $from_docblock)
+                : new TArray([$key_type, $value_type], $from_docblock),
+        ];
+    }
+
+    /**
+     * @throws TypeParseTreeException if Psalm has no type for the intersection
+     */
+    private static function intersectUnions(
+        Union $type_1,
+        Union $type_2,
+        Codebase $codebase,
+        bool $from_docblock,
+    ): Union {
+        return self::getUnionOrNever(
+            self::intersectAtomicTypeLists(
+                array_values($type_1->getAtomicTypes()),
+                array_values($type_2->getAtomicTypes()),
+                $codebase,
+                $from_docblock,
+            ),
+            $from_docblock,
+        );
+    }
+
+    /**
+     * @psalm-pure
+     */
+    private static function isMixedArray(TArray $type): bool
+    {
+        return !$type instanceof TNonEmptyArray
+            && $type->type_params[0]->isArrayKey()
+            && $type->type_params[1]->isMixed();
+    }
+
+    /**
+     * @psalm-pure
+     */
+    private static function isObjectIntersectionMember(Atomic $type): bool
+    {
+        return $type instanceof TNamedObject
+            || $type instanceof TObject
+            || $type instanceof TIterable
+            || $type instanceof TTemplateParam
+            || $type instanceof TObjectWithProperties
+            || $type instanceof TCallable;
+    }
+
+    /**
+     * Intersects scalar types, such as `lowercase-string&non-falsy-string` or `int<0, max>&int<min, 5>`, or a scalar
+     * type with `callable`, which only a `callable-string` can be.
+     *
+     * @return list<Atomic>
+     * @throws TypeParseTreeException if Psalm has no type for the intersection
+     */
+    private static function intersectScalarTypes(
+        Atomic $type_1,
+        Atomic $type_2,
+        Codebase $codebase,
+        bool $from_docblock,
+    ): array {
+        if ($type_1 instanceof TCallable || $type_2 instanceof TCallable) {
+            [$callable_type, $other_type] = $type_1 instanceof TCallable ? [$type_1, $type_2] : [$type_2, $type_1];
+
+            if ($other_type instanceof TCallable) {
+                throw self::getUnrepresentableIntersectionException($type_1, $type_2);
+            }
+
+            if ($callable_type->params !== null || $callable_type->return_type !== null) {
+                // a callable-string has no signature
+                throw self::getUnrepresentableIntersectionException($type_1, $type_2);
+            }
+
+            return self::intersectScalarTypes(
+                new TCallableString($from_docblock),
+                $other_type,
+                $codebase,
+                $from_docblock,
+            );
+        }
+
+        if ($type_1->getId() === $type_2->getId()) {
+            return [$type_1];
+        }
+
+        $components_1 = self::getScalarComponents($type_1, $from_docblock);
+        $components_2 = self::getScalarComponents($type_2, $from_docblock);
+
+        if ($components_1 !== null || $components_2 !== null) {
+            return self::intersectAtomicTypeLists(
+                $components_1 ?? [$type_1],
+                $components_2 ?? [$type_2],
+                $codebase,
+                $from_docblock,
+            );
+        }
+
+        if (AtomicTypeComparator::isContainedBy($codebase, $type_1, $type_2, false, false)) {
+            return [$type_1];
+        }
+
+        if (AtomicTypeComparator::isContainedBy($codebase, $type_2, $type_1, false, false)) {
+            return [$type_2];
+        }
+
+        if (self::isIntRange($type_1) && self::isIntRange($type_2)) {
+            $int_range = TIntRange::intersectIntRanges(
+                TIntRange::convertToIntRange($type_1),
+                TIntRange::convertToIntRange($type_2),
+            );
+
+            if ($int_range === null) {
+                return [];
+            }
+
+            if ($int_range->min_bound !== null && $int_range->min_bound === $int_range->max_bound) {
+                return [new TLiteralInt($int_range->min_bound, $from_docblock)];
+            }
+
+            return [new TIntRange($int_range->min_bound, $int_range->max_bound, $from_docblock)];
+        }
+
+        if ($type_1 instanceof TString && $type_2 instanceof TString) {
+            return self::intersectStringTypes($type_1, $type_2, $from_docblock);
+        }
+
+        $family_1 = self::getScalarFamily($type_1);
+        $family_2 = self::getScalarFamily($type_2);
+
+        if ($family_1 !== null && $family_2 !== null
+            && ($family_1 !== $family_2 || self::isSingleValue($type_1) || self::isSingleValue($type_2))
+        ) {
+            return [];
+        }
+
+        throw self::getUnrepresentableIntersectionException($type_1, $type_2);
+    }
+
+    /**
+     * The types a scalar type that is a union of others is made of, e.g. `int|string` for `array-key`
+     *
+     * @return list<Scalar>|null
+     * @psalm-pure
+     */
+    private static function getScalarComponents(Atomic $type, bool $from_docblock): ?array
+    {
+        return match ($type::class) {
+            TArrayKey::class => [new TInt($from_docblock), new TString($from_docblock)],
+            TNumeric::class => [
+                new TInt($from_docblock),
+                new TFloat($from_docblock),
+                new TNumericString($from_docblock),
+            ],
+            TScalar::class => [
+                new TInt($from_docblock),
+                new TFloat($from_docblock),
+                new TString($from_docblock),
+                new TBool($from_docblock),
+            ],
+            TBool::class => [new TTrue($from_docblock), new TFalse($from_docblock)],
+            default => null,
+        };
+    }
+
+    /**
+     * Intersects two string types neither of which contains the other
+     *
+     * @return list<TString>
+     * @throws TypeParseTreeException if Psalm has no type for the intersection
+     * @psalm-pure
+     */
+    private static function intersectStringTypes(TString $type_1, TString $type_2, bool $from_docblock): array
+    {
+        $refinements_1 = StringRefinement::get($type_1);
+        $refinements_2 = StringRefinement::get($type_2);
+
+        if ($refinements_1 !== null && $refinements_2 !== null) {
+            if ($type_1 instanceof TLiteralString || $type_2 instanceof TLiteralString) {
+                [$literal_refinements, $refinements] = $type_1 instanceof TLiteralString
+                    ? [$refinements_1, $refinements_2]
+                    : [$refinements_2, $refinements_1];
+
+                // the literal string, if it has every refinement of the other type
+                return ($refinements & ~$literal_refinements) === 0
+                    ? [$type_1 instanceof TLiteralString ? $type_1 : $type_2]
+                    : [];
+            }
+
+            $type = StringRefinement::getType($refinements_1 | $refinements_2, $from_docblock);
+
+            if ($type !== null) {
+                return [$type];
+            }
+        }
+
+        $is_decimal_int_type_1 = $type_1 instanceof TDecimalIntString || $type_1 instanceof TNonDecimalIntString;
+        $is_decimal_int_type_2 = $type_2 instanceof TDecimalIntString || $type_2 instanceof TNonDecimalIntString;
+
+        if (($is_decimal_int_type_1 && ($is_decimal_int_type_2 || $type_2 instanceof TLiteralString))
+            || ($is_decimal_int_type_2 && $type_1 instanceof TLiteralString)
+        ) {
+            // a string is a decimal int string or not: the other type of these, or a literal string neither contains
+            return [];
+        }
+
+        throw self::getUnrepresentableIntersectionException($type_1, $type_2);
+    }
+
+    /**
+     * @psalm-pure
+     */
+    private static function getUnrepresentableIntersectionException(
+        Atomic $type_1,
+        Atomic $type_2,
+    ): TypeParseTreeException {
+        return new TypeParseTreeException(
+            'Psalm has no type for the intersection of ' . $type_1->getId() . ' and ' . $type_2->getId(),
+        );
+    }
+
+    /**
+     * @psalm-assert-if-true TInt $type
+     * @psalm-pure
+     */
+    private static function isIntRange(Atomic $type): bool
+    {
+        return $type::class === TInt::class
+            || $type instanceof TIntRange
+            || $type instanceof TLiteralInt;
+    }
+
+    /**
+     * @psalm-pure
+     */
+    private static function isSingleValue(Atomic $type): bool
+    {
+        return $type instanceof TTrue
+            || $type instanceof TFalse
+            || $type instanceof TLiteralFloat;
+    }
+
+    /**
+     * @psalm-pure
+     */
+    private static function getScalarFamily(Atomic $type): ?string
+    {
+        return match (true) {
+            $type instanceof TString => 'string',
+            $type instanceof TInt => 'int',
+            $type instanceof TFloat => 'float',
+            $type instanceof TBool => 'bool',
+            default => null,
+        };
+    }
+
+    /**
+     * @param  array<string, array<string, Union>> $template_type_map
+     * @param  array<string, TypeAlias> $type_aliases
+     * @throws TypeParseTreeException
+     */
+    private static function getTypeFromCallableTree(
+        CallableTree $parse_tree,
+        Codebase $codebase,
+        array $template_type_map,
+        array $type_aliases,
+        bool $from_docblock,
+    ): TCallable|TClosure {
+        $params = [];
+
+        foreach ($parse_tree->children as $child_tree) {
+            $is_variadic = false;
+            $is_optional = false;
+            $is_by_ref = false;
+            $param_name = '';
+
+            // `$x=` wraps the named parameter in a parameter that only carries the default
+            if ($child_tree instanceof CallableParamTree
+                && isset($child_tree->children[0])
+                && $child_tree->children[0] instanceof CallableParamTree
+            ) {
+                $is_optional = $child_tree->has_default;
+                $child_tree = $child_tree->children[0];
+            }
+
+            if ($child_tree instanceof CallableParamTree) {
+                if (isset($child_tree->children[0])) {
+                    $tree_type = self::getTypeFromTree(
+                        $child_tree->children[0],
+                        $codebase,
+                        null,
+                        $template_type_map,
+                        $type_aliases,
+                        $from_docblock,
+                    );
+                } else {
+                    $tree_type = new TMixed(false, $from_docblock);
+                }
+
+                $is_variadic = $child_tree->variadic;
+                $is_optional = $is_optional || $child_tree->has_default;
+                $is_by_ref = $child_tree->by_ref;
+                $param_name = $child_tree->name ?? '';
+            } else {
+                if ($child_tree instanceof Value && strpos($child_tree->value, '$') > 0) {
+                    $child_tree->value = (string) preg_replace('/(.+)\$.*/', '$1', $child_tree->value);
+                }
+
+                $tree_type = self::getTypeFromTree(
+                    $child_tree,
+                    $codebase,
+                    null,
+                    $template_type_map,
+                    $type_aliases,
+                    $from_docblock,
+                );
+            }
+
+            $param = new FunctionLikeParameter(
+                $param_name,
+                $is_by_ref,
+                $tree_type instanceof Union ? $tree_type : new Union([$tree_type]),
+                null,
+                null,
+                null,
+                $is_optional,
+                false,
+                $is_variadic,
+            );
+
+            $params[] = $param;
+        }
+
+        [$n, $purity] = self::getCallablePurity(
+            $parse_tree->value,
+            $parse_tree->purity,
+            $codebase,
+            $template_type_map,
+            $type_aliases,
+            $from_docblock,
+        );
+
+        if (in_array(strtolower($n), ['closure', '\closure'], true)) {
+            return new TClosure($params, null, $purity, [], [], $from_docblock);
+        }
+
+        return new TCallable($params, null, $purity, $from_docblock);
+    }
+
+    /**
+     * Resolves the purity of a `Closure`/`callable` keyword: from its `pure-`/`impure-` prefix or from
+     * the `[...]` purity given after it, which must be a capability set or a purity template.
+     *
+     * @param  array<string, array<string, Union>> $template_type_map
+     * @param  array<string, TypeAlias> $type_aliases
+     * @return array{string, CapabilitySet|Union} the bare keyword and the purity
+     * @throws TypeParseTreeException
+     */
+    private static function getCallablePurity(
+        string $keyword,
+        ?ParseTree $purity_tree,
+        Codebase $codebase,
+        array $template_type_map,
+        array $type_aliases,
+        bool $from_docblock,
+    ): array {
+        $purity = Capabilities::ALL;
+
+        if (str_starts_with($keyword, 'impure-')) {
+            $keyword = substr($keyword, strlen('impure-'));
+        } elseif (str_starts_with($keyword, 'pure-')) {
+            $purity = Capabilities::NONE;
+            $keyword = substr($keyword, strlen('pure-'));
+        }
+
+        if ($purity_tree === null) {
+            return [$keyword, $purity];
+        }
+
+        // `Closure[_]`: a purity template of the enclosing function-like, bound when the
+        // parameter the closure belongs to is known
+        if ($purity_tree instanceof Value && $purity_tree->value === PurityWildcard::NAME) {
+            return [$keyword, PurityWildcard::placeholder($from_docblock)];
+        }
+
+        $purity_type = self::getTypeFromTree(
+            $purity_tree,
+            $codebase,
+            null,
+            $template_type_map,
+            $type_aliases,
+            $from_docblock,
+        );
+
+        $purity_type = $purity_type instanceof Union
+            ? $purity_type
+            : new Union([$purity_type], ['from_docblock' => $from_docblock]);
+
+        if (!Capabilities::isPurityType($purity_type)) {
+            throw new TypeParseTreeException(
+                $keyword . '[' . $purity_type->getId() . '] is not valid: the purity of a callable must be'
+                . ' a capability set (e.g. pure, write-props|io) or a template declared with @psalm-purity-template',
+            );
+        }
+
+        return [$keyword, $purity_type];
+    }
+
+    /**
+     * @param array<string, array<string, Union>> $template_type_map
+     * @throws TypeParseTreeException
+     * @psalm-pure
+     */
+    private static function getTypeFromIndexedAccess(
+        string $array_param_name,
+        string $offset_param_name,
+        array $template_type_map,
+        bool $from_docblock,
+    ): TTemplateIndexedAccess {
+        if (!isset($template_type_map[$offset_param_name])) {
+            throw new TypeParseTreeException('Unrecognised template param ' . $offset_param_name);
+        }
+
+        $offset_template_data = $template_type_map[$offset_param_name];
+
+        $offset_defining_class = array_keys($offset_template_data)[0];
+
+        if (!$offset_defining_class
+            && isset($offset_template_data[''])
+            && $offset_template_data['']->isSingle()
+        ) {
+            $offset_template_type = $offset_template_data['']->getSingleAtomic();
+
+            if ($offset_template_type instanceof TTemplateKeyOf) {
+                $offset_defining_class = $offset_template_type->defining_class;
+            }
+        }
+
+        $array_defining_class = array_keys($template_type_map[$array_param_name])[0];
+
+        if ($offset_defining_class !== $array_defining_class
+            && !str_starts_with($offset_defining_class, 'fn-')
+        ) {
+            throw new TypeParseTreeException('Template params are defined in different locations');
+        }
+
+        return new TTemplateIndexedAccess(
+            $array_param_name,
+            $offset_param_name,
+            $array_defining_class,
+            $from_docblock,
+        );
+    }
+
+    /**
+     * @param  array<string, array<string, Union>> $template_type_map
+     * @param  array<string, TypeAlias> $type_aliases
+     * @throws TypeParseTreeException
+     */
+    private static function getTypeFromKeyedArrayTree(
+        KeyedArrayTree $parse_tree,
+        Codebase $codebase,
+        array $template_type_map,
+        array $type_aliases,
+        bool $from_docblock,
+    ): TKeyedArray|TObjectWithProperties|TArray {
+        $properties = [];
+        $class_strings = [];
+
+        $type = $parse_tree->value;
+
+        $had_optional = false;
+        $had_explicit = false;
+        $had_implicit = false;
+
+        $previous_property_key = -1;
+
+        $is_list = true;
+
+        $sealed = true;
+
+        $extra_params = null;
+
+        $last_property_branch = end($parse_tree->children);
+        if ($last_property_branch instanceof GenericTree
+            && $last_property_branch->value === ''
+        ) {
+            $extra_params = $last_property_branch->children;
+            array_pop($parse_tree->children);
+        }
+
+        foreach ($parse_tree->children as $i => $property_branch) {
+            $class_string = false;
+
+            if ($property_branch instanceof FieldEllipsis) {
+                if ($i !== count($parse_tree->children) - 1) {
+                    throw new TypeParseTreeException(
+                        'Unexpected ...',
+                    );
+                }
+
+                $sealed = false;
+
+                break;
+            }
+
+            if (!$property_branch instanceof KeyedArrayPropertyTree) {
+                $property_type = self::getTypeFromTree(
+                    $property_branch,
+                    $codebase,
+                    null,
+                    $template_type_map,
+                    $type_aliases,
+                    $from_docblock,
+                );
+                $property_maybe_undefined = false;
+                $property_key = $i;
+                $had_implicit = true;
+            } elseif (count($property_branch->children) === 1) {
+                $property_type = self::getTypeFromTree(
+                    $property_branch->children[0],
+                    $codebase,
+                    null,
+                    $template_type_map,
+                    $type_aliases,
+                    $from_docblock,
+                );
+                $property_maybe_undefined = $property_branch->possibly_undefined;
+                if (strpos($property_branch->value, '::')) {
+                    [$fq_classlike_name, $const_name] = explode('::', $property_branch->value);
+                    if ($const_name === 'class') {
+                        $property_key = $fq_classlike_name;
+                        $class_string = true;
+                    } elseif ($property_branch->value[0] === '"' || $property_branch->value[0] === "'") {
+                        $property_key = $property_branch->value;
+                    } else {
+                        throw new TypeParseTreeException(
+                            ':: in array key is only allowed for ::class',
+                        );
+                    }
+                } else {
+                    $property_key = $property_branch->value;
+                }
+                if ($is_list && (
+                        ($int_property_key = ArrayAnalyzer::getLiteralArrayKeyInt($property_key)) === false
+                        || ($had_optional && !$property_maybe_undefined)
+                        || $type === 'array'
+                        || $type === 'callable-array'
+                        || $previous_property_key != ($int_property_key - 1)
+                    )
+                ) {
+                    $is_list = false;
+                }
+                $had_explicit = true;
+                $previous_property_key = $property_key;
+
+                if ($property_key[0] === '\'' || $property_key[0] === '"') {
+                    $property_key = stripslashes(substr($property_key, 1, -1));
+                }
+            } else {
+                throw new TypeParseTreeException(
+                    'Missing property type',
+                );
+            }
+
+            if (!$property_type instanceof Union) {
+                $property_type = new Union([$property_type], ['from_docblock' => $from_docblock]);
+            }
+
+            if ($property_maybe_undefined) {
+                $property_type->possibly_undefined = true;
+                $had_optional = true;
+            }
+
+            if (isset($properties[$property_key])) {
+                throw new TypeParseTreeException("Duplicate key $property_key detected");
+            }
+
+            $properties[$property_key] = $property_type;
+            if ($class_string) {
+                $class_strings[$property_key] = true;
+            }
+        }
+
+        if ($had_explicit && $had_implicit) {
+            throw new TypeParseTreeException('Cannot mix explicit and implicit keys');
+        }
+
+        if ($type === 'object') {
+            return new TObjectWithProperties($properties, [], [], $from_docblock);
+        }
+
+        $callable = str_starts_with($type, 'callable-');
+        if ($callable) {
+            $type = substr($type, 9);
+        }
+
+        if ($callable && !$properties) {
+            throw new TypeParseTreeException('A callable array cannot be empty');
+        }
+
+        if ($type !== 'array' && $type !== 'list') {
+            throw new TypeParseTreeException('Unexpected brace character in type '.$type);
+        }
+
+        if ($type === 'list' && !$is_list) {
+            throw new TypeParseTreeException('A list shape cannot describe a non-list');
+        }
+
+        if (!$properties) {
+            return new TArray([Type::getNever($from_docblock), Type::getNever($from_docblock)], $from_docblock);
+        }
+
+        if ($extra_params) {
+            if ($is_list && count($extra_params) !== 1) {
+                throw new TypeParseTreeException('Must have exactly one extra field!');
+            }
+            if (!$is_list && count($extra_params) !== 2) {
+                throw new TypeParseTreeException('Must have exactly two extra fields!');
+            }
+            $final_extra_params = $is_list ? [Type::getListKey(true)] : [];
+            foreach ($extra_params as $child_tree) {
+                $child_type = self::getTypeFromTree(
+                    $child_tree,
+                    $codebase,
+                    null,
+                    $template_type_map,
+                    $type_aliases,
+                    $from_docblock,
+                );
+                if ($child_type instanceof Atomic) {
+                    $child_type = new Union([$child_type]);
+                }
+                $final_extra_params []= $child_type;
+            }
+            $extra_params = $final_extra_params;
+        }
+        return $callable
+            ? TKeyedArray::makeCallable(
+                $properties,
+                $class_strings,
+                $is_list,
+                $from_docblock,
+            ) : TKeyedArray::make(
+                $properties,
+                $class_strings,
+                $extra_params ?? ($sealed
+                    ? null
+                    : [$is_list ? Type::getListKey() : Type::getArrayKey(), Type::getMixed()]
+                ),
+                $is_list,
+                $from_docblock,
+            )
+        ;
+    }
+
+    /**
+     * @param TNamedObject|TObjectWithProperties|TCallableObject|TIterable|TTemplateParam|TKeyedArray $intersection_type
+     * @psalm-mutation-free
+     */
+    private static function extractIntersectionKey(Atomic $intersection_type): string
+    {
+        return $intersection_type instanceof TIterable || $intersection_type instanceof TKeyedArray
+            ? $intersection_type->getId()
+            : $intersection_type->getKey();
+    }
+
+    /**
+     * @param non-empty-array<Atomic> $intersection_types
+     * @return non-empty-array<string,TIterable|TNamedObject|TCallableObject|TTemplateParam|TObjectWithProperties|TKeyedArray>
+     */
+    private static function extractKeyedIntersectionTypes(
+        Codebase $codebase,
+        array $intersection_types,
+    ): array {
+        $keyed_intersection_types = [];
+        $callable_intersection = null;
+        $any_object_type_found = $any_array_found = false;
+
+        $normalized_intersection_types = self::resolveTypeAliases(
+            $codebase,
+            $intersection_types,
+        );
+
+        foreach ($normalized_intersection_types as $intersection_type) {
+            if ($intersection_type instanceof TKeyedArray
+                && !$intersection_type->is_callable
+            ) {
+                $any_array_found = true;
+
+                if ($any_object_type_found) {
+                    throw new TypeParseTreeException(
+                        'The intersection type must not mix array and object types!',
+                    );
+                }
+
+                $keyed_intersection_types[self::extractIntersectionKey($intersection_type)] = $intersection_type;
+                continue;
+            }
+
+            $any_object_type_found = true;
+
+            if ($intersection_type instanceof TIterable
+                || $intersection_type instanceof TNamedObject
+                || $intersection_type instanceof TTemplateParam
+                || $intersection_type instanceof TObjectWithProperties
+            ) {
+                $keyed_intersection_types[self::extractIntersectionKey($intersection_type)] = $intersection_type;
+                continue;
+            }
+
+            if ($intersection_type::class === TObject::class) {
+                continue;
+            }
+
+            if ($intersection_type instanceof TCallable) {
+                if ($callable_intersection !== null) {
+                    throw new TypeParseTreeException(
+                        'The intersection type must not contain more than one callable type!',
+                    );
+                }
+                $callable_intersection = $intersection_type;
+                continue;
+            }
+
+            throw new TypeParseTreeException(
+                'Intersection types must be all objects, '
+                . $intersection_type::class . ' provided',
+            );
+        }
+
+        if ($callable_intersection !== null) {
+            $callable_object_type = new TCallableObject(
+                $callable_intersection->from_docblock,
+                $callable_intersection,
+            );
+
+            $keyed_intersection_types[self::extractIntersectionKey($callable_object_type)] = $callable_object_type;
+        }
+
+        if ($any_object_type_found && $any_array_found) {
+            throw new TypeParseTreeException(
+                'Intersection types must be all objects or all keyed array.',
+            );
+        }
+
+        assert($keyed_intersection_types !== []);
+
+        return $keyed_intersection_types;
+    }
+
+    /**
+     * @param array<Atomic> $intersection_types
+     * @return array<Atomic>
+     */
+    private static function resolveTypeAliases(Codebase $codebase, array $intersection_types): array
+    {
+        $normalized_intersection_types = [];
+        $modified = false;
+        foreach ($intersection_types as $intersection_type) {
+            if (!$intersection_type instanceof TTypeAlias
+                || !$codebase->classlike_storage_provider->has(
+                    $codebase->classlikes->getUnAliasedName($intersection_type->declaring_fq_classlike_name),
+                )
+            ) {
+                $normalized_intersection_types[] = [$intersection_type];
+                continue;
+            }
+
+            $expanded_intersection_type = TypeExpander::expandAtomic(
+                $codebase,
+                $intersection_type,
+                null,
+                null,
+                null,
+                true,
+                false,
+                false,
+                true,
+                true,
+                true,
+            );
+
+            $modified = $modified || $expanded_intersection_type[0] !== $intersection_type;
+            $normalized_intersection_types[] = $expanded_intersection_type;
+        }
+
+        if ($modified === false) {
+            return $intersection_types;
+        }
+
+        return self::resolveTypeAliases(
+            $codebase,
+            array_merge(...$normalized_intersection_types),
+        );
+    }
+
+    /**
+     * @param array<TKeyedArray> $intersection_types
+     * @param TKeyedArray|TArray $first_type
+     * @param TKeyedArray|TArray $last_type
+     */
+    private static function getTypeFromKeyedArrays(
+        Codebase $codebase,
+        array $intersection_types,
+        Atomic $first_type,
+        Atomic $last_type,
+        bool $from_docblock,
+    ): Atomic {
+        /** @var non-empty-array<string|int, Union> */
+        $properties = [];
+
+        if ($first_type instanceof TArray) {
+            array_shift($intersection_types);
+        } elseif ($last_type instanceof TArray) {
+            array_pop($intersection_types);
+        }
+
+        $all_sealed = true;
+
+        foreach ($intersection_types as $intersection_type) {
+            if ($intersection_type->fallback_params !== null) {
+                $all_sealed = false;
+            }
+
+            foreach ($intersection_type->properties as $property => $property_type) {
+                if (!array_key_exists($property, $properties)) {
+                    $properties[$property] = $property_type;
+                    continue;
+                }
+
+                $new_type = Type::intersectUnionTypes(
+                    $properties[$property],
+                    $property_type,
+                    $codebase,
+                );
+
+                if ($new_type === null) {
+                    throw new TypeParseTreeException(
+                        'Incompatible intersection types for "' . $property . '", '
+                        . $properties[$property] . ' and ' . $property_type
+                        . ' provided',
+                    );
+                }
+                $properties[$property] = $new_type;
+            }
+        }
+
+        $first_or_last_type = $first_type instanceof TArray
+            ? $first_type
+            : ($last_type instanceof TArray ? $last_type : null);
+
+        $fallback_params = null;
+
+        if ($first_or_last_type !== null) {
+            $fallback_params = [
+                $first_or_last_type->type_params[0],
+                $first_or_last_type->type_params[1],
+            ];
+        } elseif (!$all_sealed) {
+            $fallback_params = [Type::getArrayKey(), Type::getMixed()];
+        }
+
+        return TKeyedArray::make(
+            $properties,
+            null,
+            $fallback_params,
+            false,
+            $from_docblock,
+        );
+    }
+
+    /**
+     * The value of the string literal `$quote . $literal . $quote`, as PHP reads it
+     *
+     * @psalm-pure
+     */
+    private static function unescapeStringLiteral(string $literal, string $quote): string
+    {
+        if ($quote === '\'') {
+            return strtr($literal, ['\\\\' => '\\', '\\\'' => '\'']);
+        }
+
+        $simple_escapes = ['n' => "\n", 'r' => "\r", 't' => "\t", 'v' => "\v", 'e' => "\e", 'f' => "\f",
+            '\\' => '\\', '$' => '$', '"' => '"'];
+
+        $value = '';
+        $length = strlen($literal);
+
+        for ($i = 0; $i < $length; $i++) {
+            if ($literal[$i] !== '\\' || $i + 1 === $length) {
+                $value .= $literal[$i];
+
+                continue;
+            }
+
+            $next = $literal[$i + 1];
+
+            if (isset($simple_escapes[$next])) {
+                $value .= $simple_escapes[$next];
+                $i++;
+            } elseif (preg_match(
+                '/\G(?:([0-7]{1,3})|x([0-9A-Fa-f]{1,2})|u\{([0-9A-Fa-f]+)\})/',
+                $literal,
+                $match,
+                0,
+                $i + 1,
+            )) {
+                if (isset($match[1]) && $match[1] !== '') {
+                    $value .= chr(((int) octdec($match[1])) & 0xFF);
+                } elseif (isset($match[2]) && $match[2] !== '') {
+                    $value .= chr((int) hexdec($match[2]));
+                } else {
+                    // checked before the conversion: more digits than the largest code point has overflow an int
+                    $hex_digits = ltrim($match[3] ?? '0', '0');
+                    $code_point = strlen($hex_digits) > 6 ? PHP_INT_MAX : (int) hexdec($hex_digits);
+
+                    // as PHP: always UTF-8, a surrogate is encoded like any other code point
+                    if ($code_point > 0x10FFFF) {
+                        throw new TypeParseTreeException(
+                            'Invalid UTF-8 codepoint escape sequence: Codepoint too large',
+                        );
+                    }
+
+                    $value .= $code_point < 0x80
+                        ? chr($code_point)
+                        : ($code_point < 0x800
+                            ? chr(0xC0 | $code_point >> 6) . chr(0x80 | $code_point & 0x3F)
+                            : ($code_point < 0x10000
+                                ? chr(0xE0 | $code_point >> 12)
+                                    . chr(0x80 | $code_point >> 6 & 0x3F)
+                                    . chr(0x80 | $code_point & 0x3F)
+                                : chr(0xF0 | $code_point >> 18)
+                                    . chr(0x80 | $code_point >> 12 & 0x3F)
+                                    . chr(0x80 | $code_point >> 6 & 0x3F)
+                                    . chr(0x80 | $code_point & 0x3F)));
+                }
+
+                $i += strlen($match[0] ?? '');
+            } else {
+                $value .= '\\';
+            }
+        }
+
+        return $value;
+    }
+}

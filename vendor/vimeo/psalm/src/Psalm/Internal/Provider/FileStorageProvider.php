@@ -1,0 +1,157 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Internal\Provider;
+
+use InvalidArgumentException;
+use Psalm\Storage\FileStorage;
+
+use function strtolower;
+
+/**
+ * @internal
+ */
+final class FileStorageProvider
+{
+    /**
+     * A list of data useful to analyse files
+     * Storing this statically is much faster (at least in PHP 7.2.1)
+     *
+     * @var array<lowercase-string, FileStorage>
+     */
+    private static array $storage = [];
+
+    /**
+     * A list of data useful to analyse new files
+     * Storing this statically is much faster (at least in PHP 7.2.1)
+     *
+     * @var array<string, FileStorage>
+     */
+    private static array $new_storage = [];
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function __construct(public ?FileStorageCacheProvider $cache = null)
+    {
+    }
+
+    /**
+     * @psalm-external-mutation-free
+     */
+    public function get(string $file_path): FileStorage
+    {
+        $file_path = strtolower($file_path);
+
+        if (!isset(self::$storage[$file_path])) {
+            throw new InvalidArgumentException('Could not get file storage for ' . $file_path);
+        }
+
+        return self::$storage[$file_path];
+    }
+
+    /**
+     * @psalm-external-mutation-free
+     */
+    public function remove(string $file_path): void
+    {
+        unset(self::$storage[strtolower($file_path)]);
+    }
+
+    public function has(string $file_path, ?string $file_contents = null): bool
+    {
+        $original_file_path = $file_path;
+        $file_path = strtolower($file_path);
+
+        if (isset(self::$storage[$file_path])) {
+            return true;
+        }
+
+        if ($file_contents === null) {
+            return false;
+        }
+
+        if (!$this->cache) {
+            return false;
+        }
+
+        $cached_value = $this->cache->getLatestFromCache($file_path, $file_contents);
+
+        if (!$cached_value) {
+            return false;
+        }
+
+        // the cache doesn't tell the spellings of a path apart, but the locations in the storage, and the storages of
+        // the class-likes in the file, have the spelling they were scanned with
+        if ($cached_value->file_path !== $original_file_path) {
+            // the scan replaces the entry, which the cache would otherwise skip as already stored
+            $this->cache->forget($file_path);
+
+            return false;
+        }
+
+        self::$storage[$file_path] = $cached_value;
+        self::$new_storage[$file_path] = $cached_value;
+
+        return true;
+    }
+
+    /**
+     * @return array<lowercase-string, FileStorage>
+     * @psalm-external-mutation-free
+     */
+    public static function getAll(): array
+    {
+        return self::$storage;
+    }
+
+    /**
+     * @return array<string, FileStorage>
+     * @psalm-external-mutation-free
+     */
+    public function getNew(): array
+    {
+        return self::$new_storage;
+    }
+
+    /**
+     * @param array<lowercase-string, FileStorage> $more
+     * @psalm-external-mutation-free
+     */
+    public function addMore(array $more): void
+    {
+        self::$new_storage = [...self::$new_storage, ...$more];
+        self::$storage = [...self::$storage, ...$more];
+    }
+
+    /**
+     * @psalm-external-mutation-free
+     */
+    public function create(string $file_path): FileStorage
+    {
+        $file_path_lc = strtolower($file_path);
+
+        $storage = new FileStorage($file_path);
+        self::$storage[$file_path_lc] = $storage;
+        self::$new_storage[$file_path_lc] = $storage;
+
+        return $storage;
+    }
+
+    /**
+     * @psalm-external-mutation-free
+     */
+    public static function deleteAll(): void
+    {
+        self::$storage = [];
+    }
+
+    /**
+     * @psalm-external-mutation-free
+     */
+    public static function populated(): void
+    {
+        self::$new_storage = [];
+    }
+}

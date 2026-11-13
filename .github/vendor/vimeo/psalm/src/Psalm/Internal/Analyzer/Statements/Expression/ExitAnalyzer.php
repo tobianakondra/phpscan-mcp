@@ -1,0 +1,134 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Internal\Analyzer\Statements\Expression;
+
+use PhpParser\Node\Expr\Exit_;
+use Psalm\CodeLocation;
+use Psalm\Context;
+use Psalm\Internal\Analyzer\Statements\Expression\Call\ArgumentAnalyzer;
+use Psalm\Internal\Analyzer\Statements\ExpressionAnalyzer;
+use Psalm\Internal\Analyzer\StatementsAnalyzer;
+use Psalm\Internal\DataFlow\DataFlowNode;
+use Psalm\Issue\ForbiddenCode;
+use Psalm\Issue\ImpureFunctionCall;
+use Psalm\IssueBuffer;
+use Psalm\Storage\Capabilities;
+use Psalm\Storage\FunctionLikeParameter;
+use Psalm\Type;
+use Psalm\Type\Atomic\TInt;
+use Psalm\Type\Atomic\TString;
+use Psalm\Type\TaintKind;
+use Psalm\Type\Union;
+
+/**
+ * @internal
+ */
+final class ExitAnalyzer
+{
+    public static function analyze(
+        StatementsAnalyzer $statements_analyzer,
+        Exit_ $stmt,
+        Context $context,
+    ): bool {
+        $expr_type = null;
+
+        $config = $statements_analyzer->getProjectAnalyzer()->getConfig();
+
+        $forbidden = null;
+
+        if (isset($config->forbidden_functions['exit'])
+            && $stmt->getAttribute('kind') === Exit_::KIND_EXIT
+        ) {
+            $forbidden = 'exit';
+        } elseif (isset($config->forbidden_functions['die'])
+            && $stmt->getAttribute('kind') === Exit_::KIND_DIE
+        ) {
+            $forbidden = 'die';
+        }
+
+        if ($forbidden) {
+            IssueBuffer::maybeAdd(
+                new ForbiddenCode(
+                    'You have forbidden the use of ' . $forbidden,
+                    new CodeLocation($statements_analyzer, $stmt),
+                ),
+                $statements_analyzer->getSuppressedIssues(),
+            );
+        }
+
+        if ($stmt->expr) {
+            $context->inside_call = true;
+
+            if (ExpressionAnalyzer::analyze($statements_analyzer, $stmt->expr, $context) === false) {
+                return false;
+            }
+
+            if ($statements_analyzer->taint_flow_graph) {
+                $call_location = new CodeLocation($statements_analyzer->getSource(), $stmt);
+
+                $echo_param_sink = DataFlowNode::getForCallableArg(
+                    'builtin',
+                    'exit',
+                    0,
+                    $call_location,
+                    TaintKind::INPUT_HTML
+                        | TaintKind::INPUT_HAS_QUOTES
+                        | TaintKind::USER_SECRET
+                        | TaintKind::SYSTEM_SECRET,
+                );
+
+                $statements_analyzer->taint_flow_graph->addSink($echo_param_sink);
+            }
+
+            if ($expr_type = $statements_analyzer->node_data->getType($stmt->expr)) {
+                $exit_param = new FunctionLikeParameter(
+                    'var',
+                    false,
+                );
+
+                if (ArgumentAnalyzer::verifyType(
+                    $statements_analyzer,
+                    $expr_type,
+                    new Union([new TInt(), new TString()]),
+                    null,
+                    'exit',
+                    null,
+                    0,
+                    new CodeLocation($statements_analyzer->getSource(), $stmt->expr),
+                    $stmt->expr,
+                    $context,
+                    null,
+                    $exit_param,
+                    false,
+                    null,
+                    true,
+                    true,
+                    new CodeLocation($statements_analyzer, $stmt),
+                ) === false) {
+                    return false;
+                }
+            }
+
+            $context->inside_call = false;
+        }
+
+        if ($expr_type && !$expr_type->isInt()) {
+            $function_name = $stmt->getAttribute('kind') === Exit_::KIND_DIE ? 'die' : 'exit';
+            $statements_analyzer->signalMutation(
+                Capabilities::IO,
+                $context,
+                $function_name . ' with a non-integer argument',
+                ImpureFunctionCall::class,
+                $stmt,
+            );
+        }
+
+        $statements_analyzer->node_data->setType($stmt, Type::getNever());
+
+        $context->has_returned = true;
+
+        return true;
+    }
+}

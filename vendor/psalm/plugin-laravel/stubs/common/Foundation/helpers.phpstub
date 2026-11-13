@@ -1,0 +1,442 @@
+<?php
+
+/**
+ * Stubs for {@see https://github.com/laravel/framework/blob/master/src/Illuminate/Foundation/helpers.php}
+ */
+
+// abort: nothing to stub
+
+/**
+ * Throw an HttpException with the given data if the given condition is true.
+ *
+ * @param  bool  $boolean
+ * @psalm-assert falsy $boolean
+ * @psalm-return ($boolean is false ? never-return : void )
+ * @param  \Symfony\Component\HttpFoundation\Response|\Illuminate\Contracts\Support\Responsable|int<400, 511>  $code
+ * @param  string  $message
+ * @param  array  $headers
+ * @return void
+ *
+ * @throws \Symfony\Component\HttpKernel\Exception\HttpException
+ * @throws \Symfony\Component\HttpKernel\Exception\NotFoundHttpException
+ */
+function abort_if($boolean, $code, $message = '', array $headers = []) {}
+
+/**
+ * Throw an HttpException with the given data unless the given condition is true.
+ *
+ * @param  bool  $boolean
+ * @param  \Symfony\Component\HttpFoundation\Response|\Illuminate\Contracts\Support\Responsable|int<400, 511>  $code
+ * @param  string  $message
+ * @param  array  $headers
+ * @return void
+ * @psalm-return ($boolean is true ? never-return : void )
+ * @psalm-assert !falsy $boolean
+ *
+ * @throws \Symfony\Component\HttpKernel\Exception\HttpException
+ * @throws \Symfony\Component\HttpKernel\Exception\NotFoundHttpException
+ */
+function abort_unless($boolean, $code, $message = '', array $headers = []) {}
+
+/**
+ * Generate the URL to a controller action.
+ *
+ * @param  callable-array|class-string $name
+ * @param  mixed  $parameters
+ * @param  bool  $absolute
+ * @return string
+ */
+function action($name, $parameters = [], $absolute = true) {}
+
+/**
+ * Get the available container instance, or resolve the given abstract.
+ *
+ * The return type is provided by {@see \Psalm\LaravelPlugin\Handlers\Application\ContainerHandler};
+ * this stub exists only to mark $abstract as an unsafe-reflection taint sink (CWE-470).
+ * A user-controlled class name flowing into the container lets an attacker instantiate
+ * arbitrary classes (constructor side effects, gadget chains). Reuses the built-in
+ * `callable` taint kind, which Psalm also applies to `new $var()` / dynamic invocation.
+ *
+ * @param  string|null  $abstract
+ * @param  array  $parameters
+ * @return mixed
+ *
+ * @psalm-taint-sink callable $abstract
+ */
+function app($abstract = null, array $parameters = []) {}
+
+// app_path: processed by Psalm handlers
+// asset: nothing to stub
+// auth: processed by Psalm handlers
+
+/**
+ * Get the available auth instance.
+ *
+ * @param  string|null  $guard
+ * @return (
+ *  $guard is null
+ *  ? \Illuminate\Auth\AuthManager
+ *  : (\Illuminate\Contracts\Auth\Guard|\Illuminate\Contracts\Auth\StatefulGuard)
+ * )
+ */
+function auth($guard = null) {}
+
+/**
+ * Create a new redirect response to the previous location.
+ *
+ * @param  int<300, 308>  $status
+ * @param  array<string, mixed>  $headers
+ * @param  false|string  $fallback
+ * @return \Illuminate\Http\RedirectResponse
+ */
+function back($status = 302, $headers = [], $fallback = false) {}
+
+// base_path: processed by Psalm handlers
+
+/**
+ * Hash the given value against the bcrypt algorithm.
+ *
+ * @param  string  $value
+ * @param  array{rounds?: string, ...}  $options
+ * @return non-empty-string
+ *
+ * @psalm-taint-escape user_secret
+ * @psalm-taint-escape system_secret
+ */
+function bcrypt($value, $options = []) {}
+
+/**
+ * Begin broadcasting an event.
+ *
+ * @param  object|null  $event
+ * @return \Illuminate\Broadcasting\PendingBroadcast
+ */
+function broadcast($event = null) {}
+
+// cache: processed by Psalm handlers
+
+/**
+ * Get / set the specified configuration value.
+ *
+ * If an array is passed as the key, we will assume you want to set an array of values.
+ *
+ * @param  array<string, mixed>|string|null  $key
+ * @param  mixed  $default
+ * @return ($key is null ? \Illuminate\Config\Repository : ($key is array ? null : mixed))
+ */
+function config($key = null, $default = null) {}
+
+// config_path: processed by Psalm handlers
+
+/**
+ * Create a new cookie instance.
+ *
+ * @param  non-empty-string|null  $name
+ * @param  scalar|null  $value
+ * @param  int  $minutes
+ * @param  string|null  $path
+ * @param  string|null  $domain
+ * @param  bool|null  $secure
+ * @param  bool  $httpOnly
+ * @param  bool  $raw
+ * @param  string|null  $sameSite
+ * @return ($name is null ? \Illuminate\Cookie\CookieJar : \Symfony\Component\HttpFoundation\Cookie)
+ *
+ * @psalm-taint-sink header $name
+ * @psalm-taint-sink header $value
+ * @psalm-taint-sink header $path
+ * @psalm-taint-sink header $domain
+ */
+function cookie($name = null, $value = null, $minutes = 0, $path = null, $domain = null, $secure = null, $httpOnly = true, $raw = false, $sameSite = null) {}
+
+// csrf_field: nothing to stub
+// csrf_token: nothing to stub
+// database_path: processed by Psalm handlers
+
+/**
+ * Decrypt the given value.
+ *
+ * @param  string  $value
+ * @param  bool  $unserialize
+ * @return mixed
+ *
+ * @psalm-taint-unescape user_secret
+ * @psalm-taint-unescape system_secret
+ * @psalm-flow ($value) -> return
+ * @psalm-taint-specialize
+ */
+function decrypt($value, $unserialize = true) {}
+
+/**
+ * Dispatch a job to its appropriate handler.
+ *
+ * @param  object|callable  $job
+ * @return ($job is \Closure ? \Illuminate\Foundation\Bus\PendingClosureDispatch : \Illuminate\Foundation\Bus\PendingDispatch)
+ */
+function dispatch($job) {}
+
+/**
+ * Dispatch a command to its appropriate handler in the current process.
+ *
+ * Queueable jobs will be dispatched to the "sync" queue.
+ *
+ * @param  object|callable  $job
+ * @param  mixed  $handler
+ * @return mixed
+ */
+function dispatch_sync($job, $handler = null) {}
+
+/**
+ * Encrypt the given value.
+ *
+ * @param  mixed  $value
+ * @param  bool  $serialize
+ * @return string
+ *
+ * @psalm-taint-escape user_secret
+ * @psalm-taint-escape system_secret
+ * @psalm-flow ($value) -> return
+ * @psalm-taint-specialize
+ */
+function encrypt($value, $serialize = true): string {}
+
+/**
+ * Dispatch an event and call the listeners.
+ *
+ * @param  string|object  $event
+ * @param  mixed  $payload
+ * @param  bool  $halt
+ * @return list<scalar|array|object>|scalar|array|object|null
+ */
+function event(...$args) {}
+
+// fake: nothing to stub
+// info: nothing to stub
+
+/**
+ * Log a debug message to the logs.
+ *
+ * @param  string|null  $message
+ * @param  array  $context
+ * @return \Illuminate\Log\LogManager|null
+ * @psalm-return ($message is null ? \Illuminate\Log\LogManager : null)
+ */
+function logger($message = null, array $context = []) {}
+
+// lang_path: processed by Psalm handlers
+
+/**
+ * Get a log driver instance.
+ *
+ * @param  string|null  $driver
+ * @return ($driver is null ? \Illuminate\Log\LogManager : \Psr\Log\LoggerInterface&\Illuminate\Log\Logger)
+ */
+function logs($driver = null) {}
+
+// method_field: nothing to stub
+// mix: nothing to stub
+// now: processed by Psalm handlers
+
+// policy: nothing to stub
+
+/**
+ * Handle a Precognition controller hook.
+ *
+ * @template TCallableReturn
+ *
+ * @param  null|callable(callable(\Illuminate\Http\Response=, mixed=): void): TCallableReturn  $callable
+ * @return TCallableReturn
+ */
+function precognitive($callable = null) {}
+
+// public_path: processed by Psalm handlers
+
+/**
+ * @param  string|null  $to
+ * @param  int<300, 308>  $status
+ * @param  array<string, mixed>  $headers
+ * @param  bool|null  $secure
+ * @return ($to is null ? \Illuminate\Routing\Redirector : \Illuminate\Http\RedirectResponse)
+ *
+ * @psalm-taint-sink header $to
+ */
+function redirect($to = null, $status = 302, $headers = [], $secure = null) {}
+
+// report: nothing to stub
+// report_if: nothing to stub
+// report_unless: nothing to stub
+
+/**
+ * Get an instance of the current request or an input item from the request.
+ *
+ * @param  string[]|string|null  $key
+ * @param  mixed  $default
+ * @return ($key is null ? \Illuminate\Http\Request : ($key is array ? string[] : mixed))
+ *
+ * @psalm-taint-source input
+ */
+function request($key = null, $default = null) {}
+
+/**
+ * Resolve a service from the container.
+ *
+ * The return type is provided by {@see \Psalm\LaravelPlugin\Handlers\Application\ContainerHandler};
+ * this stub exists only to mark $name as an unsafe-reflection taint sink (CWE-470),
+ * mirroring app(). Reuses the built-in `callable` taint kind.
+ *
+ * @param  string  $name
+ * @param  array  $parameters
+ * @return mixed
+ *
+ * @psalm-taint-sink callable $name
+ */
+function resolve($name, array $parameters = []) {}
+
+/**
+ * Catch a potential exception and return a default value.
+ *
+ * @template TValue
+ * @template TDefault
+ * @template TDefaultCallableReturn
+ *
+ * @param callable(): TValue $callback
+ * @param TDefault|(callable(\Throwable): TDefaultCallableReturn) $rescue
+ * @param bool $report
+ * @return TValue|(TDefault is callable ? TDefaultCallableReturn : TDefault)
+ */
+function rescue(callable $callback, $rescue = null, $report = true) {}
+
+// resolve: processed by Psalm handlers
+// resource_path: processed by Psalm handlers
+
+/**
+ * Return a new response from the application.
+ *
+ * @param  \Illuminate\Contracts\View\View|string|array|null  $content
+ * @param  int<100, 599>  $status
+ * @param  array   $headers
+ * @return \Illuminate\Http\Response|\Illuminate\Contracts\Routing\ResponseFactory
+ * @psalm-return (func_num_args() is 0 ? \Illuminate\Contracts\Routing\ResponseFactory : \Illuminate\Http\Response)
+ *
+ * @psalm-taint-sink html $content
+ * @psalm-taint-sink header $headers
+ */
+function response($content = '', $status = 200, array $headers = []) {}
+
+// secure_asset: nothing to stub
+// secure_url: nothing to stub
+
+/**
+ * Get / set the specified session value.
+ *
+ * If an array is passed as the key, we will assume you want to set an array of values.
+ *
+ * @param  mixed[]|string|null  $key
+ * @param  mixed  $default
+ * @return ($key is null ? \Illuminate\Session\SessionManager : ($key is array ? null : mixed))
+ *
+ * @psalm-taint-source input
+ */
+function session($key = null, $default = null) {}
+
+// storage_path: nothing to stub
+
+/**
+ * Create a new redirect response to a named route.
+ *
+ * @param  string  $route
+ * @param  mixed  $parameters
+ * @param  int<300, 308>  $status
+ * @param  array  $headers
+ * @return \Illuminate\Http\RedirectResponse
+ */
+function to_route($route, $parameters = [], $status = 302, $headers = []) {}
+
+// today: processed by Psalm handlers
+
+// trans: processed by Psalm handlers
+// trans_choice: processed by Psalm handlers
+
+/**
+ * Translate the given message.
+ *
+ * @param  string|null  $key
+ * @param  array<string, (\Closure(string): string)|scalar|null>  $replace
+ * @param  string|null  $locale
+ * @return ($key is null ? null : string|array)
+ */
+function __($key = null, $replace = [], $locale = null) {}
+
+/**
+ * Generate a url for the application.
+ *
+ * @param  string|null  $path
+ * @param  mixed  $parameters
+ * @param  bool|null  $secure
+ * @return ($path is null ? \Illuminate\Contracts\Routing\UrlGenerator : string)
+ */
+function url($path = null, $parameters = [], $secure = null) {}
+
+/**
+ * Create a new Validator instance.
+ *
+ * @param  array  $data
+ * @param  array  $rules
+ * @param  array  $messages
+ * @param  array  $customAttributes
+ * @return (func_num_args() is 0 ? \Illuminate\Contracts\Validation\Factory : \Illuminate\Contracts\Validation\Validator)
+ */
+function validator(array $data = [], array $rules = [], array $messages = [], array $customAttributes = []) {}
+
+/**
+ * Get the evaluated view contents for the given view.
+ *
+ * Branches on argument count (func_num_args() is 0), not on $view's value —
+ * `view(null)` still returns a View, matching Laravel's own helper. The contract
+ * returns here are the sound fallback; MissingViewHandler narrows the zero-arg
+ * form to the app's resolved factory class (any scanned class qualifies) and the
+ * argument-supplied form to `\Illuminate\View\View`, the latter only when that
+ * resolved factory is the stock `\Illuminate\View\Factory`.
+ *
+ * A user-controlled view name selects which blade template gets compiled and executed.
+ * FileViewFinder normalizes the name (dots become path separators, a known extension is
+ * appended) before joining it onto a configured view path, so it cannot escape to an
+ * arbitrary file the way `Factory::file()`'s path argument can — include only.
+ *
+ * @param  string|null  $view
+ * @param  \Illuminate\Contracts\Support\Arrayable<string, mixed>|array<string, mixed>  $data
+ * @param  array<string, mixed>  $mergeData
+ * @return (func_num_args() is 0 ? \Illuminate\Contracts\View\Factory : \Illuminate\Contracts\View\View)
+ *
+ * @psalm-taint-sink include $view
+ */
+function view($view = null, $data = [], $mergeData = []) {}
+
+/**
+ * Retrieve an old input item.
+ *
+ * Forwards to `Request::old()`, whose stub explains why a keyed read is `mixed`.
+ *
+ * @param  string|null  $key
+ * @param  mixed  $default
+ * @return ($key is null ? array<array-key, mixed>|null : mixed)
+ *
+ * @psalm-taint-source input
+ */
+function old($key = null, $default = null) {}
+
+/**
+ * Get / set the specified context value.
+ *
+ * @param  array|string|null  $key
+ * @param  mixed  $default
+ * @return ($key is string ? mixed : \Illuminate\Log\Context\Repository)
+ */
+function context($key = null, $default = null) {}
+
+/**
+ * Defer execution of the given callback.
+ *
+ * @return ($callback is null ? \Illuminate\Support\Defer\DeferredCallbackCollection : \Illuminate\Support\Defer\DeferredCallback)
+ */
+function defer(?callable $callback = null, ?string $name = null, bool $always = false) {}

@@ -1,0 +1,18 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Plugin\EventHandler;
+
+use Psalm\Plugin\EventHandler\Event\BeforeFileAnalysisEvent;
+
+/**
+ * @api
+ */
+interface BeforeFileAnalysisInterface
+{
+    /**
+     * Called before a file has been checked
+     */
+    public static function beforeAnalyzeFile(BeforeFileAnalysisEvent $event): void;
+}

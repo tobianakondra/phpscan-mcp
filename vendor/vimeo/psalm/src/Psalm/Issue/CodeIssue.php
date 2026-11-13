@@ -1,0 +1,119 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Issue;
+
+use Psalm\CodeLocation;
+use Psalm\Internal\Analyzer\IssueData;
+
+use function array_pop;
+use function explode;
+
+/**
+ * @api
+ */
+abstract class CodeIssue
+{
+    /** @var int */
+    public const ERROR_LEVEL = -1;
+    /** @var int<0, max> */
+    public const SHORTCODE = 0;
+    /** @var non-empty-string|null */
+    public const DOCUMENTATION_URL = null;
+
+    public ?string $dupe_key = null;
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function __construct(
+        public readonly string $message,
+        public readonly CodeLocation $code_location,
+    ) {
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function getShortLocationWithPrevious(): string
+    {
+        $previous_text = '';
+
+        if ($this->code_location->previous_location) {
+            $previous_location = $this->code_location->previous_location;
+            $previous_text = ' from ' . $previous_location->file_name . ':' . $previous_location->getLineNumber();
+        }
+
+        return $this->code_location->file_name . ':' . $this->code_location->getLineNumber() . $previous_text;
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function getShortLocation(): string
+    {
+        return $this->code_location->file_name . ':' . $this->code_location->getLineNumber();
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function getFilePath(): string
+    {
+        return $this->code_location->file_path;
+    }
+
+    /**
+     * @psalm-pure
+     */
+    public static function getIssueType(): string
+    {
+        $fqcn_parts = explode('\\', static::class);
+        return array_pop($fqcn_parts);
+    }
+
+    /**
+     * @param IssueData::SEVERITY_* $severity
+     */
+    public function toIssueData(string $severity): IssueData
+    {
+        $location = $this->code_location;
+        $selection_bounds = $location->getSelectionBounds();
+        $snippet_bounds = $location->getSnippetBounds();
+
+        return new IssueData(
+            $severity,
+            $location->getLineNumber(),
+            $location->getEndLineNumber(),
+            static::getIssueType(),
+            $this->message,
+            $location->file_name,
+            $location->file_path,
+            $location->getSnippet(),
+            $location->getSelectedText(),
+            $selection_bounds[0],
+            $selection_bounds[1],
+            $snippet_bounds[0],
+            $snippet_bounds[1],
+            $location->getColumn(),
+            $location->getEndColumn(),
+            static::SHORTCODE,
+            static::ERROR_LEVEL,
+            $this instanceof TaintedInput
+                ? $this->getTaintTrace()
+                : null,
+            $this instanceof MixedIssue && ($origin_location = $this->getOriginalLocation())
+                ? [
+                    TaintedInput::nodeToDataFlowNodeData(
+                        $origin_location,
+                        'The type of ' . $location->getSelectedText() . ' is sourced from here',
+                    ),
+                ]
+                : null,
+            $this->dupe_key,
+            static::DOCUMENTATION_URL,
+            $this instanceof SecurityIssue,
+        );
+    }
+}

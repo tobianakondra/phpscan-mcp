@@ -1,0 +1,84 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Plugin\EventHandler\Event;
+
+use PhpParser\Node;
+use Psalm\Codebase;
+use Psalm\FileManipulation;
+use Psalm\StatementsSource;
+use Psalm\Storage\ClassLikeStorage;
+
+/**
+ * @psalm-external-mutation-free
+ * @api
+ */
+final class AfterClassLikeAnalysisEvent
+{
+    /**
+     * Called after a statement has been checked
+     *
+     * @param FileManipulation[]   $file_replacements
+     * @internal
+     * @psalm-mutation-free
+     */
+    public function __construct(
+        private readonly Node\Stmt\ClassLike $stmt,
+        private readonly ClassLikeStorage $classlike_storage,
+        private readonly StatementsSource $statements_source,
+        private readonly Codebase $codebase,
+        private array $file_replacements = [],
+    ) {
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function getStmt(): Node\Stmt\ClassLike
+    {
+        return $this->stmt;
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function getClasslikeStorage(): ClassLikeStorage
+    {
+        return $this->classlike_storage;
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function getStatementsSource(): StatementsSource
+    {
+        return $this->statements_source;
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function getCodebase(): Codebase
+    {
+        return $this->codebase;
+    }
+
+    /**
+     * @return FileManipulation[]
+     * @psalm-mutation-free
+     */
+    public function getFileReplacements(): array
+    {
+        return $this->file_replacements;
+    }
+
+    /**
+     * @param FileManipulation[] $file_replacements
+     * @psalm-external-mutation-free
+     */
+    public function setFileReplacements(array $file_replacements): void
+    {
+        $this->file_replacements = $file_replacements;
+    }
+}

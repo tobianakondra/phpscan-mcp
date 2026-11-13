@@ -1,0 +1,580 @@
+<?php
+
+namespace MongoDB\BSON
+{
+    use IteratorAggregate;
+    use JsonSerializable;
+    use Serializable;
+    use Stringable;
+
+    interface Type
+    {
+    }
+
+    interface ObjectIdInterface
+    {
+        /** @psalm-mutation-free */
+        public function getTimestamp(): int;
+
+        /** @psalm-mutation-free */
+        public function __toString(): string;
+    }
+
+    final class ObjectId implements Stringable, ObjectIdInterface, JsonSerializable, Type, Serializable
+    {
+        /**
+         * Without an id, the constructor generates a new one from the clock and a counter of the process. Given an
+         * id, it only validates it.
+         *
+         * @psalm-capabilities ($id is null ? read-globals|write-globals|io : pure)
+         */
+        final public function __construct(?string $id = null)
+        {
+        }
+
+        /** @psalm-mutation-free */
+        final public function getTimestamp(): int
+        {
+        }
+
+        /**
+         * Its 24 hexadecimal digits: nothing the client sends can be in them
+         *
+         * The constructor validates its argument: it throws a
+         * MongoDB\Driver\Exception\InvalidArgumentException unless it gets 24 hexadecimal
+         * digits, so the string is safe whatever the id was built from. That's also why
+         * the constructor is intentionally not a taint sink: new ObjectId($_GET['id']) is
+         * the usual way to validate an id. The input reappears only in the message of the
+         * exception, which getMessage() already taints.
+         *
+         * @psalm-mutation-free
+         * @psalm-taint-escape input
+         */
+        final public function __toString(): string
+        {
+        }
+
+        /** @psalm-pure */
+        final public static function __set_state(array $properties): ObjectId
+        {
+        }
+
+        /** @psalm-mutation-free */
+        final public function serialize(): string
+        {
+        }
+
+        /** @param string $serialized */
+        final public function unserialize($serialized): void
+        {
+        }
+
+        /** @psalm-mutation-free */
+        final public function __serialize(): array
+        {
+        }
+
+        final public function __unserialize(array $data): void
+        {
+        }
+
+        /** @psalm-mutation-free */
+        final public function jsonSerialize(): mixed
+        {
+        }
+    }
+
+    /**
+     * @template TValue
+     * @template-implements IteratorAggregate<string, TValue>
+     */
+    final class Document implements IteratorAggregate, Serializable
+    {
+        private function __construct()
+        {
+        }
+
+        final static public function fromBSON(string $bson): Document
+        {
+        }
+
+        final static public function fromJSON(string $json): Document
+        {
+        }
+
+        /** @param array|object $value */
+        final static public function fromPHP($value): Document
+        {
+        }
+
+        /** @return TValue */
+        final public function get(string $key)
+        {
+        }
+
+        /** @return Iterator<string, TValue> */
+        final public function getIterator(): Iterator
+        {
+        }
+
+        final public function has(string $key): bool
+        {
+        }
+
+        /** @return array|object */
+        final public function toPHP(?array $typeMap = null)
+        {
+        }
+
+        final public function toCanonicalExtendedJSON(): string
+        {
+        }
+
+        final public function toRelaxedExtendedJSON(): string
+        {
+        }
+
+        final public function __toString(): string
+        {
+        }
+
+        final public static function __set_state(array $properties): Document
+        {
+        }
+
+        final public function serialize(): string
+        {
+        }
+
+        /** @param string $serialized */
+        final public function unserialize($serialized): void
+        {
+        }
+
+        final public function __unserialize(array $data): void
+        {
+        }
+
+        final public function __serialize(): array
+        {
+        }
+    }
+
+    /**
+     * @psalm-template TKey of int|string
+     * @psalm-template TValue
+     * $psalm-implements \Iterator<TKey, TValue>
+     */
+    final class Iterator implements \Iterator
+    {
+        final private function __construct()
+        {
+        }
+
+        /** @return TValue */
+        final public function current()
+        {
+        }
+
+        /** @return TKey */
+        final public function key()
+        {
+        }
+
+        final public function next(): void
+        {
+        }
+
+        final public function rewind(): void
+        {
+        }
+
+        final public function valid(): bool
+        {
+        }
+
+        final public function __wakeup(): void
+        {
+        }
+    }
+
+    /**
+     * @template TValue
+     * @template-implements IteratorAggregate<int, TValue>
+     */
+    final class PackedArray implements IteratorAggregate, Serializable
+    {
+        private function __construct()
+        {
+        }
+
+        final static public function fromPHP(array $value): PackedArray
+        {
+        }
+
+        /** @return TValue */
+        final public function get(int $index)
+        {
+        }
+
+        /** @return Iterator<int, TValue> */
+        final public function getIterator(): Iterator
+        {
+        }
+
+        final public function has(int $index): bool
+        {
+        }
+
+        /** @return array|object */
+        final public function toPHP(?array $typeMap = null)
+        {
+        }
+
+        final public function __toString(): string
+        {
+        }
+
+        final public static function __set_state(array $properties): PackedArray
+        {
+        }
+
+        final public function serialize(): string
+        {
+        }
+
+        /** @param string $serialized */
+        final public function unserialize($serialized): void
+        {
+        }
+
+        final public function __unserialize(array $data): void
+        {
+        }
+
+        final public function __serialize(): array
+        {
+        }
+    }
+}
+
+namespace MongoDB\Driver
+{
+    use Iterator;
+
+    /**
+     * @template-covariant TKey
+     * @template-covariant TValue
+     *
+     * @template-extends Iterator<TKey, TValue>
+     */
+    interface CursorInterface extends Iterator
+    {
+        /**
+         * @return array<TValue>
+         */
+        public function toArray();
+    }
+
+    /**
+     * Iterating fetches the next batches of results from the server, keeping the position and the current
+     * document in the cursor.
+     *
+     * @template-covariant TValue of array|object
+     *
+     * @template-implements CursorInterface<int, TValue>
+     *
+     * @psalm-capabilities read-props|write-this-props|io
+     */
+    final class Cursor implements CursorInterface
+    {
+        /** @psalm-mutation-free */
+        final public function getId(): \MongoDB\BSON\Int64
+        {
+        }
+
+        /** @psalm-mutation-free */
+        final public function getServer(): Server
+        {
+        }
+
+        /** @psalm-mutation-free */
+        final public function isDead(): bool
+        {
+        }
+
+        /**
+         * @param array<string, mixed> $typemap
+         * @psalm-capabilities read-props|write-this-props
+         */
+        final public function setTypeMap(array $typemap): void
+        {
+        }
+
+        /**
+         * @return TValue
+         */
+        public function current()
+        {
+        }
+
+        /**
+         * @return void
+         */
+        public function next()
+        {
+        }
+
+        /**
+         * @return int
+         */
+        public function key()
+        {
+        }
+
+        /**
+         * @return bool
+         */
+        public function valid()
+        {
+        }
+
+        /**
+         * @return void
+         */
+        public function rewind()
+        {
+        }
+
+        /**
+         * @return array<TValue>
+         */
+        public function toArray()
+        {
+        }
+    }
+
+    /**
+     * Commands and server selection talk to the servers; the manager keeps their topology, and its own
+     * subscribers.
+     *
+     * @psalm-capabilities read-props|write-this-props|io
+     */
+    final class Manager
+    {
+        /**
+         * It may resolve the hosts of the URI (mongodb+srv), and reuses the connections of the process.
+         *
+         * @psalm-capabilities read-globals|write-globals|io
+         */
+        final public function __construct(?string $uri = null, array $uriOptions = [], array $driverOptions = [])
+        {
+        }
+
+        /** @psalm-mutation-free */
+        final public function getReadConcern(): ReadConcern
+        {
+        }
+
+        /** @psalm-mutation-free */
+        final public function getReadPreference(): ReadPreference
+        {
+        }
+
+        /** @psalm-mutation-free */
+        final public function getWriteConcern(): WriteConcern
+        {
+        }
+
+        /**
+         * @return Cursor<array|object>
+         */
+        final public function executeQuery(string $namespace, Query $query, $options = null): Cursor
+        {
+        }
+
+        /**
+         * @return Cursor<array|object>
+         */
+        final public function executeCommand(string $db, Command $command, $options = null): Cursor
+        {
+        }
+    }
+
+    /**
+     * A server as the manager last saw it: its getters read that description; commands talk to it.
+     *
+     * @psalm-capabilities read-props|io
+     */
+    final class Server
+    {
+        /** @psalm-mutation-free */
+        final public function getHost(): string
+        {
+        }
+
+        /** @psalm-mutation-free */
+        final public function getInfo(): array
+        {
+        }
+
+        /** @psalm-mutation-free */
+        final public function getLatency(): ?int
+        {
+        }
+
+        /** @psalm-mutation-free */
+        final public function getPort(): int
+        {
+        }
+
+        /** @psalm-mutation-free */
+        final public function getServerDescription(): ServerDescription
+        {
+        }
+
+        /**
+         * @return array<string, string>
+         * @psalm-mutation-free
+         */
+        final public function getTags(): array
+        {
+        }
+
+        /** @psalm-mutation-free */
+        final public function getType(): int
+        {
+        }
+
+        /** @psalm-mutation-free */
+        final public function isArbiter(): bool
+        {
+        }
+
+        /** @psalm-mutation-free */
+        final public function isHidden(): bool
+        {
+        }
+
+        /** @psalm-mutation-free */
+        final public function isPassive(): bool
+        {
+        }
+
+        /** @psalm-mutation-free */
+        final public function isPrimary(): bool
+        {
+        }
+
+        /** @psalm-mutation-free */
+        final public function isSecondary(): bool
+        {
+        }
+    }
+
+    final class Query
+    {
+        /**
+         * @param array|object $filter
+         * @param array $queryOptions
+         *
+         * @psalm-taint-sink nosql $filter
+         */
+        final public function __construct($filter, array $queryOptions = [])
+        {
+        }
+    }
+
+    final class Command
+    {
+        /**
+         * @param array|object $document
+         * @param array $commandOptions
+         *
+         * @psalm-taint-sink nosql $document
+         */
+        final public function __construct($document, array $commandOptions = [])
+        {
+        }
+    }
+
+    final class BulkWrite implements \Countable
+    {
+        final public function __construct(array $options = [])
+        {
+        }
+
+        /**
+         * @param array|object $document
+         *
+         * @psalm-taint-sink nosql $document
+         *
+         * @return \MongoDB\BSON\ObjectId|null
+         */
+        final public function insert($document)
+        {
+        }
+
+        /**
+         * @param array|object $filter
+         * @param array|object $newObj
+         * @param array $updateOptions
+         *
+         * @psalm-taint-sink nosql $filter
+         * @psalm-taint-sink nosql $newObj
+         */
+        final public function update($filter, $newObj, array $updateOptions = []): void
+        {
+        }
+
+        /**
+         * @param array|object $filter
+         * @param array $deleteOptions
+         *
+         * @psalm-taint-sink nosql $filter
+         */
+        final public function delete($filter, array $deleteOptions = []): void
+        {
+        }
+
+        final public function count(): int
+        {
+        }
+    }
+}
+
+namespace MongoDB\Driver\Monitoring
+{
+    interface Subscriber
+    {
+    }
+
+    /**
+     * Subscribes to the events of every manager of the process
+     *
+     * @psalm-capabilities read-globals|write-globals
+     */
+    function addSubscriber(Subscriber $subscriber): void
+    {
+    }
+
+    /**
+     * @psalm-capabilities read-globals|write-globals
+     */
+    function removeSubscriber(Subscriber $subscriber): void
+    {
+    }
+}
+
+namespace MongoDB\Driver\Exception
+{
+    use Throwable;
+
+    interface Exception extends Throwable
+    {
+    }
+
+    class InvalidArgumentException extends \InvalidArgumentException implements Exception
+    {
+    }
+}

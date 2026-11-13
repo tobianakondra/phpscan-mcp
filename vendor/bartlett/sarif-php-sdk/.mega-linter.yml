@@ -1,0 +1,21 @@
+---
+EXTENDS:
+    - "https://raw.githubusercontent.com/llaville/.github/refs/heads/master/.mega-linter-base.yml"
+ENABLE:
+    - ACTION
+    - EDITORCONFIG
+    - JSON
+    - MARKDOWN
+    - PHP
+    - YAML
+DISABLE_LINTERS:
+    - ACTION_ZIZMOR
+    - JSON_PRETTIER
+    - JSON_V8R
+    - MARKDOWN_MARKDOWN_TABLE_FORMATTER
+    - MARKDOWN_MARKDOWN_LINK_CHECK
+    - PHP_PSALM
+    - PHP_PHPCSFIXER
+    - YAML_V8R
+YAML_YAMLLINT_FILTER_REGEX_EXCLUDE: "(\\.github|tests)"
+YAML_PRETTIER_FILTER_REGEX_EXCLUDE: "(\\.suite.yml|\\.github/workflows|\\.changie\\.yaml)"

@@ -1,0 +1,43 @@
+<?php
+
+namespace Illuminate\Database\Schema;
+
+use Illuminate\Support\Fluent;
+
+/**
+ * Only lock(), onDelete() and onUpdate() are stubbed; every other fluent method resolves from the
+ * class-level @method tags in Laravel's source (kept when Psalm merges this declaration into the
+ * reflected class).
+ *
+ * - lock(): Laravel documents the same four-literal union, but Psalm does not enforce an @method
+ *   param union of 4+ literals (3 are enforced). A real method is checked, so it is declared here.
+ * - onDelete()/onUpdate(): deliberate narrowing of Laravel's `string` param, an exception to the
+ *   usual "match the vendor signature" rule. It catches typos by allowing exactly the four actions
+ *   Laravel's own helpers emit (cascadeOnDelete(), restrictOnDelete(), nullOnDelete(),
+ *   noActionOnDelete() and their onUpdate twins); lowercase only, so PostgreSQL's `set default` and
+ *   upper-case spellings are rejected.
+ */
+class ForeignKeyDefinition extends Fluent
+{
+    // @todo-by https://github.com/vimeo/psalm/issues/12247 drop this lock() redeclaration, the @method tag in Laravel's source then suffices
+    /**
+     * Specify the DDL lock mode for the foreign key operation (MySQL).
+     *
+     * @param 'none'|'shared'|'default'|'exclusive' $value
+     */
+    public function lock(string $value): ForeignKeyDefinition {}
+
+    /**
+     * Add an ON DELETE action.
+     *
+     * @param 'cascade'|'restrict'|'set null'|'no action' $action
+     */
+    public function onDelete(string $action): ForeignKeyDefinition {}
+
+    /**
+     * Add an ON UPDATE action.
+     *
+     * @param 'cascade'|'restrict'|'set null'|'no action' $action
+     */
+    public function onUpdate(string $action): ForeignKeyDefinition {}
+}

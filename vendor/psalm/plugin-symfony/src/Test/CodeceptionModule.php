@@ -1,0 +1,307 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\SymfonyPsalmPlugin\Test;
+
+use Behat\Gherkin\Node\PyStringNode;
+use Codeception\Exception\ModuleRequireException;
+use Codeception\Module as BaseModule;
+use Codeception\Module\Cli;
+use Codeception\TestInterface;
+use PHPUnit\Framework\Assert;
+use Psalm\SymfonyPsalmPlugin\Twig\CachedTemplatesMapping;
+use Twig\Cache\FilesystemCache;
+use Twig\Environment;
+use Twig\Extension\AbstractExtension;
+use Twig\Loader\FilesystemLoader;
+use Weirdan\Codeception\Psalm\Module;
+
+/**
+ * @psalm-suppress UnusedClass
+ * This class is to be used in codeception configuration - like in tests/acceptance/acceptance.suite.yml.
+ */
+final class CodeceptionModule extends BaseModule
+{
+    /**
+     * The purity annotations Psalm suggests for the code under test, which is not what the tests are about.
+     */
+    private const PURITY_SUGGESTIONS = ['MissingPureAnnotation', 'MissingImmutableAnnotation', 'MissingAbstractPureAnnotation', 'MissingInterfaceImmutableAnnotation'];
+
+    private const DEFAULT_TWIG_TEMPLATES_DIR = 'templates';
+
+    private string $twigTemplateDir = self::DEFAULT_TWIG_TEMPLATES_DIR;
+
+    private ?FilesystemCache $twigCache = null;
+
+    private ?string $lastCachePath = null;
+
+    /**
+     * @var list<string>
+     */
+    private array $suppressedIssueHandlers = [];
+
+    private string $psalmConfig = '';
+
+    #[\Override]
+    public function _initialize(): void
+    {
+        $this->_setConfig([
+            'default_dir' => 'tests/_run/',
+        ]);
+    }
+
+    /**
+     * @psalm-capabilities read-props|write-this-props|write-refs
+     */
+    #[\Override]
+    public function _after(TestInterface $test): void
+    {
+        $this->twigCache = $this->lastCachePath = null;
+        $this->twigTemplateDir = self::DEFAULT_TWIG_TEMPLATES_DIR;
+    }
+
+    /**
+     * @Given the template root directory is :rootDir
+     *
+     * @psalm-capabilities read-props|write-this-props|write-refs
+     */
+    public function setTheTemplateRootDirectory(string $rootDir): void
+    {
+        $this->twigTemplateDir = $rootDir;
+    }
+
+    /**
+     * @Given I have the following :templateName template :code
+     */
+    public function haveTheFollowingTemplate(string $templateName, PyStringNode $code): void
+    {
+        $rootDirectory = rtrim($this->config['default_dir'], DIRECTORY_SEPARATOR);
+        $templatePath = (
+            $rootDirectory.DIRECTORY_SEPARATOR.
+            $this->twigTemplateDir.DIRECTORY_SEPARATOR.
+            $templateName
+        );
+        $templateDirectory = dirname($templatePath);
+        if (!file_exists($templateDirectory)) {
+            mkdir($templateDirectory, 0755, true);
+        }
+
+        file_put_contents($templatePath, $code->getRaw());
+    }
+
+    /**
+     * @Given I have the following file :filename :code
+     */
+    public function haveTheFollowingFile(string $filename, PyStringNode $code): void
+    {
+        $rootDirectory = rtrim($this->config['default_dir'], DIRECTORY_SEPARATOR);
+        $filePath = $rootDirectory.DIRECTORY_SEPARATOR.ltrim($filename, DIRECTORY_SEPARATOR);
+        $directory = dirname($filePath);
+
+        if (!is_dir($directory)) {
+            mkdir($directory, 0755, true);
+        }
+
+        file_put_contents($filePath, $code->getRaw());
+    }
+
+    /**
+     * @Given the :templateName template is compiled in the :cacheDirectory directory
+     */
+    public function haveTheTemplateCompiled(string $templateName, string $cacheDirectory): void
+    {
+        $rootDirectory = rtrim($this->config['default_dir'], DIRECTORY_SEPARATOR);
+        $cacheDirectory = $rootDirectory.DIRECTORY_SEPARATOR.ltrim($cacheDirectory, DIRECTORY_SEPARATOR);
+        if (!file_exists($cacheDirectory)) {
+            mkdir($cacheDirectory, 0755, true);
+        }
+
+        $this->loadTemplate($templateName, $rootDirectory, $cacheDirectory);
+    }
+
+    /**
+     * @Given the last compiled template got his alias changed to :newAlias
+     */
+    public function changeTheLastTemplateAlias(string $newAlias): void
+    {
+        if (null === $this->lastCachePath) {
+            throw new \RuntimeException('You have to compile a template first.');
+        }
+
+        $cacheContent = file_get_contents($this->lastCachePath);
+
+        if (!preg_match('/'.CachedTemplatesMapping::CACHED_TEMPLATE_HEADER_PATTERN.'/m', $cacheContent, $cacheHeadParts)) {
+            throw new \RuntimeException('The cache file is somehow malformed.');
+        }
+
+        file_put_contents($this->lastCachePath, str_replace(
+            $cacheHeadParts[0],
+            str_replace($cacheHeadParts['name'], $newAlias, $cacheHeadParts[0]),
+            $cacheContent
+        ));
+    }
+
+    /**
+     * @psalm-capabilities read-props|write-this-props|write-refs
+     */
+    #[\Override]
+    public function _before(TestInterface $test): void
+    {
+        $this->suppressedIssueHandlers = ['UnusedVariable'];
+    }
+
+    /**
+     * @Given I have issue handler :issueHandlers suppressed
+     * @Given I have issue handlers :issueHandlers suppressed
+     *
+     * @psalm-capabilities read-props|write-this-props|write-refs
+     */
+    public function configureIgnoredIssueHandlers(string $issueHandlers): void
+    {
+        $this->suppressedIssueHandlers = array_map('trim', explode(',', $issueHandlers));
+    }
+
+    /**
+     * @Given I have Symfony plugin enabled
+     */
+    public function configureCommonPsalmconfigEmpty(): void
+    {
+        $this->configureCommonPsalmconfig(new PyStringNode([], 0));
+    }
+
+    /**
+     * @Given I have Symfony plugin enabled with the following config :configuration
+     */
+    public function configureCommonPsalmconfig(PyStringNode $configuration): void
+    {
+        $suppressedIssueHandlers = implode("\n", array_map(function (string $issueHandler) {
+            return "<$issueHandler errorLevel=\"info\"/>";
+        }, [...$this->suppressedIssueHandlers, ...self::PURITY_SUGGESTIONS]));
+
+        $psalmModule = $this->getPsalmModule();
+
+        $this->psalmConfig = <<<XML
+<?xml version="1.0"?>
+  <psalm errorLevel="1" findUnusedCode="false">
+    <projectFiles>
+      <directory name="."/>
+      <ignoreFiles> <directory name="../../vendor"/> </ignoreFiles>
+    </projectFiles>
+
+    <plugins>
+      <pluginClass class="Psalm\SymfonyPsalmPlugin\Plugin">
+        {$configuration->getRaw()}
+      </pluginClass>
+    </plugins>
+    <issueHandlers>
+      $suppressedIssueHandlers
+    </issueHandlers>
+  </psalm>
+XML;
+        $psalmModule->haveTheFollowingConfig($this->psalmConfig);
+    }
+
+    /**
+     * @When I run Psalter fixing :issues
+     */
+    public function runPsalterFixing(string $issues): void
+    {
+        $psalmModule = $this->getPsalmModule();
+        $directory = $this->getPsalmDefaultDirectory($psalmModule);
+        $psalterPath = dirname((string) $psalmModule->_getConfig('psalm_path')).DIRECTORY_SEPARATOR.'psalter';
+
+        // Psalter rejects the "--output-format" option that the Psalm module always adds, so it cannot go through runPsalmOn().
+        file_put_contents(rtrim($directory, DIRECTORY_SEPARATOR).DIRECTORY_SEPARATOR.'psalm.xml', $this->psalmConfig);
+
+        $cli = $this->getModule('Cli');
+        if (!$cli instanceof Cli) {
+            throw new ModuleRequireException($this, 'Needs "Cli" module');
+        }
+
+        $cli->runShellCommand(sprintf(
+            'cd %s && %s --no-progress %s 2>&1',
+            escapeshellarg($directory),
+            escapeshellarg($psalterPath),
+            escapeshellarg('--issues='.$issues)
+        ), false);
+    }
+
+    /**
+     * @Then I see the fixed code :code
+     */
+    public function seeTheFixedCode(PyStringNode $code): void
+    {
+        $files = glob(rtrim($this->getPsalmDefaultDirectory($this->getPsalmModule()), DIRECTORY_SEPARATOR).DIRECTORY_SEPARATOR.'*.php');
+
+        if (false === $files || 1 !== count($files)) {
+            throw new \RuntimeException('Expected exactly one analyzed file to inspect.');
+        }
+
+        Assert::assertStringContainsString(trim((string) $code), (string) file_get_contents($files[0]));
+    }
+
+    private function getPsalmModule(): Module
+    {
+        $psalmModule = $this->getModule(Module::class);
+
+        if (!$psalmModule instanceof Module) {
+            throw new ModuleRequireException($this, sprintf('Needs "%s" module', Module::class));
+        }
+
+        return $psalmModule;
+    }
+
+    private function getPsalmDefaultDirectory(Module $psalmModule): string
+    {
+        $directory = $psalmModule->_getConfig('default_dir');
+
+        if (!is_string($directory)) {
+            throw new \RuntimeException('The Psalm module "default_dir" config must be a string.');
+        }
+
+        return $directory;
+    }
+
+    private function loadTemplate(string $templateName, string $rootDirectory, string $cacheDirectory): void
+    {
+        if (null === $this->twigCache) {
+            if (!is_dir($cacheDirectory)) {
+                throw new \InvalidArgumentException(sprintf('The %s twig cache directory does not exist or is not readable.', $cacheDirectory));
+            }
+            $this->twigCache = new FilesystemCache($cacheDirectory);
+        }
+
+        $twigEnvironment = $this->getEnvironment($rootDirectory, $this->twigCache);
+        $template = $twigEnvironment->load($templateName);
+
+        /** @psalm-suppress InternalMethod */
+        $this->lastCachePath = $this->twigCache->generateKey($templateName, get_class($template->unwrap()));
+    }
+
+    private function getEnvironment(string $rootDirectory, FilesystemCache $twigCache): Environment
+    {
+        if (!file_exists($rootDirectory.DIRECTORY_SEPARATOR.$this->twigTemplateDir)) {
+            mkdir($rootDirectory.DIRECTORY_SEPARATOR.$this->twigTemplateDir);
+        }
+
+        $loader = new FilesystemLoader($this->twigTemplateDir, $rootDirectory);
+
+        $twigEnvironment = new Environment($loader, [
+            'cache' => $twigCache,
+            'auto_reload' => true,
+            'debug' => true,
+            'optimizations' => 0,
+            'strict_variables' => false,
+        ]);
+
+        // The following is a trick to have a different twig cache hash everytime, preventing collisions from one test to another :
+        // the extension construction has to be evaled so the class name will change each time,
+        // making the env calculate a different Twig\Environment::$optionHash (which is partly based on the extension names).
+        /** @var AbstractExtension $ext */
+        $ext = eval('use Twig\Extension\AbstractExtension; return new class() extends AbstractExtension {};');
+        $twigEnvironment->addExtension($ext);
+
+        return $twigEnvironment;
+    }
+}

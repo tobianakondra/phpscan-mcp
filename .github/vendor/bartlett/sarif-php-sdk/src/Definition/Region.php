@@ -1,0 +1,100 @@
+<?php declare(strict_types=1);
+/**
+ * This file is part of the Sarif-PHP-SDK package.
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+namespace Bartlett\Sarif\Definition;
+
+use Bartlett\Sarif\Internal\JsonSerializable;
+use Bartlett\Sarif\Property;
+
+/**
+ * A region within an artifact where a result was detected.
+ *
+ * @author Laurent Laville
+ * @since Release 1.0.0
+ */
+final class Region extends JsonSerializable
+{
+    /**
+     * The line number of the first character in the region.
+     */
+    use Property\StartLine;
+
+    /**
+     * The column number of the first character in the region.
+     */
+    use Property\StartColumn;
+
+    /**
+     * The line number of the last character in the region.
+     */
+    use Property\EndLine;
+
+    /**
+     * The column number of the character following the end of the region.
+     */
+    use Property\EndColumn;
+
+    /**
+     * The zero-based offset from the beginning of the artifact of the first character in the region.
+     */
+    use Property\CharOffset;
+
+    /**
+     * The length of the region in characters.
+     */
+    use Property\CharLength;
+
+    /**
+     * The zero-based offset from the beginning of the artifact of the first byte in the region.
+     */
+    use Property\ByteOffset;
+
+    /**
+     * The length of the region in bytes.
+     */
+    use Property\ByteLength;
+
+    /**
+     * The portion of the artifact contents within the specified region.
+     */
+    use Property\Snippet;
+
+    /**
+     * A message relevant to the region.
+     */
+    use Property\MessageString;
+
+    /**
+     * Specifies the source language, if any, of the portion of the artifact specified by the region object.
+     */
+    use Property\SourceLanguage;
+
+    /**
+     * Key/value pairs that provide additional information about the region.
+     */
+    use Property\Properties;
+
+    public function __construct()
+    {
+        $required = [];
+        $optional = [
+            'startLine',
+            'startColumn',
+            'endLine',
+            'endColumn',
+            'charOffset',
+            'charLength',
+            'byteOffset',
+            'byteLength',
+            'snippet',
+            'message',
+            'sourceLanguage',
+            'properties',
+        ];
+        parent::__construct($required, $optional);
+    }
+}

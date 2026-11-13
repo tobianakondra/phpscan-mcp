@@ -1,0 +1,1491 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Internal\PhpVisitor\Reflector;
+
+use LogicException;
+use PhpParser;
+use PhpParser\Modifiers;
+use PhpParser\Node\Identifier;
+use PhpParser\Node\IntersectionType;
+use PhpParser\Node\Name;
+use PhpParser\Node\NullableType;
+use PhpParser\Node\UnionType;
+use Psalm\Aliases;
+use Psalm\CodeLocation;
+use Psalm\Codebase;
+use Psalm\Config;
+use Psalm\DocComment;
+use Psalm\Exception\ComplicatedExpressionException;
+use Psalm\Exception\DocblockParseException;
+use Psalm\Exception\IncorrectDocblockException;
+use Psalm\Internal\Algebra;
+use Psalm\Internal\Algebra\FormulaGenerator;
+use Psalm\Internal\Analyzer\ClassLikeAnalyzer;
+use Psalm\Internal\Analyzer\CommentAnalyzer;
+use Psalm\Internal\Analyzer\NamespaceAnalyzer;
+use Psalm\Internal\Analyzer\ScopeAnalyzer;
+use Psalm\Internal\Analyzer\Statements\Expression\SimpleTypeInferer;
+use Psalm\Internal\Codebase\InternalCallMapHandler;
+use Psalm\Internal\MethodIdentifier;
+use Psalm\Internal\PhpVisitor\ThisReturnVisitor;
+use Psalm\Internal\Provider\NodeDataProvider;
+use Psalm\Internal\Scanner\FileScanner;
+use Psalm\Internal\Scanner\ParsedDocblock;
+use Psalm\Internal\Type\TypeAlias;
+use Psalm\Internal\TypeVisitor\FunctionPurityTemplateReplacer;
+use Psalm\Issue\DuplicateFunction;
+use Psalm\Issue\DuplicateMethod;
+use Psalm\Issue\DuplicateParam;
+use Psalm\Issue\InvalidDocblock;
+use Psalm\Issue\MissingDocblockType;
+use Psalm\Issue\ParseError;
+use Psalm\Issue\PrivateFinalMethod;
+use Psalm\IssueBuffer;
+use Psalm\Storage\Capabilities;
+use Psalm\Storage\ClassLikeStorage;
+use Psalm\Storage\FileStorage;
+use Psalm\Storage\FunctionLikeParameter;
+use Psalm\Storage\FunctionLikeStorage;
+use Psalm\Storage\FunctionStorage;
+use Psalm\Storage\MethodStorage;
+use Psalm\Storage\Possibilities;
+use Psalm\Storage\PropertyStorage;
+use Psalm\Type;
+use Psalm\Type\Atomic\TArray;
+use Psalm\Type\Atomic\TNull;
+use Psalm\Type\Union;
+use ReflectionFunction;
+use UnexpectedValueException;
+
+use function array_keys;
+use function array_pop;
+use function array_search;
+use function count;
+use function end;
+use function explode;
+use function in_array;
+use function is_string;
+use function spl_object_id;
+use function str_contains;
+use function str_starts_with;
+use function strtolower;
+use function trim;
+
+/**
+ * @internal
+ */
+final class FunctionLikeNodeScanner
+{
+    private readonly string $file_path;
+
+    private readonly Config $config;
+
+    public ?FunctionLikeStorage $storage = null;
+
+    /**
+     * @param array<string, non-empty-array<string, Union>> $existing_function_template_types
+     * @param array<string, TypeAlias> $type_aliases
+     * @psalm-mutation-free
+     */
+    public function __construct(
+        private readonly Codebase $codebase,
+        private readonly FileScanner $file_scanner,
+        private readonly FileStorage $file_storage,
+        private readonly Aliases $aliases,
+        private readonly array $type_aliases,
+        private readonly ?ClassLikeStorage $classlike_storage,
+        private readonly array $existing_function_template_types,
+    ) {
+        $this->file_path = $file_storage->file_path;
+        $this->config = Config::getInstance();
+    }
+
+    /**
+     * @param  bool $fake_method in the case of @method annotations we do something a little strange
+     */
+    public function start(
+        PhpParser\Node\FunctionLike $stmt,
+        bool $fake_method = false,
+        ?PhpParser\Comment\Doc $doc_comment = null,
+    ): FunctionStorage|MethodStorage|false {
+        if ($stmt instanceof PhpParser\Node\Expr\Closure
+            || $stmt instanceof PhpParser\Node\Expr\ArrowFunction
+        ) {
+            $this->codebase->scanner->queueClassLikeForScanning('Closure');
+        }
+
+        $functionlike_info = $this->createStorageForFunctionLike($stmt, $fake_method);
+
+        if ($functionlike_info === false) {
+            return false;
+        }
+
+        [
+            $cased_function_id,
+            $storage,
+            $function_id,
+            $fq_classlike_name,
+            $method_name_lc,
+            $classlike_storage,
+            $is_functionlike_override,
+            $method_id,
+            $is_dupe,
+        ] = $functionlike_info;
+
+        if ($is_dupe) {
+            return $storage;
+        }
+
+        if ($stmt instanceof PhpParser\Node\Stmt\ClassMethod) {
+            $storage->cased_name = $stmt->name->name;
+        } elseif ($stmt instanceof PhpParser\Node\Stmt\Function_) {
+            $storage->cased_name =
+                ($this->aliases->namespace ? $this->aliases->namespace . '\\' : '') . $stmt->name->name;
+        }
+
+        if ($stmt instanceof PhpParser\Node\Stmt\ClassMethod || $stmt instanceof PhpParser\Node\Stmt\Function_) {
+            $storage->location = new CodeLocation($this->file_scanner, $stmt->name, null, true);
+        } else {
+            $storage->location = new CodeLocation($this->file_scanner, $stmt, null, true);
+        }
+
+        $storage->stmt_location = new CodeLocation($this->file_scanner, $stmt);
+
+        $existing_params = $this->addParams(
+            $stmt,
+            $storage,
+            $cased_function_id,
+            $fake_method,
+            $fq_classlike_name,
+            $is_functionlike_override,
+        );
+
+        if ($stmt instanceof PhpParser\Node\Stmt\Function_
+            || $stmt instanceof PhpParser\Node\Stmt\ClassMethod
+        ) {
+            if ($stmt instanceof PhpParser\Node\Stmt\ClassMethod
+                && $storage instanceof MethodStorage
+                && $classlike_storage
+                && !$classlike_storage->isMutationFree()
+                && $stmt->stmts
+                && count($stmt->stmts) === 1
+                && !count($stmt->params)
+                && $stmt->stmts[0] instanceof PhpParser\Node\Stmt\Return_
+                && $stmt->stmts[0]->expr instanceof PhpParser\Node\Expr\PropertyFetch
+                && $stmt->stmts[0]->expr->var instanceof PhpParser\Node\Expr\Variable
+                && $stmt->stmts[0]->expr->var->name === 'this'
+                && $stmt->stmts[0]->expr->name instanceof PhpParser\Node\Identifier
+            ) {
+                $property_name = $stmt->stmts[0]->expr->name->name;
+
+                if (isset($classlike_storage->properties[$property_name])
+                    && $classlike_storage->properties[$property_name]->type
+                    && !$classlike_storage->properties[$property_name]->hook_get
+                ) {
+                    if ($this->config->assume_getters_mutation_free) {
+                        $storage->capabilities = Capabilities::MUTATION_FREE & $storage->capabilities;
+                        $storage->mutation_free_assumed = !$stmt->isFinal() && !$classlike_storage->final;
+                    }
+
+                    $classlike_storage->properties[$property_name]->getter_method = strtolower($stmt->name->name);
+                }
+            } elseif (str_starts_with($stmt->name->name, 'assert')
+                && $stmt->stmts
+            ) {
+                $var_assertions = [];
+
+                foreach ($stmt->stmts as $function_stmt) {
+                    if ($function_stmt instanceof PhpParser\Node\Stmt\If_) {
+                        $final_actions = ScopeAnalyzer::getControlActions(
+                            $function_stmt->stmts,
+                            null,
+                            [],
+                            false,
+                        );
+
+                        if ($final_actions !== [ScopeAnalyzer::ACTION_END]) {
+                            $var_assertions = [];
+                            break;
+                        }
+
+                        $cond_id = spl_object_id($function_stmt->cond);
+
+                        $if_clauses = FormulaGenerator::getFormula(
+                            $cond_id,
+                            $cond_id,
+                            $function_stmt->cond,
+                            $this->classlike_storage->name ?? null,
+                            $this->file_scanner,
+                            null,
+                        );
+
+                        try {
+                            $negated_formula = Algebra::negateFormula($if_clauses);
+                        } catch (ComplicatedExpressionException) {
+                            $var_assertions = [];
+                            break;
+                        }
+
+                        $rules = Algebra::getTruthsFromFormula($negated_formula);
+
+                        if (!$rules) {
+                            $var_assertions = [];
+                            break;
+                        }
+
+                        foreach ($rules as $var_id => $rule) {
+                            foreach ($rule as $rule_part) {
+                                if (count($rule_part) > 1) {
+                                    $var_assertions = [];
+                                    continue 2;
+                                }
+
+                                if (isset($existing_params[$var_id])) {
+                                    $param_offset = $existing_params[$var_id];
+
+                                    $var_assertions[] = new Possibilities(
+                                        $param_offset,
+                                        $rule_part,
+                                    );
+                                } elseif (str_starts_with($var_id, '$this->')) {
+                                    $var_assertions[] = new Possibilities(
+                                        $var_id,
+                                        $rule_part,
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        $var_assertions = [];
+                        break;
+                    }
+                }
+
+                $storage->assertions = $var_assertions;
+            }
+
+            if ($stmt instanceof PhpParser\Node\Stmt\ClassMethod
+                && $stmt->stmts
+                && $storage instanceof MethodStorage
+            ) {
+                $last_stmt = end($stmt->stmts);
+
+                if ($last_stmt instanceof PhpParser\Node\Stmt\Return_
+                    && $last_stmt->expr instanceof PhpParser\Node\Expr\Variable
+                    && $last_stmt->expr->name === 'this'
+                ) {
+                    $storage->probably_fluent = true;
+                }
+
+                // the body only proves what the method returns if no override can replace it
+                if (!$storage->is_static
+                    && ($storage->final || $storage->visibility === ClassLikeAnalyzer::VISIBILITY_PRIVATE)
+                    && ThisReturnVisitor::returnsOnlyThis($stmt->stmts)
+                ) {
+                    $storage->returns_this = true;
+                }
+            }
+        }
+
+        if (!$this->file_scanner->will_analyze
+            && ($stmt instanceof PhpParser\Node\Stmt\Function_
+                || $stmt instanceof PhpParser\Node\Stmt\ClassMethod
+                || $stmt instanceof PhpParser\Node\Expr\Closure)
+            && $stmt->stmts
+        ) {
+            // pick up func_get_args that would otherwise be missed
+            foreach ($stmt->stmts as $function_stmt) {
+                if ($function_stmt instanceof PhpParser\Node\Stmt\Expression
+                    && $function_stmt->expr instanceof PhpParser\Node\Expr\Assign
+                    && $function_stmt->expr->expr instanceof PhpParser\Node\Expr\FuncCall
+                    && $function_stmt->expr->expr->name instanceof PhpParser\Node\Name
+                ) {
+                    $inner_function_id = $function_stmt->expr->expr->name->toString();
+
+                    if ($inner_function_id === 'func_get_arg'
+                        || $inner_function_id === 'func_get_args'
+                        || $inner_function_id === 'func_num_args'
+                    ) {
+                        $storage->variadic = true;
+                    }
+                } elseif ($function_stmt instanceof PhpParser\Node\Stmt\If_
+                    && $function_stmt->cond instanceof PhpParser\Node\Expr\BinaryOp
+                    && $function_stmt->cond->left instanceof PhpParser\Node\Expr\BinaryOp\Equal
+                    && $function_stmt->cond->left->left instanceof PhpParser\Node\Expr\FuncCall
+                    && $function_stmt->cond->left->left->name instanceof PhpParser\Node\Name
+                ) {
+                    $inner_function_id = $function_stmt->cond->left->left->name->toString();
+
+                    if ($inner_function_id === 'func_get_arg'
+                        || $inner_function_id === 'func_get_args'
+                        || $inner_function_id === 'func_num_args'
+                    ) {
+                        $storage->variadic = true;
+                    }
+                }
+            }
+        }
+
+        $parser_return_type = $stmt->getReturnType();
+
+        if ($parser_return_type) {
+            $original_type = $parser_return_type;
+            /** @var Identifier|IntersectionType|Name|NullableType|UnionType $original_type */
+
+            $storage->return_type = TypeHintResolver::resolve(
+                $original_type,
+                new CodeLocation(
+                    $this->file_scanner,
+                    $original_type,
+                ),
+                $this->codebase,
+                $this->file_storage,
+                $this->classlike_storage,
+                $this->aliases,
+                $this->codebase->analysis_php_version_id,
+            );
+
+            $storage->return_type_location = new CodeLocation(
+                $this->file_scanner,
+                $original_type,
+            );
+
+            if ($stmt->returnsByRef()) {
+                /** @psalm-suppress InaccessibleProperty We just created this type */
+                $storage->return_type->by_ref = true;
+            }
+
+            $storage->signature_return_type = $storage->return_type;
+            $storage->signature_return_type_location = $storage->return_type_location;
+        }
+
+        if ($stmt->returnsByRef()) {
+            $storage->returns_by_ref = true;
+        }
+
+        $own_doc_comment = $stmt->getDocComment();
+
+        if ($own_doc_comment !== null && $doc_comment !== null) {
+            // a closure assigned to a variable may carry annotations both on the
+            // variable's docblock and inline on the closure itself; merge them so
+            // that everything declared on the variable (e.g. an auto-added purity
+            // annotation) still applies to the closure. Tags appearing in both
+            // are kept, so a genuine conflict is reported as a duplicate tag.
+            $doc_comment = self::mergeDocComments($own_doc_comment, $doc_comment);
+        } else {
+            $doc_comment = $own_doc_comment ?? $doc_comment;
+        }
+
+
+        if ($classlike_storage && !$classlike_storage->is_trait) {
+            $storage->internal = [...$classlike_storage->internal, ...$storage->internal];
+        }
+
+        if ($doc_comment) {
+            try {
+                $code_location = new CodeLocation($this->file_scanner, $stmt, null, true);
+                $docblock_info = FunctionLikeDocblockParser::parse(
+                    $this->codebase,
+                    $doc_comment,
+                    $code_location,
+                    $cased_function_id,
+                );
+            } catch (IncorrectDocblockException $e) {
+                $storage->docblock_issues[] = new MissingDocblockType(
+                    $e->getMessage() . ' in docblock for ' . $cased_function_id,
+                    new CodeLocation($this->file_scanner, $stmt, null, true),
+                );
+
+                $docblock_info = null;
+            } catch (DocblockParseException $e) {
+                $storage->docblock_issues[] = new InvalidDocblock(
+                    $e->getMessage() . ' in docblock for ' . $cased_function_id,
+                    new CodeLocation($this->file_scanner, $stmt, null, true),
+                );
+
+                $docblock_info = null;
+            }
+
+            if ($docblock_info) {
+                if ($docblock_info->since_php_major_version && !$this->aliases->namespace) {
+                    // Keep the stubbed signature loaded on every version for analysis, but record
+                    // the version that introduced the function so its use is reported as undefined
+                    // when analysing an older PHP version without a polyfill.
+                    $storage->since_php_version_id = $docblock_info->since_php_major_version * 10_000
+                        + $docblock_info->since_php_minor_version * 100;
+                }
+
+                if ($stmt instanceof PhpParser\Node\Expr\Closure
+                    || $stmt instanceof PhpParser\Node\Expr\ArrowFunction
+                ) {
+                    if ($docblock_info->templates !== []) {
+                        $docblock_info->templates = [];
+                        $storage->docblock_issues[] = new InvalidDocblock(
+                            'Templated closures are not supported',
+                            new CodeLocation($this->file_scanner, $stmt, null, true),
+                        );
+                    }
+                }
+
+                FunctionLikeDocblockScanner::addDocblockInfo(
+                    $this->codebase,
+                    $this->file_scanner,
+                    $this->file_storage,
+                    $this->aliases,
+                    $this->type_aliases,
+                    $this->classlike_storage,
+                    $this->existing_function_template_types,
+                    $storage,
+                    $stmt,
+                    $docblock_info,
+                    $is_functionlike_override,
+                    $fake_method,
+                    $cased_function_id,
+                );
+            }
+        }
+
+        // register the functionlike once the @since check has been completed
+        if ($stmt instanceof PhpParser\Node\Stmt\Function_
+            && $function_id
+            && $storage instanceof FunctionStorage
+        ) {
+            // A polyfill of a native function the analysed version predates must not replace the
+            // native signature (and its purity); the polyfill is still known through this file.
+            if ($this->codebase->register_stub_files
+                || (($this->codebase->all_functions_global
+                        || ($this->codebase->register_autoload_files
+                            && !$this->codebase->functions->hasStubbedFunction($function_id)))
+                    && InternalCallMapHandler::getIntroducingPhpVersionId($function_id) === null)
+            ) {
+                $this->codebase->functions->addGlobalFunction($function_id, $storage);
+            }
+
+            $this->file_storage->functions[$function_id] = $storage;
+            $this->file_storage->declaring_function_ids[$function_id] = strtolower($this->file_path);
+        } elseif ($stmt instanceof PhpParser\Node\Stmt\ClassMethod
+            && $classlike_storage
+            && $storage instanceof MethodStorage
+            && $method_name_lc
+            && !$fake_method
+            && $method_id
+        ) {
+            $classlike_storage->methods[$method_name_lc] = $storage;
+
+            $classlike_storage->declaring_method_ids[$method_name_lc]
+                = $classlike_storage->appearing_method_ids[$method_name_lc]
+                = $method_id;
+
+            if (!$stmt->isPrivate()
+                || $method_name_lc === '__construct'
+                || $method_name_lc === '__clone'
+                || $classlike_storage->is_trait
+            ) {
+                $classlike_storage->inheritable_method_ids[$method_name_lc] = $method_id;
+            }
+
+            if (!isset($classlike_storage->overridden_method_ids[$method_name_lc])) {
+                $classlike_storage->overridden_method_ids[$method_name_lc] = [];
+            }
+
+            if ($storage->final && $method_name_lc === '__construct') {
+                // a bit of a hack, but makes sure that `new static` works for these classes
+                $classlike_storage->preserve_constructor_signature = true;
+            }
+        } elseif (($stmt instanceof PhpParser\Node\Expr\Closure
+                || $stmt instanceof PhpParser\Node\Expr\ArrowFunction)
+            && $function_id
+            && $storage instanceof FunctionStorage
+        ) {
+            $this->file_storage->functions[$function_id] = $storage;
+        }
+
+        if ($classlike_storage && $method_name_lc === '__construct') {
+            foreach ($stmt->getParams() as $param) {
+                if (!$param->flags || !$param->var instanceof PhpParser\Node\Expr\Variable) {
+                    continue;
+                }
+
+                $param_storage = null;
+
+                foreach ($storage->params as $param_storage) {
+                    if ($param_storage->name === $param->var->name) {
+                        break;
+                    }
+                }
+
+                if (!$param_storage) {
+                    continue;
+                }
+
+                if (isset($classlike_storage->properties[$param_storage->name]) && $param_storage->location) {
+                    IssueBuffer::maybeAdd(
+                        new ParseError(
+                            'Promoted property ' . $param_storage->name . ' clashes with an existing property',
+                            $param_storage->location,
+                        ),
+                    );
+
+                    $storage->has_visitor_issues = true;
+                    $this->file_storage->has_visitor_issues = true;
+                    continue;
+                }
+
+                $doc_comment = $param->getDocComment();
+                $var_comment_type = null;
+                $var_comment_readonly = false;
+                $var_comment_allow_private_mutation = false;
+                $var_comment_suppressed_issues = [];
+                if ($doc_comment) {
+                    $template_types = ($this->existing_function_template_types ?: [])
+                        + ($classlike_storage->template_types ?: [])
+                    ;
+
+                    try {
+                        $var_comments = CommentAnalyzer::getTypeFromComment(
+                            $this->codebase,
+                            $doc_comment,
+                            $this->file_scanner,
+                            $this->aliases,
+                            $template_types,
+                            $this->type_aliases,
+                        );
+
+                        $var_comment = array_pop($var_comments);
+
+                        if ($var_comment !== null) {
+                            $var_comment_type = $var_comment->type;
+                            $var_comment_readonly = $var_comment->readonly;
+                            $var_comment_allow_private_mutation = $var_comment->allow_private_mutation;
+                            $var_comment_suppressed_issues = $var_comment->suppressed_issues;
+                        }
+                    } catch (IncorrectDocblockException $e) {
+                        $storage->docblock_issues[] = new MissingDocblockType(
+                            $e->getMessage() . ' in docblock for ' . $cased_function_id,
+                            new CodeLocation($this->file_scanner, $param, null, true),
+                        );
+                    } catch (DocblockParseException $e) {
+                        $storage->docblock_issues[] = new InvalidDocblock(
+                            $e->getMessage() . ' in docblock for ' . $cased_function_id,
+                            new CodeLocation($this->file_scanner, $param, null, true),
+                        );
+                    }
+                }
+
+                //both way to document type were used
+                if ($param_storage->type && $param_storage->type->from_docblock && $var_comment_type) {
+                    $this->file_storage->scan_issues[] = new InvalidDocblock(
+                        'Param ' . $param_storage->name . ' of ' . $cased_function_id .
+                        ' should be documented as a param or a property, not both',
+                        new CodeLocation($this->file_scanner, $param, null, true),
+                    );
+                }
+
+                //no docblock type was provided for param but we have one for property
+                if ($var_comment_type) {
+                    $param_storage->type = $var_comment_type;
+                }
+
+                $property_storage = $classlike_storage->properties[$param_storage->name] = new PropertyStorage();
+                $property_storage->is_static = false;
+                $property_storage->type = $param_storage->type;
+
+                if ($property_storage->type) {
+                    // `@param Closure[P](): int $f`: the property holds closures of any purity P allows
+                    (new FunctionPurityTemplateReplacer())->traverse($property_storage->type);
+                }
+
+                $property_storage->signature_type = $param_storage->signature_type;
+                $property_storage->signature_type_location = $param_storage->signature_type_location;
+                $property_storage->type_location = $param_storage->type_location;
+                $property_storage->location = $param_storage->location;
+                $property_storage->stmt_location = new CodeLocation($this->file_scanner, $param);
+                $property_storage->has_default = (bool)$param->default;
+                $param_type_readonly = (bool)($param->flags & Modifiers::READONLY);
+                $property_storage->readonly = $param_type_readonly
+                    || $classlike_storage->readonly
+                    || $var_comment_readonly;
+                $property_storage->allow_private_mutation = $var_comment_allow_private_mutation;
+                $property_storage->suppressed_issues = $var_comment_suppressed_issues;
+                $param_storage->promoted_property = true;
+                $property_storage->is_promoted = true;
+
+                $fq_classlike_name = $classlike_storage->name;
+
+                $property_id = $fq_classlike_name . '::$' . $param_storage->name;
+
+                PropertyVisibilityResolver::resolve(
+                    $this->codebase,
+                    $classlike_storage,
+                    $property_storage,
+                    $param->flags,
+                    new CodeLocation($this->file_scanner, $param, null, true),
+                    $property_id,
+                );
+
+                if ($property_storage->visibility !== ClassLikeAnalyzer::VISIBILITY_PRIVATE) {
+                    $classlike_storage->inheritable_property_ids[$param_storage->name] = $property_id;
+                }
+
+                $classlike_storage->declaring_property_ids[$param_storage->name] = $fq_classlike_name;
+                $classlike_storage->appearing_property_ids[$param_storage->name] = $property_id;
+                $classlike_storage->initialized_properties[$param_storage->name] = true;
+            }
+
+            if ($stmt instanceof PhpParser\Node\Stmt\ClassMethod
+                && $storage instanceof MethodStorage
+                && $storage->params
+                && $this->config->infer_property_types_from_constructor
+            ) {
+                $this->inferPropertyTypeFromConstructor($stmt, $storage, $classlike_storage);
+            }
+        }
+
+        foreach ($stmt->getAttrGroups() as $attr_group) {
+            foreach ($attr_group->attrs as $attr) {
+                $attribute = AttributeResolver::resolve(
+                    $this->codebase,
+                    $this->file_scanner,
+                    $this->file_storage,
+                    $this->aliases,
+                    $attr,
+                    $this->classlike_storage->name ?? null,
+                );
+
+                if ($attribute->fq_class_name === 'Psalm\\Pure'
+                    || $attribute->fq_class_name === 'JetBrains\\PhpStorm\\Pure'
+                ) {
+                    $storage->specialize_call = true;
+                    $storage->capabilities = Capabilities::NONE;
+                    $storage->has_mutations_annotation = true;
+
+                    if ($storage instanceof MethodStorage) {
+                        $storage->mutation_free_assumed = false;
+                    }
+                }
+
+                if ($attribute->fq_class_name === 'NoDiscard') {
+                    $storage->no_discard = true;
+                }
+
+                if ($attribute->fq_class_name === 'Psalm\\Deprecated'
+                    || $attribute->fq_class_name === 'Deprecated'
+                    || $attribute->fq_class_name === 'JetBrains\\PhpStorm\\Deprecated'
+                ) {
+                    $storage->deprecated = true;
+                }
+
+                if ($attribute->fq_class_name === 'Psalm\\Internal' && !$storage->internal && $fq_classlike_name) {
+                    $storage->internal = [NamespaceAnalyzer::getNameSpaceRoot($fq_classlike_name)];
+                }
+
+                if ($attribute->fq_class_name === 'Psalm\\ExternalMutationFree'
+                    && $storage instanceof MethodStorage
+                ) {
+                    if ($storage->mutation_free_assumed) {
+                        // like an annotation in the docblock, it replaces what a getter is assumed to do
+                        $storage->capabilities = Capabilities::ALL;
+                        $storage->mutation_free_assumed = false;
+                    }
+
+                    $storage->capabilities = $storage->capabilities & Capabilities::EXTERNAL_MUTATION_FREE;
+                    $storage->has_mutations_annotation = true;
+                }
+
+                if ($attribute->fq_class_name === 'JetBrains\\PhpStorm\\NoReturn') {
+                    $storage->return_type = Type::getNever();
+                }
+
+                $storage->attributes[] = $attribute;
+            }
+        }
+
+        return $storage;
+    }
+
+    /**
+     * Gives the constructor $stmt scanned (see start()), if it is unannotated and trivial, what it needs (see
+     * getTrivialConstructorCapabilities())
+     */
+    public function applyTrivialConstructorCapabilities(PhpParser\Node\FunctionLike $stmt): void
+    {
+        $storage = $this->storage;
+        $classlike_storage = $this->classlike_storage;
+
+        if ($stmt instanceof PhpParser\Node\Stmt\ClassMethod
+            && $storage instanceof MethodStorage
+            && $classlike_storage !== null
+            && !$classlike_storage->is_trait
+            && strtolower($stmt->name->name) === '__construct'
+            && !$storage->has_mutations_annotation
+            && $storage->purity_from_templates === []
+            && $storage->conditional_capabilities === []
+            && $storage->capabilities_type === null
+            && $storage->capabilities === Capabilities::ALL
+        ) {
+            $trivial = self::getTrivialConstructorCapabilities($stmt, $classlike_storage);
+
+            if ($trivial !== null) {
+                [$storage->capabilities, $storage->trivial_constructor_properties] = $trivial;
+            }
+        }
+    }
+
+    /**
+     * What a constructor without a purity annotation needs, if it is trivial: it only assigns its parameters or
+     * constant values to properties its class declares before it (or promotes), without hooks. It needs nothing
+     * if it does nothing, else write-this-props: it can't keep a reference to the new object anywhere, so `new`
+     * gives a fresh object (see NewAnalyzer). Decided from the constructor's own syntax only, so it is the same
+     * whatever else is scanned. Anything else (a call, `parent::__construct()` included, a by-reference
+     * parameter, a default making an object or calling something, an undeclared or hooked property, `$this`
+     * stored anywhere) makes it non-trivial: null. Also returns the properties it assigns, which a class
+     * extending its class may redeclare with hooks (see NewAnalyzer).
+     *
+     * @return array{Capabilities::NONE|Capabilities::WRITE_THIS_PROPS, list<string>}|null
+     * @psalm-mutation-free
+     */
+    private static function getTrivialConstructorCapabilities(
+        PhpParser\Node\Stmt\ClassMethod $stmt,
+        ClassLikeStorage $classlike_storage,
+    ): ?array {
+        if ($stmt->stmts === null) {
+            return null;
+        }
+
+        $param_names = [];
+        $promotes = false;
+        $assigned = [];
+
+        foreach ($stmt->params as $param) {
+            if ($param->byRef
+                || !$param->var instanceof PhpParser\Node\Expr\Variable
+                || !is_string($param->var->name)
+                || ($param->default !== null && !self::isConstantValue($param->default))
+                || $param->hooks !== []
+            ) {
+                return null;
+            }
+
+            $param_names[$param->var->name] = true;
+
+            if ($param->flags !== 0) {
+                $promotes = true;
+                $assigned[] = $param->var->name;
+            }
+        }
+
+        foreach ($stmt->stmts as $inner_stmt) {
+            if (!$inner_stmt instanceof PhpParser\Node\Stmt\Expression
+                || !$inner_stmt->expr instanceof PhpParser\Node\Expr\Assign
+                || !$inner_stmt->expr->var instanceof PhpParser\Node\Expr\PropertyFetch
+                || !$inner_stmt->expr->var->var instanceof PhpParser\Node\Expr\Variable
+                || $inner_stmt->expr->var->var->name !== 'this'
+                || !$inner_stmt->expr->var->name instanceof PhpParser\Node\Identifier
+            ) {
+                return null;
+            }
+
+            $property = $classlike_storage->properties[$inner_stmt->expr->var->name->name] ?? null;
+            $value = $inner_stmt->expr->expr;
+
+            if ($property === null
+                || $property->is_static
+                || $property->hook_get !== null
+                || $property->hook_set !== null
+                || !($value instanceof PhpParser\Node\Expr\Variable
+                    ? is_string($value->name) && isset($param_names[$value->name])
+                    : self::isConstantValue($value))
+            ) {
+                return null;
+            }
+
+            $assigned[] = $inner_stmt->expr->var->name->name;
+        }
+
+        return [$promotes || $stmt->stmts !== [] ? Capabilities::WRITE_THIS_PROPS : Capabilities::NONE, $assigned];
+    }
+
+    /**
+     * Whether $expr is a constant value, which evaluating can't do anything: a scalar, a constant, or an array of
+     * those
+     *
+     * @psalm-mutation-free
+     */
+    private static function isConstantValue(PhpParser\Node\Expr $expr): bool
+    {
+        if ($expr instanceof PhpParser\Node\Scalar
+            || $expr instanceof PhpParser\Node\Expr\ConstFetch
+            || ($expr instanceof PhpParser\Node\Expr\ClassConstFetch
+                && $expr->class instanceof PhpParser\Node\Name
+                && $expr->name instanceof PhpParser\Node\Identifier)
+        ) {
+            return true;
+        }
+
+        if ($expr instanceof PhpParser\Node\Expr\UnaryMinus || $expr instanceof PhpParser\Node\Expr\UnaryPlus) {
+            return self::isConstantValue($expr->expr);
+        }
+
+        if ($expr instanceof PhpParser\Node\Expr\Array_) {
+            foreach ($expr->items as $item) {
+                if ($item->byRef
+                    || $item->unpack
+                    || ($item->key !== null && !self::isConstantValue($item->key))
+                    || !self::isConstantValue($item->value)
+                ) {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Merges two docblocks into one by unioning their tags. Used to combine a
+     * closure's own inline docblock (primary) with the docblock of the variable
+     * it is assigned to (secondary), so annotations declared on the variable
+     * still apply to the closure. Tags are not deduplicated, so a tag present in
+     * both — e.g. a conflicting @param or @return — survives into the merged
+     * docblock and is reported by the usual duplicate-tag detection. The result
+     * keeps the primary's source position so any reported docblock issue still
+     * points at real code.
+     */
+    private static function mergeDocComments(
+        PhpParser\Comment\Doc $primary,
+        PhpParser\Comment\Doc $secondary,
+    ): PhpParser\Comment\Doc {
+        $primary_parsed = DocComment::parsePreservingLength($primary, true);
+        $secondary_parsed = DocComment::parsePreservingLength($secondary, true);
+
+        // The tags of both docblocks are unioned rather than deduplicated: a tag
+        // that appears in both (e.g. a conflicting @param or @return) is kept so
+        // that the duplicate-tag detection in FunctionLikeDocblockParser fires on
+        // the merged docblock, just as it would within a single docblock.
+        // parsePreservingLength pads the tag text to keep source offsets, so the
+        // lines are trimmed before being re-rendered.
+        $tags = [];
+
+        foreach ([$primary_parsed->tags, $secondary_parsed->tags] as $parsed_tags) {
+            foreach ($parsed_tags as $type => $lines) {
+                foreach ($lines as $line) {
+                    $tags[$type][] = trim($line);
+                }
+            }
+        }
+
+        $description = $primary_parsed->description !== ''
+            ? $primary_parsed->description
+            : $secondary_parsed->description;
+
+        $merged = new ParsedDocblock($description, $tags);
+
+        return new PhpParser\Comment\Doc(
+            $merged->render(''),
+            $primary->getStartLine(),
+            $primary->getStartFilePos(),
+            $primary->getStartTokenPos(),
+            $primary->getEndLine(),
+            $primary->getEndFilePos(),
+            $primary->getEndTokenPos(),
+        );
+    }
+
+    private function inferPropertyTypeFromConstructor(
+        PhpParser\Node\Stmt\ClassMethod $stmt,
+        MethodStorage $storage,
+        ClassLikeStorage $classlike_storage,
+    ): void {
+        if (!$stmt->stmts) {
+            return;
+        }
+
+        $assigned_properties = [];
+
+        foreach ($stmt->stmts as $function_stmt) {
+            if ($function_stmt instanceof PhpParser\Node\Stmt\Expression
+                && $function_stmt->expr instanceof PhpParser\Node\Expr\Assign
+                && $function_stmt->expr->var instanceof PhpParser\Node\Expr\PropertyFetch
+                && $function_stmt->expr->var->var instanceof PhpParser\Node\Expr\Variable
+                && $function_stmt->expr->var->var->name === 'this'
+                && $function_stmt->expr->var->name instanceof PhpParser\Node\Identifier
+                && ($property_name = $function_stmt->expr->var->name->name)
+                && isset($classlike_storage->properties[$property_name])
+                && $function_stmt->expr->expr instanceof PhpParser\Node\Expr\Variable
+                && is_string($function_stmt->expr->expr->name)
+                && ($param_name = $function_stmt->expr->expr->name)
+                && isset($storage->param_lookup[$param_name])
+            ) {
+                if ($classlike_storage->properties[$property_name]->type
+                    || !$storage->param_lookup[$param_name]
+                ) {
+                    continue;
+                }
+
+                $param_index = array_search($param_name, array_keys($storage->param_lookup), true);
+
+                if ($param_index === false || !isset($storage->params[$param_index]->type)) {
+                    continue;
+                }
+
+                $param_type = $storage->params[$param_index]->type;
+
+                $assigned_properties[$property_name] =
+                    $storage->params[$param_index]->is_variadic
+                        ? new Union([
+                            new TArray([
+                                Type::getInt(),
+                                $param_type,
+                            ]),
+                        ])
+                        : $param_type;
+            } else {
+                $assigned_properties = [];
+                break;
+            }
+        }
+
+        if (!$assigned_properties) {
+            return;
+        }
+
+        foreach ($assigned_properties as $property_name => $property_type) {
+            $classlike_storage->properties[$property_name]->type = $property_type;
+        }
+
+        if ($storage->has_mutations_annotation) {
+            // an explicit annotation replaces what the constructor is assumed to do
+            return;
+        }
+
+        $storage->capabilities = Capabilities::EXTERNAL_MUTATION_FREE & $storage->capabilities;
+
+        $storage->mutation_free_assumed = true;
+    }
+
+    private function getTranslatedFunctionParam(
+        PhpParser\Node\Param $param,
+        PhpParser\Node\FunctionLike $stmt,
+        bool $fake_method,
+        ?string $fq_classlike_name,
+    ): FunctionLikeParameter {
+        $param_type = null;
+
+        $is_nullable = $param->default instanceof PhpParser\Node\Expr\ConstFetch &&
+            strtolower($param->default->name->getFirst()) === 'null';
+
+        $param_typehint = $param->type;
+
+        if ($param_typehint) {
+            /** @var Identifier|IntersectionType|Name|NullableType|UnionType $param_typehint */
+
+            $param_type = TypeHintResolver::resolve(
+                $param_typehint,
+                new CodeLocation(
+                    $this->file_scanner,
+                    $param_typehint,
+                ),
+                $this->codebase,
+                $this->file_storage,
+                $this->classlike_storage,
+                $this->aliases,
+                $this->codebase->analysis_php_version_id,
+            );
+
+            if ($param_type->isMixed()) {
+                $is_nullable = false;
+            } elseif ($is_nullable) {
+                $param_type = $param_type->getBuilder()->addType(new TNull)->freeze();
+            } else {
+                $is_nullable = $param_type->isNullable();
+            }
+        }
+
+        $is_optional = $param->default !== null;
+
+        if ($param->var instanceof PhpParser\Node\Expr\Error || !is_string($param->var->name)) {
+            throw new UnexpectedValueException('Not expecting param name to be non-string');
+        }
+
+        $default_type = null;
+
+        if ($param->default) {
+            $default_type = SimpleTypeInferer::infer(
+                $this->codebase,
+                new NodeDataProvider(),
+                $param->default,
+                $this->aliases,
+                null,
+                null,
+                $fq_classlike_name,
+            );
+
+            if (!$default_type) {
+                $default_type = ExpressionResolver::getUnresolvedClassConstExpr(
+                    $param->default,
+                    $this->aliases,
+                    $fq_classlike_name,
+                );
+            }
+        }
+
+        return new FunctionLikeParameter(
+            $param->var->name,
+            $param->byRef,
+            $param_type,
+            $param_type,
+            new CodeLocation(
+                $this->file_scanner,
+                $fake_method ? $stmt : $param->var,
+                null,
+                false,
+                !$fake_method
+                    ? CodeLocation::FUNCTION_PARAM_VAR
+                    : CodeLocation::FUNCTION_PHPDOC_METHOD,
+            ),
+            $param_typehint
+                ? new CodeLocation(
+                    $this->file_scanner,
+                    $fake_method ? $stmt : $param,
+                    null,
+                    false,
+                    CodeLocation::FUNCTION_PARAM_TYPE,
+                )
+                : null,
+            $is_optional,
+            $is_nullable,
+            $param->variadic,
+            $default_type,
+        );
+    }
+
+    //phpcs:disable -- Remove this once the phpstan phpdoc parser MR is merged
+    /**
+     * @return array{
+     *     string,
+     *     FunctionStorage|MethodStorage,
+     *     null|string,
+     *     null|string,
+     *     null|lowercase-string,
+     *     ClassLikeStorage|null,
+     *     bool,
+     *     MethodIdentifier|null,
+     *     bool
+     * }|false
+     */
+    private function createStorageForFunctionLike(
+        PhpParser\Node\FunctionLike $stmt,
+        bool $fake_method
+    ) {
+        //phpcs:enable -- Remove this once the phpstan phpdoc parser MR is merged
+        $classlike_storage = null;
+        $fq_classlike_name = null;
+        $is_functionlike_override = false;
+
+        $function_id = null;
+        $method_name_lc = null;
+        $method_id = null;
+
+        if ($fake_method && $stmt instanceof PhpParser\Node\Stmt\ClassMethod) {
+            $cased_function_id = '@method ' . $stmt->name->name;
+
+            $storage = $this->storage = new MethodStorage();
+            $storage->defining_fqcln = '';
+            $storage->is_static = $stmt->isStatic();
+            $storage->final = $this->classlike_storage && $this->classlike_storage->final;
+            $storage->final_from_docblock = $this->classlike_storage && $this->classlike_storage->final_from_docblock;
+            $storage->visibility = ClassLikeAnalyzer::VISIBILITY_PUBLIC;
+        } elseif ($stmt instanceof PhpParser\Node\Stmt\Function_) {
+            $cased_function_id =
+                ($this->aliases->namespace ? $this->aliases->namespace . '\\' : '') . $stmt->name->name;
+            $function_id = strtolower($cased_function_id);
+
+            $storage = $this->storage = new FunctionStorage();
+
+            if ($this->codebase->register_stub_files
+                || $this->codebase->register_autoload_files
+                || $this->codebase->all_functions_global
+            ) {
+                if (isset($this->file_storage->functions[$function_id])
+                    && ($this->codebase->register_stub_files
+                        || !$this->codebase->functions->hasStubbedFunction($function_id))
+                ) {
+                    // see the polyfill rule where the function is first registered
+                    if ($this->codebase->register_stub_files
+                        || InternalCallMapHandler::getIntroducingPhpVersionId($function_id) === null
+                    ) {
+                        $this->codebase->functions->addGlobalFunction(
+                            $function_id,
+                            $this->file_storage->functions[$function_id],
+                        );
+                    }
+
+                    $storage = $this->storage = $this->file_storage->functions[$function_id];
+
+                    return [$function_id, $storage, null, null, null, null, false, null, true];
+                }
+            } else {
+                if (isset($this->file_storage->functions[$function_id])) {
+                    $duplicate_function_storage = $this->file_storage->functions[$function_id];
+
+                    if ($duplicate_function_storage->location
+                        && $duplicate_function_storage->location->getLineNumber() === $stmt->getLine()
+                    ) {
+                        $storage = $this->storage = $this->file_storage->functions[$function_id];
+
+                        return [$function_id, $storage, null, null, null, null, false, null, true];
+                    }
+
+                    IssueBuffer::maybeAdd(
+                        new DuplicateFunction(
+                            'Method ' . $function_id . ' has already been defined'
+                            . ($duplicate_function_storage->location
+                                ? ' in ' . $duplicate_function_storage->location->file_path
+                                : ''),
+                            new CodeLocation($this->file_scanner, $stmt, null, true),
+                        ),
+                    );
+
+                    $this->file_storage->has_visitor_issues = true;
+
+                    $duplicate_function_storage->has_visitor_issues = true;
+
+                    $storage = $this->storage = $this->file_storage->functions[$function_id];
+
+                    return [$function_id, $storage, null, null, null, null, false, null, true];
+                }
+
+                // a core function the analysed PHP version predates can be polyfilled
+                if (isset($this->config->getPredefinedFunctions()[$function_id])
+                    && InternalCallMapHandler::getIntroducingPhpVersionId($function_id) === null
+                ) {
+                    /** @psalm-suppress ArgumentTypeCoercion */
+                    $reflection_function = new ReflectionFunction($function_id);
+
+                    if ($reflection_function->getFileName() !== $this->file_path) {
+                        $this->file_storage->scan_issues[] = new DuplicateFunction(
+                            'Method ' . $function_id . ' has already been defined as a core function',
+                            new CodeLocation($this->file_scanner, $stmt, null, true),
+                        );
+                    }
+                }
+            }
+        } elseif ($stmt instanceof PhpParser\Node\Stmt\ClassMethod) {
+            if (!$this->classlike_storage) {
+                throw new LogicException('$this->classlike_storage should not be null');
+            }
+
+            $fq_classlike_name = $this->classlike_storage->name;
+
+            $method_name_lc = strtolower($stmt->name->name);
+
+            $function_id = $fq_classlike_name . '::' . $method_name_lc;
+            $cased_function_id = $fq_classlike_name . '::' . $stmt->name->name;
+
+            $classlike_storage = $this->classlike_storage;
+
+            $storage = null;
+
+            if (isset($classlike_storage->methods[$method_name_lc])) {
+                if (!$this->codebase->register_stub_files) {
+                    $duplicate_method_storage = $classlike_storage->methods[$method_name_lc];
+
+                    IssueBuffer::maybeAdd(
+                        new DuplicateMethod(
+                            'Method ' . $function_id . ' has already been defined'
+                            . ($duplicate_method_storage->location
+                                ? ' in ' . $duplicate_method_storage->location->file_path
+                                : ''),
+                            new CodeLocation($this->file_scanner, $stmt, null, true),
+                        ),
+                    );
+
+                    $this->file_storage->has_visitor_issues = true;
+
+                    $duplicate_method_storage->has_visitor_issues = true;
+
+                    return false;
+                }
+
+                // skip methods based on @since docblock tag: version-specific stubs declare the
+                // same method more than once with per-version signatures, and only the one whose
+                // @since matches the analysed version must be registered (registering the others
+                // would collide). Unlike classes/functions, this is signature selection rather
+                // than an availability gate.
+                $doc_comment = $stmt->getDocComment();
+
+                if ($doc_comment) {
+                    $docblock_info = null;
+                    try {
+                        $code_location = new CodeLocation($this->file_scanner, $stmt, null, true);
+                        $docblock_info = FunctionLikeDocblockParser::parse(
+                            $this->codebase,
+                            $doc_comment,
+                            $code_location,
+                            $cased_function_id,
+                        );
+                    } catch (IncorrectDocblockException|DocblockParseException) {
+                    }
+                    if ($docblock_info) {
+                        if ($docblock_info->since_php_major_version && !$this->aliases->namespace) {
+                            $analysis_major_php_version = $this->codebase->getMajorAnalysisPhpVersion();
+                            $analysis_minor_php_version = $this->codebase->getMinorAnalysisPhpVersion();
+                            if ($docblock_info->since_php_major_version > $analysis_major_php_version) {
+                                return false;
+                            }
+
+                            if ($docblock_info->since_php_major_version === $analysis_major_php_version
+                                && $docblock_info->since_php_minor_version > $analysis_minor_php_version
+                            ) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+
+                $is_functionlike_override = true;
+                $storage = $this->storage = $classlike_storage->methods[$method_name_lc];
+            }
+
+            if (!$storage) {
+                $storage = $this->storage = new MethodStorage();
+            }
+
+            $storage->stubbed = $this->codebase->register_stub_files;
+            $storage->defining_fqcln = $fq_classlike_name;
+
+            $class_name_parts = explode('\\', $fq_classlike_name);
+            $class_name = array_pop($class_name_parts);
+
+            if ($method_name_lc === strtolower($class_name)
+                && !isset($classlike_storage->methods['__construct'])
+                && !str_contains($fq_classlike_name, '\\')
+                && $this->codebase->analysis_php_version_id <= 7_04_00
+            ) {
+                $this->codebase->methods->setDeclaringMethodId(
+                    $fq_classlike_name,
+                    '__construct',
+                    $fq_classlike_name,
+                    $method_name_lc,
+                );
+
+                $this->codebase->methods->setAppearingMethodId(
+                    $fq_classlike_name,
+                    '__construct',
+                    $fq_classlike_name,
+                    $method_name_lc,
+                );
+            }
+
+            $method_id = new MethodIdentifier(
+                $fq_classlike_name,
+                $method_name_lc,
+            );
+
+            $storage->is_static = $stmt->isStatic();
+            $storage->abstract = $stmt->isAbstract();
+
+            if ($stmt->isPrivate() && $stmt->isFinal() && $method_name_lc !== '__construct') {
+                $this->file_storage->scan_issues[] = new PrivateFinalMethod(
+                    'Private methods cannot be final',
+                    new CodeLocation($this->file_scanner, $stmt, null, true),
+                    (string) $method_id,
+                );
+                if ($this->codebase->analysis_php_version_id >= 8_00_00) {
+                    // ignore `final` on the method as that's what PHP does
+                    $storage->final = $classlike_storage->final;
+                } else {
+                    $storage->final = true;
+                }
+            } else {
+                $storage->final = $classlike_storage->final || $stmt->isFinal();
+            }
+
+            $storage->final_from_docblock = $classlike_storage->final_from_docblock;
+
+            if ($stmt->isPrivate()) {
+                $storage->visibility = ClassLikeAnalyzer::VISIBILITY_PRIVATE;
+            } elseif ($stmt->isProtected()) {
+                $storage->visibility = ClassLikeAnalyzer::VISIBILITY_PROTECTED;
+            } else {
+                $storage->visibility = ClassLikeAnalyzer::VISIBILITY_PUBLIC;
+            }
+        } elseif ($stmt instanceof PhpParser\Node\Expr\Closure
+            || $stmt instanceof PhpParser\Node\Expr\ArrowFunction
+        ) {
+            $function_id = $cased_function_id = strtolower($this->file_path)
+                . ':' . $stmt->getLine()
+                . ':' . (int)$stmt->getAttribute('startFilePos') . ':-:closure';
+
+            $storage = $this->storage = $this->file_storage->functions[$function_id] = new FunctionStorage();
+
+            $storage->is_static = $stmt->static;
+
+            if ($stmt instanceof PhpParser\Node\Expr\Closure) {
+                foreach ($stmt->uses as $closure_use) {
+                    if ($closure_use->byRef && is_string($closure_use->var->name)) {
+                        $storage->byref_uses[$closure_use->var->name] = true;
+                    }
+                }
+            }
+        } elseif ($stmt instanceof PhpParser\Node\PropertyHook) {
+            $function_id = $cased_function_id = strtolower($this->file_path)
+                . ':' . $stmt->getLine()
+                . ':' . (int)$stmt->getAttribute('startFilePos') . ':-:hook';
+
+            $storage = $this->storage = $this->file_storage->functions[$function_id] = new FunctionStorage();
+        } else {
+            throw new UnexpectedValueException("Unrecognized functionlike of type ".($stmt::class));
+        }
+
+        return [
+            $cased_function_id,
+            $storage,
+            $function_id,
+            $fq_classlike_name,
+            $method_name_lc,
+            $classlike_storage,
+            $is_functionlike_override,
+            $method_id,
+            false,
+        ];
+    }
+
+    /**
+     * Sets the parameters of $storage from those of $stmt
+     *
+     * @return array<string, int> the offsets of the parameters by variable id
+     */
+    private function addParams(
+        PhpParser\Node\FunctionLike $stmt,
+        FunctionLikeStorage $storage,
+        string $cased_function_id,
+        bool $fake_method,
+        ?string $fq_classlike_name,
+        bool $is_functionlike_override,
+    ): array {
+        $required_param_count = 0;
+        $i = 0;
+        $has_optional_param = false;
+
+        $existing_params = [];
+
+        // A stub redeclaring a method an earlier stub declared reuses its storage, and its parameters are built
+        // again from this declaration. The taint annotations of the earlier declaration still hold for the
+        // parameters this one redeclares, as its function-level ones do (the docblock scanner merges those).
+        $overridden_params = [];
+        if ($is_functionlike_override) {
+            foreach ($storage->params as $overridden_param) {
+                $overridden_params[$overridden_param->name] = $overridden_param;
+            }
+        }
+
+        $storage->setParams([]);
+
+        foreach ($stmt->getParams() as $param) {
+            if ($param->var instanceof PhpParser\Node\Expr\Error) {
+                $storage->docblock_issues[] = new InvalidDocblock(
+                    'Param' . ($i + 1) . ' of ' . $cased_function_id . ' has invalid syntax',
+                    new CodeLocation($this->file_scanner, $param, null, true),
+                );
+
+                ++$i;
+
+                continue;
+            }
+
+            $param_storage = $this->getTranslatedFunctionParam($param, $stmt, $fake_method, $fq_classlike_name);
+
+            if (isset($overridden_params[$param_storage->name])) {
+                $overridden_param = $overridden_params[$param_storage->name];
+                $param_storage->sinks = $overridden_param->sinks;
+                $param_storage->value_sinks = $overridden_param->value_sinks;
+                $param_storage->assert_untainted = $overridden_param->assert_untainted;
+            }
+
+            foreach ($param->attrGroups as $attr_group) {
+                foreach ($attr_group->attrs as $attr) {
+                    $param_storage->attributes[] = AttributeResolver::resolve(
+                        $this->codebase,
+                        $this->file_scanner,
+                        $this->file_storage,
+                        $this->aliases,
+                        $attr,
+                        $this->classlike_storage->name ?? null,
+                    );
+                }
+            }
+
+            if ($param_storage->name === 'haystack'
+                && in_array($this->file_path, $this->codebase->config->internal_stubs)
+            ) {
+                $param_storage->expect_variable = true;
+            }
+
+            if (isset($existing_params['$' . $param_storage->name])) {
+                $storage->docblock_issues[] = new DuplicateParam(
+                    'Duplicate param $' . $param_storage->name . ' in docblock for ' . $cased_function_id,
+                    new CodeLocation($this->file_scanner, $param, null, true),
+                );
+
+                ++$i;
+
+                continue;
+            }
+
+            $existing_params['$' . $param_storage->name] = $i;
+            $storage->addParam($param_storage, (bool)$param->type);
+
+            if (!$param_storage->is_optional && !$param_storage->is_variadic) {
+                $required_param_count = $i + 1;
+
+                if (!$param->variadic
+                    && $has_optional_param
+                ) {
+                    foreach ($storage->params as $param) {
+                        $param->is_optional = false;
+                    }
+                }
+            } else {
+                $has_optional_param = true;
+            }
+
+            ++$i;
+        }
+
+        $storage->required_param_count = $required_param_count;
+
+        return $existing_params;
+    }
+
+    /**
+     * Marks the function-like scanned by start() as a builtin if it is declared by one of Psalm's stubs. A stub of a
+     * builtin replaces its call map entry, but not the taint sinks of its parameters (see
+     * dictionaries/InternalTaintSinkMap.php): adds them to it.
+     *
+     * @psalm-capabilities read-props|write-this-props|write-props|write-refs|read-globals
+     */
+    public function addInternalTaintSinks(): void
+    {
+        if ($this->storage === null
+            || $this->storage->cased_name === null
+            || !in_array($this->file_path, $this->codebase->config->internal_stubs, true)
+        ) {
+            return;
+        }
+
+        $this->storage->builtin = true;
+
+        $function_id = $this->classlike_storage !== null
+            ? $this->classlike_storage->name . '::' . $this->storage->cased_name
+            : $this->storage->cased_name;
+
+        foreach ($this->storage->params as $offset => $param) {
+            $param->sinks |= InternalCallMapHandler::getParamTaintSinks($function_id, $offset);
+        }
+    }
+}

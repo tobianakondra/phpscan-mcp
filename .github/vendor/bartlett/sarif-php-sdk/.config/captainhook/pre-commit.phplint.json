@@ -1,0 +1,28 @@
+{
+    "pre-commit": {
+        "enabled": true,
+        "actions": [
+            {
+                "action": [
+                    "{$ENV|value-of:XDG_BIN_HOME}phplint",
+                    "lint",
+                    "--configuration={$ENV|value-of:\\Bartlett\\CaptainHookBinPlugin\\BinPlugin.config-file|cache:false}",
+                    "--progress quiet",
+                    "{$ENV|value-of:\\Bartlett\\CaptainHookBinPlugin\\BinPlugin.colors-flag|cache:false}",
+                    "{$STAGED_FILES|of-type:php|separated-by: }"
+                ],
+                "config": {
+                    "label": "Lint Files (with PHPLint)"
+                },
+                "options": {
+                    "colors": "ansi",
+                    "config-file": "{$ENV|value-of:XDG_CONFIG_HOME}/.phplint.yml",
+                    "package-require": [
+                        "overtrue/phplint",
+                        "^9.8"
+                    ]
+                }
+            }
+        ]
+    }
+}

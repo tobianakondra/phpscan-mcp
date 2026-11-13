@@ -1,0 +1,2188 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Internal\Analyzer\Statements\Expression\Call;
+
+use PhpParser;
+use Psalm\CodeLocation;
+use Psalm\Codebase;
+use Psalm\Config;
+use Psalm\Context;
+use Psalm\Internal\Analyzer\ClassAnalyzer;
+use Psalm\Internal\Analyzer\ClassLikeAnalyzer;
+use Psalm\Internal\Analyzer\ClassLikeNameOptions;
+use Psalm\Internal\Analyzer\FunctionLikeAnalyzer;
+use Psalm\Internal\Analyzer\InheritedMethodTaints;
+use Psalm\Internal\Analyzer\NamespaceAnalyzer;
+use Psalm\Internal\Analyzer\Statements\Expression\Call\Method\MethodCallReturnTypeFetcher;
+use Psalm\Internal\Analyzer\Statements\Expression\Call\Method\MethodVisibilityAnalyzer;
+use Psalm\Internal\Analyzer\Statements\Expression\CallAnalyzer;
+use Psalm\Internal\Analyzer\Statements\Expression\GlobalStateAnalyzer;
+use Psalm\Internal\Analyzer\Statements\Expression\SimpleTypeInferer;
+use Psalm\Internal\Analyzer\Statements\ExpressionAnalyzer;
+use Psalm\Internal\Analyzer\StatementsAnalyzer;
+use Psalm\Internal\Codebase\ConditionalTaintSinks;
+use Psalm\Internal\Codebase\ReceiverPropertyTaints;
+use Psalm\Internal\DataFlow\DataFlowNode;
+use Psalm\Internal\MethodIdentifier;
+use Psalm\Internal\Type\Comparator\UnionTypeComparator;
+use Psalm\Internal\Type\TemplateBound;
+use Psalm\Internal\Type\TemplateDefaults;
+use Psalm\Internal\Type\TemplateInferredTypeReplacer;
+use Psalm\Internal\Type\TemplateResult;
+use Psalm\Internal\Type\TemplateStandinTypeReplacer;
+use Psalm\Internal\Type\TypeExpander;
+use Psalm\Internal\Type\TypeVariableBounds;
+use Psalm\Issue\AbstractInstantiation;
+use Psalm\Issue\DeprecatedClass;
+use Psalm\Issue\ImpureMethodCall;
+use Psalm\Issue\InterfaceInstantiation;
+use Psalm\Issue\InternalClass;
+use Psalm\Issue\InternalMethod;
+use Psalm\Issue\InvalidStringClass;
+use Psalm\Issue\MixedMethodCall;
+use Psalm\Issue\ParseError;
+use Psalm\Issue\TooManyArguments;
+use Psalm\Issue\UndefinedClass;
+use Psalm\Issue\UnsafeGenericInstantiation;
+use Psalm\Issue\UnsafeInstantiation;
+use Psalm\Issue\UnusedMethodCall;
+use Psalm\IssueBuffer;
+use Psalm\Plugin\EventHandler\Event\AddRemoveTaintsEvent;
+use Psalm\Storage\Capabilities;
+use Psalm\Storage\ClassLikeStorage;
+use Psalm\Storage\MethodStorage;
+use Psalm\Storage\Possibilities;
+use Psalm\Type;
+use Psalm\Type\Atomic;
+use Psalm\Type\Atomic\TAnonymousClassInstance;
+use Psalm\Type\Atomic\TClassString;
+use Psalm\Type\Atomic\TConditional;
+use Psalm\Type\Atomic\TDependentGetClass;
+use Psalm\Type\Atomic\TFalse;
+use Psalm\Type\Atomic\TGenericObject;
+use Psalm\Type\Atomic\TLiteralClassString;
+use Psalm\Type\Atomic\TMixed;
+use Psalm\Type\Atomic\TNamedObject;
+use Psalm\Type\Atomic\TNull;
+use Psalm\Type\Atomic\TNumericString;
+use Psalm\Type\Atomic\TObject;
+use Psalm\Type\Atomic\TString;
+use Psalm\Type\Atomic\TTemplateParam;
+use Psalm\Type\Atomic\TTemplateParamClass;
+use Psalm\Type\Atomic\TTypeVariable;
+use Psalm\Type\Atomic\TUnknownClassString;
+use Psalm\Type\TaintKind;
+use Psalm\Type\Union;
+
+use function array_key_first;
+use function array_map;
+use function array_values;
+use function count;
+use function in_array;
+use function is_int;
+use function is_string;
+use function ltrim;
+use function preg_match;
+use function reset;
+use function strtolower;
+
+/**
+ * @internal
+ * @psalm-import-type CapabilitySet from Capabilities
+ */
+final class NewAnalyzer extends CallAnalyzer
+{
+    /**
+     * Whether the class gives the template to a class it extends (`@extends Parent<T>`) whose template the
+     * constructor arguments bound: that is then the template's. A template it doesn't give, like one beside
+     * the purity template of a parent, or one given to a parent template the arguments didn't bind, like a purity
+     * template given to that of a parent (`@extends Parent[P]`), is resolved like that of a class extending nothing.
+     *
+     * @param array<string, array<string, Union>>|null $template_extended_params
+     * @param array<string, array<string, non-empty-list<TemplateBound>>> $lower_bounds
+     * @psalm-assert-if-true !null $template_extended_params
+     * @psalm-pure
+     */
+    private static function isGivenToBoundParentTemplate(
+        string $fq_class_name,
+        string $template_name,
+        ?array $template_extended_params,
+        array $lower_bounds,
+    ): bool {
+        foreach ($template_extended_params ?? [] as $extended_class_name => $type_map) {
+            foreach ($type_map as $extended_template_name => $extended_type) {
+                foreach ($extended_type->getAtomicTypes() as $atomic_type) {
+                    if ($atomic_type instanceof TTemplateParam
+                        && $atomic_type->param_name === $template_name
+                        && $atomic_type->defining_class === $fq_class_name
+                        && (isset($lower_bounds[$extended_template_name][$extended_class_name])
+                            || self::isGivenToBoundParentTemplate(
+                                $extended_class_name,
+                                $extended_template_name,
+                                $template_extended_params,
+                                $lower_bounds,
+                            )
+                        )
+                    ) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * The node attribute holding the capabilities a `new` or static call required from its caller,
+     * used to decide whether the callee may have changed refined properties or statics.
+     */
+    public const CALLEE_CAPABILITIES_ATTRIBUTE = 'callee_capabilities';
+
+    public static function analyze(
+        StatementsAnalyzer $statements_analyzer,
+        PhpParser\Node\Expr\New_ $stmt,
+        Context $context,
+        ?TemplateResult $template_result = null,
+    ): bool {
+        $fq_class_name = null;
+
+        $codebase = $statements_analyzer->getCodebase();
+        $config = $codebase->config;
+
+        $can_extend = false;
+
+        $from_static = false;
+
+        if ($stmt->isFirstClassCallable()) {
+            IssueBuffer::maybeAdd(new ParseError(
+                'First-class callables cannot be used in new',
+                new CodeLocation($statements_analyzer->getSource(), $stmt),
+            ));
+            return false;
+        }
+
+        if ($stmt->class instanceof PhpParser\Node\Name) {
+            if (!in_array(strtolower($stmt->class->getFirst()), ['self', 'static', 'parent'], true)) {
+                $aliases = $statements_analyzer->getAliases();
+
+                $fq_class_name = ClassLikeAnalyzer::getFQCLNFromNameObject(
+                    $stmt->class,
+                    $aliases,
+                );
+
+                $fq_class_name = $codebase->classlikes->getUnAliasedName($fq_class_name);
+
+                if ($context->calling_method_id
+                    && !$stmt->class instanceof PhpParser\Node\Name\FullyQualified
+                ) {
+                    $codebase->addReferenceToUseAlias(
+                        $stmt->class->getFirst(),
+                        $statements_analyzer->getFilePath(),
+                        $context,
+                    );
+                }
+            } elseif ($context->self !== null) {
+                switch ($stmt->class->getFirst()) {
+                    case 'self':
+                        $class_storage = $codebase->classlike_storage_provider->get($context->self);
+                        $fq_class_name = $class_storage->name;
+                        break;
+
+                    case 'parent':
+                        $fq_class_name = $context->parent;
+                        break;
+
+                    case 'static':
+                        // @todo maybe we can do better here
+                        $class_storage = $codebase->classlike_storage_provider->get($context->self);
+                        $fq_class_name = $class_storage->name;
+
+                        if (!$class_storage->final) {
+                            $can_extend = true;
+                            $from_static = true;
+                        }
+
+                        break;
+                }
+            }
+
+            if ($codebase->store_node_types
+                && $fq_class_name
+                && !$context->collect_initializations
+                && !$context->collect_mutations
+            ) {
+                $codebase->analyzer->addNodeReference(
+                    $statements_analyzer->getFilePath(),
+                    $stmt->class,
+                    $codebase->classlikes->classExists($fq_class_name, null, $context)
+                        ? $fq_class_name
+                        : '*'
+                            . ($stmt->class instanceof PhpParser\Node\Name\FullyQualified
+                                ? '\\'
+                                : $statements_analyzer->getNamespace() . '-')
+                            . $stmt->class->toString(),
+                );
+            }
+        } elseif ($stmt->class instanceof PhpParser\Node\Stmt\Class_) {
+            $statements_analyzer->analyze([$stmt->class], $context);
+            $fq_class_name = ClassAnalyzer::getAnonymousClassName(
+                $stmt->class,
+                $statements_analyzer->getAliases(),
+                $statements_analyzer->getFilePath(),
+            );
+        } else {
+            self::analyzeConstructorExpression(
+                $statements_analyzer,
+                $codebase,
+                $context,
+                $stmt,
+                $stmt->class,
+                $config,
+                $fq_class_name,
+                $can_extend,
+            );
+        }
+
+        if ($fq_class_name) {
+            if ($codebase->alter_code
+                && $stmt->class instanceof PhpParser\Node\Name
+                && !in_array($stmt->class->getFirst(), ['parent', 'static'])
+            ) {
+                $codebase->classlikes->handleClassLikeReferenceInMigration(
+                    $codebase,
+                    $statements_analyzer,
+                    $stmt->class,
+                    $fq_class_name,
+                    $context,
+                );
+            }
+
+            if ($context->check_classes) {
+                if ($context->isPhantomClass($fq_class_name)) {
+                    ArgumentsAnalyzer::analyze(
+                        $statements_analyzer,
+                        $stmt->getArgs(),
+                        null,
+                        null,
+                        true,
+                        $context,
+                    );
+
+                    return true;
+                }
+
+                if (ClassLikeAnalyzer::checkFullyQualifiedClassLikeName(
+                    $statements_analyzer,
+                    $fq_class_name,
+                    new CodeLocation($statements_analyzer->getSource(), $stmt->class),
+                    $context,
+                    $statements_analyzer->getSuppressedIssues(),
+                    new ClassLikeNameOptions(context: $context),
+                ) === false) {
+                    ArgumentsAnalyzer::analyze(
+                        $statements_analyzer,
+                        $stmt->getArgs(),
+                        null,
+                        null,
+                        true,
+                        $context,
+                    );
+
+                    return true;
+                }
+
+                if ($codebase->interfaceExists($fq_class_name, null, $context)) {
+                    IssueBuffer::maybeAdd(
+                        new InterfaceInstantiation(
+                            'Interface ' . $fq_class_name . ' cannot be instantiated',
+                            new CodeLocation($statements_analyzer->getSource(), $stmt->class),
+                        ),
+                        $statements_analyzer->getSuppressedIssues(),
+                    );
+                    return true;
+                }
+            }
+
+            if ($stmt->class instanceof PhpParser\Node\Stmt\Class_) {
+                $extends = $stmt->class->extends ? (string) $stmt->class->extends : null;
+                $result_atomic_type = new TAnonymousClassInstance($fq_class_name, false, $extends);
+            } else {
+                //if the class is a Name, it can't represent a child
+                $definite_class = $stmt->class instanceof PhpParser\Node\Name;
+                $result_atomic_type = new TNamedObject($fq_class_name, $from_static, $definite_class);
+            }
+
+            $statements_analyzer->node_data->setType(
+                $stmt,
+                new Union([$result_atomic_type]),
+            );
+
+            if (strtolower($fq_class_name) === 'stdclass' && $stmt->getArgs() !== []) {
+                IssueBuffer::maybeAdd(
+                    new TooManyArguments(
+                        'stdClass::__construct() has no parameters',
+                        new CodeLocation($statements_analyzer->getSource(), $stmt),
+                        'stdClass::__construct',
+                    ),
+                    $statements_analyzer->getSuppressedIssues(),
+                );
+            }
+
+            if (strtolower($fq_class_name) !== 'stdclass' &&
+                $codebase->classlikes->classExists($fq_class_name, null, $context)
+            ) {
+                self::analyzeNamedConstructor(
+                    $statements_analyzer,
+                    $codebase,
+                    $stmt,
+                    $context,
+                    $fq_class_name,
+                    $from_static,
+                    $can_extend,
+                    $template_result,
+                );
+
+                self::checkUnusedThrowable($statements_analyzer, $codebase, $stmt, $context, $fq_class_name);
+            } else {
+                ArgumentsAnalyzer::analyze(
+                    $statements_analyzer,
+                    $stmt->getArgs(),
+                    null,
+                    null,
+                    true,
+                    $context,
+                );
+
+                if ($codebase->classlikes->enumExists($fq_class_name, null, $context)) {
+                    IssueBuffer::maybeAdd(new UndefinedClass(
+                        'Enums cannot be instantiated',
+                        new CodeLocation($statements_analyzer, $stmt),
+                        $fq_class_name,
+                    ));
+                }
+            }
+        }
+
+        if (!$config->remember_property_assignments_after_call && !$context->collect_initializations) {
+            // a constructor that cannot write properties or globals leaves every refinement in place
+            $context->removeMutableObjectVars(
+                false,
+                self::getCalleeCapabilities($stmt) ?? Capabilities::ALL,
+            );
+        }
+
+        return true;
+    }
+
+    /**
+     * An exception that is created but never thrown, returned or otherwise used is a mistake
+     * (a missing `throw`), whatever its constructor does: it is reported like the unused return
+     * value of a pure call.
+     */
+    private static function checkUnusedThrowable(
+        StatementsAnalyzer $statements_analyzer,
+        Codebase $codebase,
+        PhpParser\Node\Expr\New_ $stmt,
+        Context $context,
+        string $fq_class_name,
+    ): void {
+        if (!$codebase->find_unused_variables
+            || $context->collect_initializations
+            || $context->collect_mutations
+            || $context->insideUse()
+            || $context->inside_unset
+            || !$codebase->classImplements($fq_class_name, 'Throwable')
+        ) {
+            return;
+        }
+
+        $method_id = new MethodIdentifier($fq_class_name, '__construct');
+
+        $class_description = $stmt->class instanceof PhpParser\Node\Stmt\Class_
+            ? 'anonymous ' . ($stmt->class->extends ? $stmt->class->extends->toString() : 'class')
+            : $fq_class_name;
+
+        IssueBuffer::maybeAdd(
+            new UnusedMethodCall(
+                'The ' . $class_description . ' instance created here is never thrown or used',
+                new CodeLocation($statements_analyzer->getSource(), $stmt),
+                (string) $method_id,
+            ),
+            $statements_analyzer->getSuppressedIssues(),
+        );
+    }
+
+    /**
+     * The constructors the implemented interfaces declare: PHP checks the one of every child class against them
+     *
+     * @return list<MethodStorage>
+     * @psalm-capabilities read-props
+     */
+    private static function getInterfaceConstructors(Codebase $codebase, ClassLikeStorage $storage): array
+    {
+        $constructors = [];
+
+        foreach ($storage->class_implements as $interface_lc => $_) {
+            if ($codebase->classlike_storage_provider->has($interface_lc)) {
+                $interface_storage = $codebase->classlike_storage_provider->get($interface_lc);
+
+                if (isset($interface_storage->methods['__construct'])) {
+                    $constructors[] = $interface_storage->methods['__construct'];
+                }
+            }
+        }
+
+        return $constructors;
+    }
+
+    /**
+     * Whether the child classes accept the arguments: the constructor is a marked one, or the arguments fit the
+     * constructor of an implemented interface. A child may rename the parameters, so named arguments don't fit.
+     *
+     * @param list<PhpParser\Node\Arg> $args
+     */
+    private static function childConstructorsAcceptArgs(
+        StatementsAnalyzer $statements_analyzer,
+        Codebase $codebase,
+        Context $context,
+        ClassLikeStorage $storage,
+        array $args,
+    ): bool {
+        if ($storage->preserve_constructor_signature) {
+            return true;
+        }
+
+        foreach (self::getInterfaceConstructors($codebase, $storage) as $constructor) {
+            $params = $constructor->params;
+            $last_param = $params === [] ? null : $params[count($params) - 1];
+
+            // a child constructor may require every parameter of the interface one
+            if (count($args) < ($constructor->required_param_count ?? count($params))) {
+                continue;
+            }
+
+            foreach ($args as $offset => $arg) {
+                $param = $params[$offset] ?? ($last_param?->is_variadic ? $last_param : null);
+                // the arguments of `new $class_name()` are not all analysed yet: read their type without analysing
+                $arg_type = $statements_analyzer->node_data->getType($arg->value)
+                    ?? ($arg->value instanceof PhpParser\Node\Expr\Variable && is_string($arg->value->name)
+                        ? $context->vars_in_scope['$' . $arg->value->name] ?? null
+                        : SimpleTypeInferer::infer(
+                            $codebase,
+                            $statements_analyzer->node_data,
+                            $arg->value,
+                            $statements_analyzer->getAliases(),
+                        ));
+
+                if ($arg->name
+                    || $arg->unpack
+                    || !$param
+                    || !$arg_type
+                    || ($param->type && !UnionTypeComparator::isContainedBy($codebase, $arg_type, $param->type))
+                ) {
+                    continue 2;
+                }
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    private static function checkNewStatic(
+        StatementsAnalyzer $statements_analyzer,
+        Codebase $codebase,
+        Context $context,
+        PhpParser\Node\Expr\New_ $stmt,
+        ClassLikeStorage $storage,
+        string $fq_class_name,
+        bool $args_analyzed,
+    ): void {
+        // whether the arguments fit an interface's constructor is only known once they are analysed
+        if ($args_analyzed !== (!$storage->preserve_constructor_signature
+            && self::getInterfaceConstructors($codebase, $storage) !== [])
+        ) {
+            return;
+        }
+
+        if (!self::childConstructorsAcceptArgs(
+            $statements_analyzer,
+            $codebase,
+            $context,
+            $storage,
+            $stmt->getArgs(),
+        )) {
+            IssueBuffer::maybeAdd(
+                new UnsafeInstantiation(
+                    'Cannot safely instantiate class ' . $fq_class_name . ' with "new static" as'
+                    . ' its constructor might change in child classes',
+                    new CodeLocation($statements_analyzer->getSource(), $stmt),
+                ),
+                $statements_analyzer->getSuppressedIssues(),
+            );
+        } elseif (self::hasTemplatesInferredByConstructor($codebase, $storage)
+            && !$storage->enforce_template_inheritance
+        ) {
+            $source = $statements_analyzer->getSource();
+
+            if ($source instanceof FunctionLikeAnalyzer) {
+                $function_storage = $source->getFunctionLikeStorage($statements_analyzer);
+
+                if ($function_storage->return_type
+                    && preg_match('/\bstatic\b/', $function_storage->return_type->getId())
+                ) {
+                    IssueBuffer::maybeAdd(
+                        new UnsafeGenericInstantiation(
+                            'Cannot safely instantiate generic class ' . $fq_class_name
+                                . ' with "new static" as'
+                                . ' its generic parameters may be constrained in child classes.',
+                            new CodeLocation($statements_analyzer->getSource(), $stmt),
+                        ),
+                        $statements_analyzer->getSuppressedIssues(),
+                    );
+                }
+            }
+        }
+    }
+
+    private static function analyzeNamedConstructor(
+        StatementsAnalyzer $statements_analyzer,
+        Codebase $codebase,
+        PhpParser\Node\Expr\New_ $stmt,
+        Context $context,
+        string $fq_class_name,
+        bool $from_static,
+        bool $can_extend,
+        ?TemplateResult $template_result = null,
+    ): void {
+        $storage = $codebase->classlike_storage_provider->get($fq_class_name);
+
+        if ($from_static) {
+            self::checkNewStatic($statements_analyzer, $codebase, $context, $stmt, $storage, $fq_class_name, false);
+        }
+
+        // if we're not calling this constructor via new static()
+        if ($storage->abstract && !$can_extend) {
+            if (IssueBuffer::accepts(
+                new AbstractInstantiation(
+                    'Unable to instantiate an abstract class ' . $fq_class_name,
+                    new CodeLocation($statements_analyzer->getSource(), $stmt),
+                ),
+                $statements_analyzer->getSuppressedIssues(),
+            )) {
+                return;
+            }
+        }
+
+        if ($storage->deprecated && strtolower($fq_class_name) !== strtolower((string)$context->self)) {
+            IssueBuffer::maybeAdd(
+                new DeprecatedClass(
+                    $fq_class_name . ' is marked deprecated',
+                    new CodeLocation($statements_analyzer->getSource(), $stmt),
+                    $fq_class_name,
+                ),
+                $statements_analyzer->getSuppressedIssues(),
+            );
+        }
+
+
+        $caller_identifier = $statements_analyzer->getFullyQualifiedFunctionMethodOrNamespaceName() ?? '';
+
+        if (!$context->collect_initializations
+            && !$context->collect_mutations
+            && !NamespaceAnalyzer::isWithinAny($caller_identifier, $storage->internal)
+        ) {
+            IssueBuffer::maybeAdd(
+                new InternalClass(
+                    $fq_class_name . ' is internal to ' . InternalClass::listToPhrase($storage->internal)
+                        . ' but called from ' . ($caller_identifier ?: 'root namespace'),
+                    new CodeLocation($statements_analyzer->getSource(), $stmt),
+                    $fq_class_name,
+                ),
+                $statements_analyzer->getSuppressedIssues(),
+            );
+        }
+
+        $method_id = new MethodIdentifier($fq_class_name, '__construct');
+
+        // whether the constructor, if any, can't keep a reference to the new object (see analyzeConstructorPurity())
+        $keeps_no_reference = true;
+
+        if ($codebase->methodExists(
+            $method_id,
+            $context->calling_method_id,
+            $codebase->collect_locations ? new CodeLocation($statements_analyzer->getSource(), $stmt) : null,
+            $statements_analyzer,
+            $statements_analyzer->getFilePath(),
+        )) {
+            if ($codebase->store_node_types
+                && !$context->collect_initializations
+                && !$context->collect_mutations
+            ) {
+                ArgumentMapPopulator::recordArgumentPositions(
+                    $statements_analyzer,
+                    $stmt,
+                    $codebase,
+                    (string)$method_id,
+                );
+            }
+
+            $template_result ??= new TemplateResult([], []);
+
+            if (!self::isInTrait($statements_analyzer)) {
+                $template_result->static_class_type = $fq_class_name;
+                $template_result->static_class_is_final = $storage->final;
+            }
+
+            $args_analyzed = self::checkMethodArgs(
+                $method_id,
+                $stmt->getArgs(),
+                $template_result,
+                $context,
+                new CodeLocation($statements_analyzer->getSource(), $stmt),
+                $statements_analyzer,
+            ) !== false;
+
+            if ($from_static) {
+                self::checkNewStatic($statements_analyzer, $codebase, $context, $stmt, $storage, $fq_class_name, true);
+            }
+
+            if (!$args_analyzed) {
+                return;
+            }
+
+            if (MethodVisibilityAnalyzer::analyze(
+                $method_id,
+                $context,
+                $statements_analyzer->getSource(),
+                new CodeLocation($statements_analyzer->getSource(), $stmt),
+                $statements_analyzer->getSuppressedIssues(),
+            ) === false) {
+                return;
+            }
+
+            $declaring_method_id = $codebase->methods->getDeclaringMethodId($method_id);
+
+            $method_storage = null;
+            $keeps_no_reference = false;
+
+            if ($declaring_method_id) {
+                $method_storage = $codebase->methods->getStorage($declaring_method_id);
+
+                if (!NamespaceAnalyzer::isWithinAny($caller_identifier, $method_storage->internal)) {
+                    IssueBuffer::maybeAdd(
+                        new InternalMethod(
+                            'Constructor ' . $codebase->methods->getCasedMethodId($declaring_method_id)
+                                . ' is internal to ' . InternalClass::listToPhrase($method_storage->internal)
+                                . ' but called from ' . ($caller_identifier ?: 'root namespace'),
+                            new CodeLocation($statements_analyzer, $stmt),
+                            (string) $method_id,
+                        ),
+                        $statements_analyzer->getSuppressedIssues(),
+                    );
+                }
+
+                $keeps_no_reference = self::analyzeConstructorPurity(
+                    $statements_analyzer,
+                    $codebase,
+                    $context,
+                    $stmt,
+                    $declaring_method_id,
+                    $method_storage,
+                    $template_result,
+                    $fq_class_name,
+                    $can_extend,
+                );
+
+                if ($method_storage->assertions && $stmt->class instanceof PhpParser\Node\Name) {
+                    self::applyAssertionsToContext(
+                        $stmt->class,
+                        null,
+                        self::getAssertionsOnArgs($method_storage->assertions, $method_storage, $stmt->getArgs()),
+                        $stmt->getArgs(),
+                        $template_result,
+                        $context,
+                        $statements_analyzer,
+                    );
+                }
+
+                if ($method_storage->if_true_assertions) {
+                    $statements_analyzer->node_data->setIfTrueAssertions(
+                        $stmt,
+                        array_map(
+                            static fn(Possibilities $assertion): Possibilities
+                                => $assertion->getUntemplatedCopy($template_result, null, $codebase),
+                            self::getAssertionsOnArgs(
+                                $method_storage->if_true_assertions,
+                                $method_storage,
+                                $stmt->getArgs(),
+                            ),
+                        ),
+                    );
+                }
+
+                if ($method_storage->if_false_assertions) {
+                    $statements_analyzer->node_data->setIfFalseAssertions(
+                        $stmt,
+                        array_map(
+                            static fn(Possibilities $assertion): Possibilities
+                                => $assertion->getUntemplatedCopy($template_result, null, $codebase),
+                            self::getAssertionsOnArgs(
+                                $method_storage->if_false_assertions,
+                                $method_storage,
+                                $stmt->getArgs(),
+                            ),
+                        ),
+                    );
+                }
+            }
+
+            $generic_param_types = null;
+            $self_out_candidate = null;
+
+            if ($storage->template_types) {
+                $generic_param_types = self::getGenericParamTypes(
+                    $statements_analyzer,
+                    $stmt,
+                    $storage,
+                    $template_result,
+                    $fq_class_name,
+                    $method_storage,
+                );
+
+                $self_out_candidate = self::getSelfOutType(
+                    $statements_analyzer,
+                    $stmt,
+                    $storage,
+                    $fq_class_name,
+                    $from_static,
+                    $method_storage,
+                    $declaring_method_id,
+                    $method_id,
+                    $template_result,
+                    $generic_param_types,
+                );
+            }
+
+            // XXX: what if we need both?
+            if ($generic_param_types !== null && $generic_param_types !== [] && !$self_out_candidate) {
+                $result_atomic_type = new TGenericObject(
+                    $fq_class_name,
+                    $generic_param_types,
+                    false,
+                    $from_static,
+                );
+
+                $statements_analyzer->node_data->setType(
+                    $stmt,
+                    new Union([$result_atomic_type]),
+                );
+            }
+        } elseif ($stmt->getArgs()) {
+            IssueBuffer::maybeAdd(
+                new TooManyArguments(
+                    'Class ' . $fq_class_name . ' has no __construct, but arguments were passed',
+                    new CodeLocation($statements_analyzer->getSource(), $stmt),
+                    $fq_class_name . '::__construct',
+                ),
+                $statements_analyzer->getSuppressedIssues(),
+            );
+        } elseif (($type_params = array_values(TemplateDefaults::bindOmitted($storage, [], true, false))) !== []) {
+            $result_atomic_type = new TGenericObject($fq_class_name, $type_params, false, $from_static);
+
+            $statements_analyzer->node_data->setType(
+                $stmt,
+                new Union([$result_atomic_type]),
+            );
+        }
+
+        $is_external_mutation_free = $storage->isExternalMutationFree();
+
+        if ($is_external_mutation_free) {
+            $stmt->setAttribute('external_mutation_free', true);
+        }
+
+        // Nothing else holds the new object when its class contract says so, or when the constructor run can't
+        // keep a reference to it. That of a child class may run instead when the class may be extended
+        // (`new static`, `new $class_string`).
+        if ($is_external_mutation_free || ($keeps_no_reference && !$can_extend)) {
+            $stmt_type = $statements_analyzer->node_data->getType($stmt);
+
+            if ($stmt_type) {
+                $stmt_type = $stmt_type->setProperties([
+                    'reference_free' => true,
+                ]);
+                $statements_analyzer->node_data->setType($stmt, $stmt_type);
+            }
+        }
+
+        self::taintNewObject($statements_analyzer, $stmt, $method_id, $fq_class_name, $storage);
+    }
+
+    /**
+     * The type variable a template of a constructed class is carried as: the
+     * bounds the constructor arguments inferred are its lower bounds, and the
+     * template's declared constraint its upper bound.
+     *
+     * @param non-empty-list<TemplateBound> $arg_bounds
+     * @param bool $bound_through_class_string whether an argument binds the template through a
+     *     `class-string<T>` position
+     */
+    private static function mintTypeVariable(
+        StatementsAnalyzer $statements_analyzer,
+        PhpParser\Node\Expr\New_ $stmt,
+        array $arg_bounds,
+        Union $constraint,
+        bool $bound_through_class_string,
+    ): Union {
+        $new_location = new CodeLocation($statements_analyzer->getSource(), $stmt);
+
+        $lower_bounds = [];
+
+        foreach ($arg_bounds as $arg_bound) {
+            // the appearance depth is normalized: the inference is
+            // lifted onto the variable itself, where it competes with
+            // the (depth-0) bounds later code records
+            $lower_bound = new TemplateBound(
+                $arg_bound->type,
+                0,
+                $arg_bound->arg_offset,
+                $arg_bound->equality_bound_classlike,
+                $new_location,
+            );
+            $lower_bound->from_constraint_fallback = $arg_bound->from_constraint_fallback;
+
+            $lower_bounds[] = $lower_bound;
+        }
+
+        $upper_bounds = [new TemplateBound($constraint, 0, null, null, $new_location)];
+
+        // A constructor argument that binds this template through a
+        // `class-string<T>` position names the type exactly
+        // (`new ReflectionClass(Foo::class)` reflects Foo, nothing
+        // wider): the inferred bounds pin the variable's upper bounds
+        // too, so a later conflicting use fails reconciliation.
+        if ($bound_through_class_string) {
+            foreach ($lower_bounds as $lower_bound) {
+                $upper_bounds[] = new TemplateBound(
+                    $lower_bound->type,
+                    0,
+                    $lower_bound->arg_offset,
+                    null,
+                    $new_location,
+                );
+            }
+        }
+
+        $type_variable_bounds = new TypeVariableBounds($lower_bounds, $upper_bounds);
+
+        $type_variable_name = $statements_analyzer->type_variable_tracker->addVariable($type_variable_bounds);
+
+        return new Union([new TTypeVariable($type_variable_name, $type_variable_bounds)]);
+    }
+
+    /**
+     * The new object takes its taints from what its constructor returns and leaves in it, and from what its
+     * `@psalm-flow` annotations say its arguments flow into.
+     */
+    private static function taintNewObject(
+        StatementsAnalyzer $statements_analyzer,
+        PhpParser\Node\Expr\New_ $stmt,
+        MethodIdentifier $method_id,
+        string $fq_class_name,
+        ClassLikeStorage $storage,
+    ): void {
+        $stmt_type = $statements_analyzer->node_data->getType($stmt);
+
+        if (!$statements_analyzer->taint_flow_graph
+            || $statements_analyzer->getCodebase()->config->suppressesIssueType(
+                $statements_analyzer->getSuppressedIssues(),
+                'TaintedInput',
+            )
+            || !$stmt_type
+        ) {
+            return;
+        }
+
+        $codebase = $statements_analyzer->getCodebase();
+
+        $code_location = new CodeLocation($statements_analyzer->getSource(), $stmt);
+
+        $method_storage = null;
+
+        $declaring_method_id = $codebase->methods->getDeclaringMethodId($method_id);
+
+        if ($declaring_method_id) {
+            $method_storage = $codebase->methods->getStorage($declaring_method_id);
+        }
+
+        // an inherited constructor analyzed for the class of the object (see InheritedMethodTaints) returns into a node
+        // of its own
+        $body_suffix = $method_storage && $declaring_method_id && (string) $declaring_method_id !== (string) $method_id
+            ? InheritedMethodTaints::getBodySuffix($statements_analyzer, $fq_class_name, $declaring_method_id)
+            : null;
+
+        // the node the body of the constructor returns into, wherever it is declared (see
+        // FunctionLikeAnalyzer::getBodyMethodId())
+        $cased_constructor_id = $declaring_method_id
+            ? FunctionLikeAnalyzer::getCasedBodyMethodId($codebase, $method_id)
+            : $fq_class_name . '::__construct';
+
+        if (!$method_storage) {
+            $method_source = DataFlowNode::getForCallableReturn(
+                'builtin',
+                $fq_class_name . '::__construct',
+                $storage->isExternalMutationFree() ? $code_location : null,
+            );
+        } else {
+            $method_source = InheritedMethodTaints::withMethodSuffix(
+                $declaring_method_id ?? $method_id,
+                $body_suffix,
+                static fn(): DataFlowNode => DataFlowNode::getForMethodReturn(
+                    $cased_constructor_id,
+                    $method_storage,
+                    $storage->isExternalMutationFree() || $method_storage->specialize_call ? $code_location : null,
+                ),
+            );
+        }
+
+        $statements_analyzer->taint_flow_graph->addNode($method_source);
+
+        if ($method_storage && $method_storage->return_source_params !== []) {
+            self::taintUsingConstructorFlows($statements_analyzer, $stmt, $method_storage, $method_source);
+        }
+
+        if ($method_storage && !$stmt->isFirstClassCallable()) {
+            ConditionalTaintSinks::taintCall(
+                $statements_analyzer,
+                $statements_analyzer->taint_flow_graph,
+                $method_storage,
+                $stmt->getArgs(),
+                $cased_constructor_id,
+                $code_location,
+            );
+        }
+
+        $parent_nodes = [$method_source->id => $method_source];
+
+        // the object is what the constructor leaves in it (see FunctionLikeAnalyzer)
+        $constructor_location = $method_storage !== null && $method_storage->specialize_call
+            ? $method_storage->location
+            : null;
+        if ($constructor_location) {
+            $this_out_node = InheritedMethodTaints::withMethodSuffix(
+                $declaring_method_id ?? $method_id,
+                $body_suffix,
+                static fn(): DataFlowNode => DataFlowNode::getForAssignment(
+                    '$this out of ' . $cased_constructor_id,
+                    $constructor_location,
+                    $method_source->specialization_key,
+                ),
+            );
+
+            $statements_analyzer->taint_flow_graph->addNode($this_out_node);
+            $parent_nodes[$this_out_node->id] = $this_out_node;
+        }
+
+        $stmt_type = OutputStreamTaintAnalyzer::taintOpenedStream(
+            $statements_analyzer,
+            $fq_class_name . '::__construct',
+            $stmt->getArgs(),
+            $stmt_type->setParentNodes($parent_nodes),
+            $code_location,
+        );
+
+        // what the constructor's `@psalm-flow` annotations say it sets to the properties of the new object
+        if ($method_storage && !$stmt->isFirstClassCallable()) {
+            $stmt_type = ReceiverPropertyTaints::taintConstruction(
+                $statements_analyzer,
+                $statements_analyzer->taint_flow_graph,
+                $method_storage,
+                $stmt->getArgs(),
+                $fq_class_name,
+                $code_location,
+                $stmt_type,
+            );
+        }
+
+        $statements_analyzer->node_data->setType($stmt, $stmt_type);
+    }
+
+    /**
+     * What the constructor's `@psalm-flow` annotations say the arguments of this call flow into the new object. The
+     * arguments' own nodes are used: the constructor's argument nodes are only this call's when the call is
+     * specialized, and the new object's node may be this call's (an external-mutation-free class) even when it isn't.
+     */
+    private static function taintUsingConstructorFlows(
+        StatementsAnalyzer $statements_analyzer,
+        PhpParser\Node\Expr\New_ $stmt,
+        MethodStorage $method_storage,
+        DataFlowNode $method_source,
+    ): void {
+        $graph = $statements_analyzer->taint_flow_graph;
+
+        if (!$graph) {
+            return;
+        }
+
+        foreach ($stmt->getArgs() as $argument_offset => $arg) {
+            $param_offset = $argument_offset;
+
+            if ($arg->name !== null) {
+                $param_offset = null;
+
+                foreach ($method_storage->params as $offset => $param) {
+                    if ($param->name === $arg->name->name) {
+                        $param_offset = $offset;
+                    }
+                }
+            }
+
+            // the arguments a variadic parameter takes flow as it does
+            $last_offset = count($method_storage->params) - 1;
+            if ($param_offset !== null
+                && $param_offset > $last_offset
+                && $last_offset >= 0
+                && $method_storage->params[$last_offset]->is_variadic
+            ) {
+                $param_offset = $last_offset;
+            }
+
+            $path_type = $param_offset !== null ? $method_storage->return_source_params[$param_offset] ?? null : null;
+            $arg_type = $statements_analyzer->node_data->getType($arg->value);
+
+            if ($path_type === null || !$arg_type) {
+                continue;
+            }
+
+            foreach ($arg_type->parent_nodes as $parent_node) {
+                $graph->addPath(
+                    $parent_node,
+                    $method_source,
+                    $path_type,
+                    $method_storage->added_taints,
+                    $method_storage->removed_taints,
+                );
+            }
+        }
+    }
+
+    /**
+     * `new $class_name()` calls the constructor of the class the class-string stands for, which
+     * may be anything when the class is not known.
+     */
+    /**
+     * The capabilities recorded in the CALLEE_CAPABILITIES_ATTRIBUTE of a `new` or static call,
+     * null when none were.
+     *
+     * @return CapabilitySet|null
+     */
+    public static function getCalleeCapabilities(PhpParser\Node $stmt): ?int
+    {
+        $capabilities = $stmt->getAttribute(self::CALLEE_CAPABILITIES_ATTRIBUTE);
+
+        if (!is_int($capabilities) || $capabilities < Capabilities::NONE || $capabilities > Capabilities::ALL) {
+            return null;
+        }
+
+        return $capabilities;
+    }
+
+    /**
+     * What calling a constructor costs: its capabilities (with those of the closures its purity
+     * templates are bound to), less what it does to the new object, with its by-reference
+     * parameters costing what the arguments passed to them are.
+     *
+     * Returns whether the constructor can't keep a reference to the new object: it can only store `$this`
+     * by writing another object, global state or a by-reference parameter.
+     */
+    private static function analyzeConstructorPurity(
+        StatementsAnalyzer $statements_analyzer,
+        Codebase $codebase,
+        Context $context,
+        PhpParser\Node\Expr\New_ $stmt,
+        MethodIdentifier $declaring_method_id,
+        MethodStorage $method_storage,
+        ?TemplateResult $template_result,
+        string $fq_class_name,
+        bool $can_extend,
+    ): bool {
+        $cased_method_id = 'constructor ' . $codebase->methods->getCasedMethodId($declaring_method_id);
+
+        // the constructor only mutates the new object: what it does to it is fine
+        $template_capabilities = CallPurityResolver::getCallCapabilities(
+            $statements_analyzer,
+            $codebase,
+            $method_storage,
+            Capabilities::NONE,
+            $template_result,
+            self::getConstructorClassTemplateParams($codebase, $context, $method_storage, $fq_class_name),
+            args: $stmt->isFirstClassCallable() ? [] : $stmt->getArgs(),
+        );
+        // a trivial constructor (see FunctionLikeNodeScanner::applyTrivialConstructorCapabilities()) runs the hooks a
+        // class extending its own redeclares its properties with, which may do anything
+        $own_capabilities = self::runsPropertyHooks(
+            $codebase,
+            $method_storage,
+            $declaring_method_id,
+            $fq_class_name,
+            $can_extend,
+        )
+            ? Capabilities::ALL
+            : CallPurityResolver::getOwnCapabilities($codebase, $method_storage, $template_result);
+        $resolved_capabilities = $template_capabilities
+            | ($own_capabilities & ~(Capabilities::READ_PROPS | Capabilities::WRITE_THIS_PROPS));
+
+        $args = $stmt->getArgs();
+
+        $constructor_capabilities = ByRefArgumentAnalyzer::adjustCapabilities(
+            $statements_analyzer,
+            $context,
+            $resolved_capabilities,
+            $method_storage->params,
+            $args,
+        );
+
+        $stmt->setAttribute(self::CALLEE_CAPABILITIES_ATTRIBUTE, $constructor_capabilities);
+
+        $statements_analyzer->signalMutation(
+            $constructor_capabilities,
+            $context,
+            $cased_method_id,
+            ImpureMethodCall::class,
+            $stmt,
+            null,
+            false,
+            $method_storage,
+            true,
+        );
+
+        // the constructor's level does not include what its purity templates are bound to here
+        if ($template_capabilities !== Capabilities::NONE) {
+            $statements_analyzer->signalMutationOnlyInferred($template_capabilities);
+        }
+
+        // the constructor may have stored global state in the new object: what it reads, not
+        // what it writes through its by-reference arguments
+        if (($resolved_capabilities & Capabilities::READ_GLOBALS) !== 0) {
+            $stmt->setAttribute(GlobalStateAnalyzer::ATTRIBUTE, true);
+        }
+
+        GlobalStateAnalyzer::checkArguments(
+            $statements_analyzer,
+            $context,
+            $args,
+            $constructor_capabilities,
+            ImpureMethodCall::class,
+            $cased_method_id,
+        );
+
+        return ($resolved_capabilities
+            & (Capabilities::WRITE_PROPS | Capabilities::WRITE_GLOBALS | Capabilities::WRITE_REFS)) === 0;
+    }
+
+    /**
+     * Whether the constructor of $method_storage, made write-this-props for only assigning properties (see
+     * FunctionLikeNodeScanner::applyTrivialConstructorCapabilities()), may run property hooks when it constructs an
+     * object of $fq_class_name: that class, or one between it and the class declaring the constructor, redeclares
+     * one of those properties with a hook. When the class may be extended (`new static`, `new $class`), a class
+     * extending it may do that too.
+     *
+     * @psalm-mutation-free
+     */
+    private static function runsPropertyHooks(
+        Codebase $codebase,
+        MethodStorage $method_storage,
+        MethodIdentifier $declaring_method_id,
+        string $fq_class_name,
+        bool $can_extend,
+    ): bool {
+        if ($method_storage->trivial_constructor_properties === null
+            || $method_storage->trivial_constructor_properties === []
+        ) {
+            return false;
+        }
+
+        if ($can_extend) {
+            return true;
+        }
+
+        if (strtolower($fq_class_name) === $declaring_method_id->fq_class_name
+            || !$codebase->classlike_storage_provider->has($fq_class_name)
+        ) {
+            return false;
+        }
+
+        $class_storage = $codebase->classlike_storage_provider->get($fq_class_name);
+
+        foreach ($method_storage->trivial_constructor_properties as $property_name) {
+            $declaring_class = $class_storage->declaring_property_ids[$property_name] ?? null;
+
+            if ($declaring_class === null
+                || strtolower($declaring_class) === $declaring_method_id->fq_class_name
+                || !$codebase->classlike_storage_provider->has($declaring_class)
+            ) {
+                continue;
+            }
+
+            $property_storage = $codebase->classlike_storage_provider->get($declaring_class)
+                ->properties[$property_name] ?? null;
+
+            if ($property_storage === null
+                || $property_storage->hook_get !== null
+                || $property_storage->hook_set !== null
+            ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static function checkDynamicConstructorPurity(
+        StatementsAnalyzer $statements_analyzer,
+        Codebase $codebase,
+        Context $context,
+        PhpParser\Node\Expr\New_ $stmt,
+        ?string $fq_class_name,
+    ): void {
+        if ($fq_class_name !== null
+            && $codebase->classlikes->classOrInterfaceOrEnumExists($fq_class_name)
+        ) {
+            $method_id = new MethodIdentifier($fq_class_name, '__construct');
+            $declaring_method_id = $codebase->methods->getDeclaringMethodId($method_id);
+
+            if ($declaring_method_id === null) {
+                // no constructor: nothing is run
+                return;
+            }
+
+            self::analyzeConstructorPurity(
+                $statements_analyzer,
+                $codebase,
+                $context,
+                $stmt,
+                $declaring_method_id,
+                $codebase->methods->getStorage($declaring_method_id),
+                null,
+                $fq_class_name,
+                // the class string may name a class extending it
+                !$codebase->classlike_storage_provider->get($fq_class_name)->final,
+            );
+
+            return;
+        }
+
+        $statements_analyzer->signalMutation(
+            Capabilities::ALL,
+            $context,
+            'the constructor of an unknown class',
+            ImpureMethodCall::class,
+            $stmt,
+        );
+    }
+
+    private static function analyzeConstructorExpression(
+        StatementsAnalyzer $statements_analyzer,
+        Codebase $codebase,
+        Context $context,
+        PhpParser\Node\Expr\New_ $stmt,
+        PhpParser\Node\Expr $stmt_class,
+        Config $config,
+        ?string &$fq_class_name,
+        bool &$can_extend,
+    ): void {
+        $was_inside_general_use = $context->inside_general_use;
+        $context->inside_general_use = true;
+        ExpressionAnalyzer::analyze($statements_analyzer, $stmt_class, $context);
+        $context->inside_general_use = $was_inside_general_use;
+
+        $stmt_class_type = $statements_analyzer->node_data->getType($stmt_class);
+
+        if (!$stmt_class_type) {
+            ArgumentsAnalyzer::analyze(
+                $statements_analyzer,
+                $stmt->getArgs(),
+                null,
+                null,
+                true,
+                $context,
+            );
+
+            return;
+        }
+
+        $has_single_class = $stmt_class_type->isSingleStringLiteral();
+
+        if ($has_single_class) {
+            // A class string is always fully qualified, so "\Foo" and "Foo" name the same class
+            $fq_class_name = ltrim($stmt_class_type->getSingleStringLiteral()->value, '\\');
+        } else {
+            if ($statements_analyzer->taint_flow_graph
+                && $stmt_class_type->parent_nodes
+                && !$statements_analyzer->getCodebase()->config->suppressesIssueType(
+                    $statements_analyzer->getSuppressedIssues(),
+                    'TaintedInput',
+                )
+            ) {
+                $arg_location = new CodeLocation($statements_analyzer->getSource(), $stmt_class);
+
+                $custom_call_sink = DataFlowNode::getForCallableArg(
+                    'dynamic-instantiation',
+                    'variable-call',
+                    0,
+                    $arg_location,
+                    TaintKind::INPUT_CALLABLE,
+                );
+
+                $statements_analyzer->taint_flow_graph->addSink($custom_call_sink);
+
+                $event = new AddRemoveTaintsEvent($stmt, $context, $statements_analyzer, $codebase);
+
+                $added_taints = $codebase->config->eventDispatcher->dispatchAddTaints($event);
+                $removed_taints = $codebase->config->eventDispatcher->dispatchRemoveTaints($event);
+
+                $taints = $added_taints & ~$removed_taints;
+                if ($added_taints !== 0) {
+                    $taint_source = $custom_call_sink->setTaints($taints);
+                    $statements_analyzer->taint_flow_graph->addSource($taint_source);
+                }
+
+                foreach ($stmt_class_type->parent_nodes as $parent_node) {
+                    $statements_analyzer->taint_flow_graph->addPath(
+                        $parent_node,
+                        $custom_call_sink,
+                        'call',
+                        $added_taints,
+                        $removed_taints,
+                    );
+                }
+            }
+
+            if (self::checkMethodArgs(
+                null,
+                $stmt->getArgs(),
+                new TemplateResult([], []),
+                $context,
+                new CodeLocation($statements_analyzer->getSource(), $stmt),
+                $statements_analyzer,
+            ) === false) {
+                return;
+            }
+        }
+
+        $new_type = self::getNewType(
+            $statements_analyzer,
+            $codebase,
+            $context,
+            $stmt,
+            $stmt_class_type,
+            $config,
+            $can_extend,
+        );
+
+        if (!$has_single_class) {
+            if ($new_type) {
+                $statements_analyzer->node_data->setType($stmt, $new_type);
+            }
+
+            ArgumentsAnalyzer::analyze(
+                $statements_analyzer,
+                $stmt->getArgs(),
+                null,
+                null,
+                true,
+                $context,
+            );
+
+            return;
+        }
+    }
+    private static function getNewType(
+        StatementsAnalyzer $statements_analyzer,
+        Codebase $codebase,
+        Context $context,
+        PhpParser\Node\Expr\New_ $stmt,
+        Union $stmt_class_type,
+        Config $config,
+        bool &$can_extend,
+    ): ?Union {
+        $new_types = [];
+
+        foreach ($stmt_class_type->getAtomicTypes() as $lhs_type_part) {
+            if ($lhs_type_part instanceof TTemplateParam) {
+                $as = self::getNewType(
+                    $statements_analyzer,
+                    $codebase,
+                    $context,
+                    $stmt,
+                    $lhs_type_part->as,
+                    $config,
+                    $can_extend,
+                );
+                if ($as) {
+                    $new_types []= new Union([$lhs_type_part->replaceAs($as)]);
+                }
+                continue;
+            }
+
+            if ($lhs_type_part instanceof TTemplateParamClass) {
+                if (!$statements_analyzer->node_data->getType($stmt)) {
+                    $new_type_part = new TTemplateParam(
+                        $lhs_type_part->param_name,
+                        $lhs_type_part->as_type
+                            ? new Union([$lhs_type_part->as_type])
+                            : Type::getObject(),
+                        $lhs_type_part->defining_class,
+                    );
+
+                    if (!$lhs_type_part->as_type) {
+                        IssueBuffer::maybeAdd(
+                            new MixedMethodCall(
+                                'Cannot call constructor on an unknown class',
+                                new CodeLocation($statements_analyzer->getSource(), $stmt),
+                            ),
+                            $statements_analyzer->getSuppressedIssues(),
+                        );
+                    }
+
+                    $new_types []= new Union([$new_type_part]);
+
+                    if ($lhs_type_part->as_type
+                        && $codebase->classlikes->classExists($lhs_type_part->as_type->value, null, $context)
+                    ) {
+                        $as_storage = $codebase->classlike_storage_provider->get(
+                            $lhs_type_part->as_type->value,
+                        );
+
+                        if (!self::childConstructorsAcceptArgs(
+                            $statements_analyzer,
+                            $codebase,
+                            $context,
+                            $as_storage,
+                            $stmt->getArgs(),
+                        )) {
+                            IssueBuffer::maybeAdd(
+                                new UnsafeInstantiation(
+                                    'Cannot safely instantiate class ' . $lhs_type_part->as_type->value
+                                    . ' with "new $class_name" as'
+                                    . ' its constructor might change in child classes',
+                                    new CodeLocation($statements_analyzer->getSource(), $stmt),
+                                ),
+                                $statements_analyzer->getSuppressedIssues(),
+                            );
+                        }
+                    }
+                }
+
+                if ($lhs_type_part->as_type) {
+                    $codebase->methodExists(
+                        new MethodIdentifier(
+                            $lhs_type_part->as_type->value,
+                            '__construct',
+                        ),
+                        $context->calling_method_id,
+                        $codebase->collect_locations
+                            ? new CodeLocation($statements_analyzer->getSource(), $stmt) : null,
+                        $statements_analyzer,
+                        $statements_analyzer->getFilePath(),
+                    );
+                }
+
+                self::checkDynamicConstructorPurity(
+                    $statements_analyzer,
+                    $codebase,
+                    $context,
+                    $stmt,
+                    $lhs_type_part->as_type?->value,
+                );
+
+                continue;
+            }
+
+            if ($lhs_type_part instanceof TLiteralClassString
+                || $lhs_type_part instanceof TClassString
+                || $lhs_type_part instanceof TDependentGetClass
+            ) {
+                if (!$statements_analyzer->node_data->getType($stmt)) {
+                    if ($lhs_type_part instanceof TClassString) {
+                        $generated_type = $lhs_type_part->as_type ?? new TObject();
+                        if ($lhs_type_part instanceof TUnknownClassString) {
+                            $generated_type = $lhs_type_part->as_unknown_type ?? $generated_type;
+                        }
+
+                        if ($lhs_type_part->as_type
+                            && $codebase->classlikes->classExists($lhs_type_part->as_type->value, null, $context)
+                        ) {
+                            $as_storage = $codebase->classlike_storage_provider->get(
+                                $lhs_type_part->as_type->value,
+                            );
+
+                            if (!self::childConstructorsAcceptArgs(
+                                $statements_analyzer,
+                                $codebase,
+                                $context,
+                                $as_storage,
+                                $stmt->getArgs(),
+                            )) {
+                                IssueBuffer::maybeAdd(
+                                    new UnsafeInstantiation(
+                                        'Cannot safely instantiate class ' . $lhs_type_part->as_type->value
+                                        . ' with "new $class_name" as'
+                                        . ' its constructor might change in child classes',
+                                        new CodeLocation($statements_analyzer->getSource(), $stmt),
+                                    ),
+                                    $statements_analyzer->getSuppressedIssues(),
+                                );
+                            }
+                        }
+                    } elseif ($lhs_type_part instanceof TDependentGetClass) {
+                        $generated_type = new TObject();
+
+                        if ($lhs_type_part->as_type->hasObjectType()
+                            && $lhs_type_part->as_type->isSingle()
+                        ) {
+                            foreach ($lhs_type_part->as_type->getAtomicTypes() as $typeof_type_atomic) {
+                                if ($typeof_type_atomic instanceof TNamedObject) {
+                                    $generated_type = new TNamedObject(
+                                        $typeof_type_atomic->value,
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        $generated_type = new TNamedObject(
+                            $lhs_type_part->value,
+                        );
+                    }
+
+                    if ($lhs_type_part instanceof TClassString) {
+                        $can_extend = true;
+
+                        self::checkDynamicConstructorPurity(
+                            $statements_analyzer,
+                            $codebase,
+                            $context,
+                            $stmt,
+                            $lhs_type_part->as_type?->value,
+                        );
+                    }
+
+                    if ($generated_type instanceof TObject) {
+                        IssueBuffer::maybeAdd(
+                            new MixedMethodCall(
+                                'Cannot call constructor on an unknown class',
+                                new CodeLocation($statements_analyzer->getSource(), $stmt),
+                            ),
+                            $statements_analyzer->getSuppressedIssues(),
+                        );
+                    }
+
+                    $new_types []= new Union([$generated_type]);
+                }
+
+                continue;
+            }
+
+            if ($lhs_type_part instanceof TString) {
+                if (!$config->allow_string_standin_for_class
+                    || $lhs_type_part instanceof TNumericString
+                ) {
+                    IssueBuffer::maybeAdd(
+                        new InvalidStringClass(
+                            'String cannot be used as a class',
+                            new CodeLocation($statements_analyzer->getSource(), $stmt),
+                        ),
+                        $statements_analyzer->getSuppressedIssues(),
+                    );
+                }
+            } elseif ($lhs_type_part instanceof TMixed
+                || $lhs_type_part instanceof TObject
+            ) {
+                IssueBuffer::maybeAdd(
+                    new MixedMethodCall(
+                        'Cannot call constructor on an unknown class',
+                        new CodeLocation($statements_analyzer->getSource(), $stmt),
+                    ),
+                    $statements_analyzer->getSuppressedIssues(),
+                );
+            } elseif ($lhs_type_part instanceof TFalse
+                && $stmt_class_type->ignore_falsable_issues
+            ) {
+                // do nothing
+            } elseif ($lhs_type_part instanceof TNull
+                && $stmt_class_type->ignore_nullable_issues
+            ) {
+                // do nothing
+            } elseif ($lhs_type_part instanceof TNamedObject) {
+                $new_types []= new Union([$lhs_type_part]);
+                continue;
+            } else {
+                IssueBuffer::maybeAdd(
+                    new UndefinedClass(
+                        'Type ' . $lhs_type_part . ' cannot be called as a class',
+                        new CodeLocation($statements_analyzer->getSource(), $stmt),
+                        (string)$lhs_type_part,
+                    ),
+                    $statements_analyzer->getSuppressedIssues(),
+                );
+            }
+
+            $new_types []= Type::getObject();
+        }
+
+        if ($new_types) {
+            return Type::combineUnionTypeArray($new_types, $codebase);
+        }
+        return null;
+    }
+
+    /**
+     * Whether the constructor binds the given template through a `class-string<T>`
+     * (`T::class`) parameter position, which names the template's type exactly
+     * rather than providing a value of it.
+     *
+     * @psalm-mutation-free
+     */
+    private static function templateBoundThroughClassString(
+        MethodStorage $method_storage,
+        string $template_name,
+    ): bool {
+        foreach ($method_storage->params as $constructor_param) {
+            if (!$constructor_param->type) {
+                continue;
+            }
+
+            foreach ($constructor_param->type->getAtomicTypes() as $param_atomic_type) {
+                if ($param_atomic_type instanceof TTemplateParamClass
+                    && $param_atomic_type->param_name === $template_name
+                ) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * The type of `new` when the constructor says what it constructs: through `@psalm-this-out`, or
+     * through a `@return` naming the class (`Store[pure]<TValue>`), whose class templates are bound
+     * to what the plain type of `new` has. A subclass inheriting a constructor with a `@return`, or
+     * `new static` from a class that may have some, gets the plain type instead.
+     *
+     * @param list<Union> $generic_param_types
+     */
+    private static function getSelfOutType(
+        StatementsAnalyzer $statements_analyzer,
+        PhpParser\Node\Expr\New_ $stmt,
+        ClassLikeStorage $storage,
+        string $fq_class_name,
+        bool $from_static,
+        ?MethodStorage $method_storage,
+        ?MethodIdentifier $declaring_method_id,
+        MethodIdentifier $method_id,
+        TemplateResult $template_result,
+        array $generic_param_types,
+    ): ?Union {
+        $codebase = $statements_analyzer->getCodebase();
+
+        if ($method_storage && $method_storage->self_out_type) {
+            $self_out_candidate = $method_storage->self_out_type;
+
+            if ($template_result->lower_bounds) {
+                $self_out_candidate = TypeExpander::expandUnion(
+                    $codebase,
+                    $self_out_candidate,
+                    $fq_class_name,
+                    null,
+                    $storage->parent_class,
+                    true,
+                    false,
+                    false,
+                    true,
+                );
+            }
+        } elseif ($method_storage
+            && $declaring_method_id
+            && (!$from_static || $storage->final)
+            && strtolower($declaring_method_id->fq_class_name) === strtolower($fq_class_name)
+            && $method_storage->return_type
+            && self::isConstructedType($method_storage->return_type)
+        ) {
+            $self_out_candidate = $method_storage->return_type;
+            $bound_template_result = new TemplateResult($template_result->template_types, []);
+            $bound_template_result->lower_bounds = $template_result->lower_bounds;
+            $offset = 0;
+
+            foreach ($storage->template_types ?? [] as $template_name => $_) {
+                $bound_template_result->lower_bounds[$template_name][$fq_class_name] = [
+                    new TemplateBound($generic_param_types[$offset]),
+                ];
+                $offset++;
+            }
+
+            $template_result = $bound_template_result;
+        } else {
+            return null;
+        }
+
+        if (!self::isInTrait($statements_analyzer)) {
+            $template_result->static_class_type = $fq_class_name;
+        }
+
+        $self_out_candidate = MethodCallReturnTypeFetcher::replaceTemplateTypes(
+            $self_out_candidate,
+            $template_result,
+            $method_id,
+            count($stmt->getArgs()),
+            $codebase,
+        );
+
+        $self_out_candidate = TypeExpander::expandUnion(
+            $codebase,
+            $self_out_candidate,
+            $fq_class_name,
+            $fq_class_name,
+            $storage->parent_class,
+            true,
+            false,
+            false,
+            true,
+        );
+
+        $statements_analyzer->node_data->setType($stmt, $self_out_candidate);
+
+        return $self_out_candidate;
+    }
+
+    /**
+     * The types a constructor's @return may give the object it constructs, through its conditional
+     * branches: an object type, which the docblock scanner checks names the class itself.
+     *
+     * @return list<Atomic>
+     * @psalm-pure
+     */
+    public static function getConstructedAtomics(Union $type): array
+    {
+        $atomics = [];
+
+        foreach ($type->getAtomicTypes() as $atomic) {
+            $atomics = $atomic instanceof TConditional
+                ? [
+                    ...$atomics,
+                    ...self::getConstructedAtomics($atomic->if_type),
+                    ...self::getConstructedAtomics($atomic->else_type),
+                ]
+                : [...$atomics, $atomic];
+        }
+
+        return $atomics;
+    }
+
+    /**
+     * Whether a constructor's @return gives the type of the object it constructs, and is not a
+     * `@return void` or similar.
+     *
+     * @psalm-pure
+     */
+    private static function isConstructedType(Union $type): bool
+    {
+        foreach (self::getConstructedAtomics($type) as $atomic) {
+            if (!$atomic instanceof TNamedObject) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Returns the set of class templates with no public channel that can constrain
+     * them: a template named anywhere in a public non-constructor method parameter
+     * or a public non-readonly property type is one that later code can still
+     * constrain, anything else can only have been fixed at the construction site and
+     * so is pinned eagerly rather than minted as a type variable.
+     *
+     * Any appearance in such a parameter constrains the variable, whichever way the
+     * position points, so `getTemplateTypes()` finding it in *any* nested position is
+     * correct — it is not an over-count. A value position (`set(T $item)`) records a
+     * lower bound that widens the type argument; a callable-parameter position
+     * (`each(callable(T): mixed)`) records an upper bound (`T <: the callback's
+     * parameter`). The upper bound is a real constraint, not a no-op: on an otherwise
+     * unbound construction it is what resolves the variable (to the callback's
+     * parameter type rather than `mixed`, matching Hack — see the
+     * `unboundTemplateSolvesToClosureParam` test), and it conflicts with a lower
+     * bound recorded elsewhere when the two cannot hold together (see
+     * `constructorBoundThenClosureParamConflict`). Pinning such a template eagerly
+     * instead would lose both behaviours, so every appearance must mint a variable.
+     *
+     * The set is only ever over-approximated per construction site: the channel may
+     * never be exercised (the method is not called), in which case the variable
+     * simply reconciles to its construction-site bound — which is why a variable that
+     * survives into an expression must be resolved through its bounds by consumers
+     * (array access, property reads, method returns) rather than assumed pinned.
+     *
+     * @return array<string, true>
+     * @psalm-mutation-free
+     */
+    private static function getUnconstrainableTemplates(ClassLikeStorage $storage): array
+    {
+        $unconstrainable = [];
+
+        foreach ($storage->template_types ?? [] as $template_name => $_) {
+            $unconstrainable[$template_name] = true;
+        }
+
+        foreach ($storage->methods as $method_name => $method_storage) {
+            if (!$unconstrainable) {
+                break;
+            }
+
+            if ($method_name === '__construct'
+                || $method_storage->visibility !== ClassLikeAnalyzer::VISIBILITY_PUBLIC
+            ) {
+                continue;
+            }
+
+            foreach ($method_storage->params as $param) {
+                if ($param->type) {
+                    foreach ($param->type->getTemplateTypes() as $template_type) {
+                        unset($unconstrainable[$template_type->param_name]);
+                    }
+                }
+            }
+        }
+
+        foreach ($storage->properties as $property_storage) {
+            if (!$unconstrainable) {
+                break;
+            }
+
+            // A `readonly` property cannot be assigned after construction, so it
+            // is not a channel through which the template can be constrained.
+            if ($property_storage->visibility !== ClassLikeAnalyzer::VISIBILITY_PUBLIC
+                || $property_storage->readonly
+            ) {
+                continue;
+            }
+
+            if ($property_storage->type) {
+                foreach ($property_storage->type->getTemplateTypes() as $template_type) {
+                    unset($unconstrainable[$template_type->param_name]);
+                }
+            }
+        }
+
+        // a purity template is what the object was constructed with: what its methods cost is
+        // charged when they are called, so it cannot be widened by what happens afterwards
+        foreach ($storage->template_types ?? [] as $template_name => $bounds) {
+            foreach ($bounds as $bound) {
+                if (Capabilities::isPurityType($bound)) {
+                    $unconstrainable[$template_name] = true;
+                }
+            }
+        }
+
+        return $unconstrainable;
+    }
+
+    /**
+     * The templates of the class the parameters of its constructor mention, which the arguments
+     * of a `new` bind.
+     *
+     * @return array<string, true>
+     * @psalm-mutation-free
+     */
+    private static function getConstructorParamTemplates(Codebase $codebase, ClassLikeStorage $storage): array
+    {
+        $constructor_id = $storage->declaring_method_ids['__construct'] ?? null;
+
+        if ($constructor_id === null) {
+            return [];
+        }
+
+        $templates = [];
+
+        foreach ($codebase->methods->getStorage($constructor_id)->params as $param) {
+            foreach ($param->type?->getTemplateTypes() ?? [] as $template_type) {
+                if (isset($storage->template_types[$template_type->param_name])) {
+                    $templates[$template_type->param_name] = true;
+                }
+            }
+        }
+
+        return $templates;
+    }
+
+    /**
+     * Whether `new static()` may infer a template of the class differently from what a child class
+     * binds it to: a type template, or a purity template the constructor's parameters take (a
+     * `Closure[C]` argument), as the others are only bound by the classes extending it.
+     *
+     * @psalm-mutation-free
+     */
+    private static function hasTemplatesInferredByConstructor(Codebase $codebase, ClassLikeStorage $storage): bool
+    {
+        foreach ($storage->template_types ?? [] as $template_name => $_) {
+            if (!isset($storage->purity_templates[$template_name])) {
+                return true;
+            }
+        }
+
+        return self::getConstructorParamTemplates($codebase, $storage) !== [];
+    }
+
+    /**
+     * The type arguments of the new object: what the constructor arguments bound each template to, directly or
+     * through a parent template, or else what the unbound template stands for.
+     *
+     * @return list<Union>
+     */
+    private static function getGenericParamTypes(
+        StatementsAnalyzer $statements_analyzer,
+        PhpParser\Node\Expr\New_ $stmt,
+        ClassLikeStorage $storage,
+        TemplateResult $template_result,
+        string $fq_class_name,
+        ?MethodStorage $method_storage,
+    ): array {
+        $codebase = $statements_analyzer->getCodebase();
+        $unconstrainable_templates = self::getUnconstrainableTemplates($storage);
+        $inferred_lower_bounds = self::getInferredLowerBounds($template_result);
+        $generic_param_types = [];
+
+        foreach ($storage->template_types ?? [] as $template_name => $base_type) {
+            // a type template with a default only takes bounds from arguments that said something about it, as an
+            // argument that says nothing (`null` for `(callable(): T)|null`) leaves the template out
+            $lower_bounds = isset($storage->template_defaults[$template_name])
+                && !isset($storage->purity_templates[$template_name])
+                    ? $inferred_lower_bounds
+                    : $template_result->lower_bounds;
+
+            if (isset($lower_bounds[$template_name][$fq_class_name])) {
+                $generic_param_type = TemplateStandinTypeReplacer::getMostSpecificTypeFromBounds(
+                    $lower_bounds[$template_name][$fq_class_name],
+                    $codebase,
+                );
+
+                // PHP has no constructor type arguments, so later code may still widen this template within its
+                // constraint (as Hack's `new Foo<_>()`): mint a type variable with the argument bounds below and the
+                // constraint above, the other templates it names (`TIterator as Traversable<TKey, TValue>`) resolved
+                $constraint = TemplateInferredTypeReplacer::replace(
+                    array_values($base_type)[0],
+                    $template_result,
+                    $codebase,
+                );
+
+                // a `mixed` argument binds the template to `mixed`, which no later bound can narrow, while a type
+                // variable would hide the template from reads (`class-string<T>` returns, `self<T&X>` assertions, the
+                // constraint clamp on later calls): keep the plain parameter, as for an explicit `Foo<mixed>`
+                if (!isset($unconstrainable_templates[$template_name])
+                    && !$generic_param_type->hasMixed()
+                ) {
+                    $generic_param_type = self::mintTypeVariable(
+                        $statements_analyzer,
+                        $stmt,
+                        $lower_bounds[$template_name][$fq_class_name],
+                        $constraint,
+                        $method_storage
+                            && self::templateBoundThroughClassString($method_storage, $template_name),
+                    );
+                }
+            } elseif (self::isGivenToBoundParentTemplate(
+                $fq_class_name,
+                $template_name,
+                $storage->template_extended_params,
+                $lower_bounds,
+            )) {
+                $generic_param_type = self::getGenericParamForOffset(
+                    $fq_class_name,
+                    $template_name,
+                    $storage->template_extended_params,
+                    array_map(
+                        static fn(array $type_map): array => array_map(
+                            static fn(array $bounds): Union
+                                => TemplateStandinTypeReplacer::getMostSpecificTypeFromBounds(
+                                    $bounds,
+                                    $codebase,
+                                ),
+                            $type_map,
+                        ),
+                        $lower_bounds,
+                    ),
+                );
+            } else {
+                $generic_param_type = self::getUninferredTemplateParam(
+                    $statements_analyzer,
+                    $stmt,
+                    $storage,
+                    $template_name,
+                    $base_type,
+                    $generic_param_types,
+                    $unconstrainable_templates,
+                );
+            }
+
+            $generic_param_types[] = $generic_param_type->setProperties([
+                'had_template' => true,
+            ]);
+        }
+
+        return $generic_param_types;
+    }
+
+    /**
+     * The lower bounds of the template result, without those of the templates the arguments said nothing about
+     * ({@see TemplateDefaults::isUninferred()}).
+     *
+     * @return array<string, array<string, non-empty-list<TemplateBound>>>
+     * @psalm-mutation-free
+     */
+    private static function getInferredLowerBounds(TemplateResult $template_result): array
+    {
+        $inferred_lower_bounds = [];
+
+        foreach ($template_result->lower_bounds as $template_name => $type_map) {
+            foreach ($type_map as $defining_class => $lower_bounds) {
+                if (!TemplateDefaults::isUninferred($template_result, $template_name, $defining_class)) {
+                    $inferred_lower_bounds[$template_name][$defining_class] = $lower_bounds;
+                }
+            }
+        }
+
+        return $inferred_lower_bounds;
+    }
+
+    /**
+     * What a template the constructor arguments did not bind stands for. Later code may still constrain it (Hack's
+     * `new Foo<_>()`), so it gets a type variable bounded above by its constraint and reconciled once the enclosing
+     * function-like is analyzed, unless only the constructor names it: then it is a type template's default, with
+     * the earlier templates bound as in the new object, or else its constraint.
+     *
+     * @param non-empty-array<string, Union> $type_map the constraint of the template, by its class
+     * @param list<Union> $generic_param_types those of the templates before it
+     * @param array<string, true> $unconstrainable_templates computed once for the `new` expression
+     */
+    private static function getUninferredTemplateParam(
+        StatementsAnalyzer $statements_analyzer,
+        PhpParser\Node\Expr\New_ $stmt,
+        ClassLikeStorage $storage,
+        string $template_name,
+        array $type_map,
+        array $generic_param_types,
+        array $unconstrainable_templates,
+    ): Union {
+        $constraint = reset($type_map);
+        $default = $storage->template_defaults[$template_name] ?? null;
+
+        if ($default !== null
+            && !isset($storage->purity_templates[$template_name])
+            && isset($unconstrainable_templates[$template_name])
+        ) {
+            $bound = [];
+
+            foreach ($storage->template_types ?? [] as $name => $earlier_type_map) {
+                if (!isset($generic_param_types[count($bound)])) {
+                    break;
+                }
+
+                $bound[$name][array_key_first($earlier_type_map)] = $generic_param_types[count($bound)];
+            }
+
+            $codebase = $statements_analyzer->getCodebase();
+
+            return TemplateDefaults::expandDefault(
+                $codebase,
+                TemplateDefaults::resolve($default, new TemplateResult([], $bound), $codebase),
+                $storage,
+                $template_name,
+            );
+        }
+
+        // the constraint may name the other templates of the class (`TIterator as Iterator<TKey, TValue>`): the
+        // earlier ones stand for what they are bound to in the new object, the others for their constraints
+        $named_templates = [];
+        $template_offset = 0;
+
+        foreach ($storage->template_types ?? [] as $name => $other_type_map) {
+            $named_templates[$name][array_key_first($other_type_map)]
+                = $generic_param_types[$template_offset++] ?? reset($other_type_map);
+        }
+
+        $constraint = TemplateInferredTypeReplacer::replace(
+            $constraint,
+            new TemplateResult([], $named_templates),
+            $statements_analyzer->getCodebase(),
+        );
+
+        if (isset($unconstrainable_templates[$template_name])) {
+            return $constraint;
+        }
+
+        $type_variable_bounds = new TypeVariableBounds(
+            [],
+            [new TemplateBound($constraint, 0, null, null, new CodeLocation($statements_analyzer->getSource(), $stmt))],
+        );
+
+        $type_variable_name = $statements_analyzer->type_variable_tracker->addVariable($type_variable_bounds);
+
+        return new Union([new TTypeVariable($type_variable_name, $type_variable_bounds)]);
+    }
+
+    /**
+     * What the class purity templates a constructor's purity comes from are bound to for the class
+     * instantiated, when its arguments do not bind them: what the class binds them to, their default
+     * or upper bound for a class that does not, and, for `new self()` and `new static()` in a class
+     * that does not, the templates themselves, which the class may be instantiated with any value
+     * of (and which the methods inheriting their purity from them may use).
+     *
+     * @return array<string, array<string, Union>>
+     */
+    private static function getConstructorClassTemplateParams(
+        Codebase $codebase,
+        Context $context,
+        MethodStorage $method_storage,
+        string $fq_class_name,
+    ): array {
+        $defining_class = $method_storage->defining_fqcln;
+
+        if ($method_storage->purity_from_templates === []
+            || $defining_class === null
+            || !$codebase->classlike_storage_provider->has($fq_class_name)
+        ) {
+            return [];
+        }
+
+        $defining_storage = $codebase->classlike_storage_provider->get($defining_class);
+        $class_storage = $codebase->classlike_storage_provider->get($fq_class_name);
+        $bound_by_arguments = self::getConstructorParamTemplates($codebase, $defining_storage);
+        $class_template_params = ClassTemplateParamCollector::collect(
+            $codebase,
+            $defining_storage,
+            $class_storage,
+            '__construct',
+            new TNamedObject($fq_class_name),
+        ) ?? [];
+
+        foreach ($method_storage->purity_from_templates as $template_name) {
+            $bound = $defining_storage->template_types[$template_name][$defining_class] ?? null;
+
+            if ($bound === null || isset($bound_by_arguments[$template_name])) {
+                unset($class_template_params[$template_name]);
+            } elseif (!isset($class_storage->template_extended_params[$defining_class][$template_name])) {
+                $class_template_params[$template_name] = [
+                    $defining_class => $fq_class_name === $context->self
+                        ? new Union([new TTemplateParam($template_name, $bound, $defining_class)])
+                        : $defining_storage->template_defaults[$template_name] ?? $bound,
+                ];
+            }
+        }
+
+        return $class_template_params;
+    }
+}

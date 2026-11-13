@@ -1,0 +1,15 @@
+<?php
+
+namespace Illuminate\Database\Eloquent\Relations;
+
+/**
+ * @template TRelatedModel of \Illuminate\Database\Eloquent\Model
+ * Covariant TDeclaringModel — required by #913 (see Relation.phpstub for the rationale).
+ * @template-covariant TDeclaringModel of \Illuminate\Database\Eloquent\Model
+ * @template-extends BelongsTo<TRelatedModel, TDeclaringModel>
+ * @mixin \Illuminate\Database\Eloquent\Builder<TRelatedModel>
+ */
+class MorphTo extends BelongsTo
+{
+
+}

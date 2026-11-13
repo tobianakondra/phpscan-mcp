@@ -1,0 +1,217 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\LaravelPlugin\Stubs;
+
+use Psalm\Progress\Progress;
+
+/**
+ * Discovers `.phpstub` files for the plugin's stub registration.
+ *
+ * Splits responsibility from {@see \Psalm\LaravelPlugin\Plugin}: filesystem
+ * traversal and version-directory selection live in this utility so they can
+ * be exercised by unit tests without booting the plugin, while warning
+ * reporting still uses Psalm's {@see Progress} output interface.
+ *
+ * @internal
+ */
+final class StubFileFinder
+{
+    /**
+     * Recursively find all `.phpstub` files in a directory.
+     *
+     * Results are sorted to ensure deterministic stub registration order.
+     * RecursiveDirectoryIterator returns files in filesystem order, which
+     * varies across OSes (alphabetical on APFS/HFS+, inode order on ext4).
+     *
+     * Stub loading order matters: when multiple stubs declare the same method
+     * on the same class, Psalm reuses the MethodStorage and re-applies docblock
+     * parsing. Types are last-loaded-wins; a re-declared method keeps earlier
+     * `@psalm-taint-sink`/`@psalm-assert-untainted` only on a same-named parameter, and a
+     * re-declared free function replaces them. Without sorting, moving or renaming stub files
+     * can silently change types and drop sinks. See docs/contributing/README.md "Stub merging".
+     *
+     * @return list<string>
+     */
+    public static function findIn(string $directory, Progress $output): array
+    {
+        if (!\is_dir($directory)) {
+            return [];
+        }
+
+        $iterator = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator(
+            $directory,
+            \FilesystemIterator::SKIP_DOTS,
+        ));
+
+        $stubs = [];
+
+        try {
+            /** @var \SplFileInfo $file */
+            foreach ($iterator as $file) {
+                if ($file->getExtension() !== 'phpstub') {
+                    continue;
+                }
+
+                // getRealPath() is false for every phar:// (or other stream wrapper) path, e.g. when
+                // the plugin runs inside psalm.phar; keep such paths as-is instead of dropping the stub.
+                $realPath = $file->getRealPath();
+                $stubs[] = \is_string($realPath) ? $realPath : $file->getPathname();
+            }
+        } catch (\UnexpectedValueException $unexpectedValueException) {
+            // RecursiveIteratorIterator can throw during iteration on unreadable subdirectories.
+            // Return whatever stubs were collected before the error — partial results from
+            // readable subdirectories are better than none.
+            $output->warning(
+                "Laravel plugin: error scanning stub directory '{$directory}': {$unexpectedValueException->getMessage()}",
+            );
+        }
+
+        \sort($stubs);
+
+        return $stubs;
+    }
+
+    /** @return list<string> */
+    public static function commonStubs(string $stubsRoot, Progress $output): array
+    {
+        return self::findIn($stubsRoot . '/common', $output);
+    }
+
+    /**
+     * Collect stubs for an optional third-party integration (e.g. `laravel-ai`).
+     *
+     * Lives under `stubs/integrations/<package>/`. Loaded only when the caller
+     * has verified that the integration's package is installed in the analyzed
+     * project, so absent packages never contribute stale class shapes.
+     *
+     * @return list<string>
+     */
+    public static function integrationStubs(string $stubsRoot, string $integration, Progress $output): array
+    {
+        return self::findIn($stubsRoot . '/integrations/' . $integration, $output);
+    }
+
+    /**
+     * Collect stubs from all version directories that are <= the installed Laravel version.
+     *
+     * Supports both major-only directories (e.g. "12/", "13/") and patch-level directories
+     * (e.g. "12.20.0/", "12.42.0/"). Directories are sorted in ascending version order so
+     * that later versions override earlier ones for same-named stubs.
+     *
+     * @see https://www.php.net/version_compare — treats "12" as "12.0.0"
+     *
+     * @return list<string>
+     */
+    public static function stubsForLaravelVersion(string $stubsRoot, string $version, Progress $output): array
+    {
+        // Collect version directories (names starting with a digit, e.g. "12", "12.20.0", "13")
+        $candidates = [];
+
+        foreach (new \DirectoryIterator($stubsRoot) as $entry) {
+            if (!$entry->isDir() || $entry->isDot()) {
+                continue;
+            }
+
+            $dirName = $entry->getFilename();
+
+            // Skip non-version directories (e.g. "common")
+            if (\ctype_digit($dirName[0])) {
+                $candidates[] = $dirName;
+            }
+        }
+
+        $stubs = [];
+
+        foreach (self::filterVersionDirectories($candidates, $version) as $dir) {
+            \array_push($stubs, ...self::findIn($stubsRoot . '/' . $dir, $output));
+        }
+
+        return $stubs;
+    }
+
+    /**
+     * Filter and sort version directory names, keeping only those <= the target version.
+     *
+     * @param list<string> $candidates directory names (e.g. ["13", "12", "12.20.0"])
+     *
+     * @return list<string> sorted ascending by version (e.g. ["12", "12.20.0"])
+     *
+     * @psalm-pure
+     *
+     * @internal used by tests
+     */
+    public static function filterVersionDirectories(array $candidates, string $targetVersion): array
+    {
+        $matched = \array_filter($candidates, static fn(string $dir): bool => \version_compare(
+            $dir,
+            $targetVersion,
+            '<=',
+        ));
+
+        \usort($matched, static fn(string $a, string $b): int => \version_compare($a, $b));
+
+        return $matched;
+    }
+
+    /**
+     * Fully qualified names of the classes, interfaces, traits and enums a stub file declares.
+     *
+     * A token pass rather than a parse: every stub has at most one `namespace X;` statement,
+     * and a declaration keyword followed by an identifier excludes `Foo::class` and
+     * `new class`. Cost is a few milliseconds for the whole stub tree.
+     *
+     * @return list<string>
+     */
+    public static function declaredClassLikes(string $stubFile): array
+    {
+        $contents = \file_get_contents($stubFile);
+
+        if ($contents === false) {
+            return [];
+        }
+
+        $tokens = \PhpToken::tokenize($contents);
+        $namespace = '';
+        $declared = [];
+
+        foreach ($tokens as $index => $token) {
+            if ($token->is(\T_NAMESPACE)) {
+                $name = self::nextSignificantToken($tokens, $index);
+
+                if ($name?->is([\T_STRING, \T_NAME_QUALIFIED]) === true) {
+                    $namespace = $name->text . '\\';
+                }
+
+                continue;
+            }
+
+            if (!$token->is([\T_CLASS, \T_INTERFACE, \T_TRAIT, \T_ENUM])) {
+                continue;
+            }
+
+            $name = self::nextSignificantToken($tokens, $index);
+
+            if ($name?->is(\T_STRING) === true) {
+                $declared[] = $namespace . $name->text;
+            }
+        }
+
+        return $declared;
+    }
+
+    /** @param list<\PhpToken> $tokens */
+    private static function nextSignificantToken(array $tokens, int $index): ?\PhpToken
+    {
+        $count = \count($tokens);
+
+        for ($next = $index + 1; $next < $count; $next++) {
+            if (!$tokens[$next]->isIgnorable()) {
+                return $tokens[$next];
+            }
+        }
+
+        return null;
+    }
+}

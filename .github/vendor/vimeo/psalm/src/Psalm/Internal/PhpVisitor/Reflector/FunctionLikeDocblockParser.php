@@ -1,0 +1,990 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Internal\PhpVisitor\Reflector;
+
+use AssertionError;
+use PhpParser;
+use Psalm\CodeLocation;
+use Psalm\Codebase;
+use Psalm\DocComment;
+use Psalm\Exception\DocblockParseException;
+use Psalm\Exception\IncorrectDocblockException;
+use Psalm\Internal\Analyzer\CommentAnalyzer;
+use Psalm\Internal\Scanner\DocblockParser;
+use Psalm\Internal\Scanner\FunctionDocblockComment;
+use Psalm\Internal\Scanner\ParsedDocblock;
+use Psalm\Issue\CodeIssue;
+use Psalm\Issue\InvalidDocblock;
+use Psalm\Storage\Capabilities;
+use Psalm\Storage\CapabilitiesParseException;
+use RuntimeException;
+
+use function array_keys;
+use function array_shift;
+use function array_unique;
+use function count;
+use function explode;
+use function implode;
+use function pathinfo;
+use function preg_last_error_msg;
+use function preg_match;
+use function preg_replace;
+use function preg_split;
+use function reset;
+use function str_contains;
+use function str_ends_with;
+use function str_replace;
+use function str_starts_with;
+use function stripos;
+use function strlen;
+use function strtolower;
+use function substr;
+use function substr_count;
+use function trim;
+
+use const PATHINFO_EXTENSION;
+
+/**
+ * @internal
+ */
+final class FunctionLikeDocblockParser
+{
+    /**
+     * @throws DocblockParseException if there was a problem parsing the docblock
+     */
+    public static function parse(
+        Codebase $codebase,
+        PhpParser\Comment\Doc $comment,
+        CodeLocation $code_location,
+        string $cased_function_id,
+    ): FunctionDocblockComment {
+        // invalid @psalm annotations are already reported by the StatementsAnalyzer
+        $parsed_docblock = DocComment::parsePreservingLength($comment, true);
+
+        $comment_text = $comment->getText();
+
+        $info = new FunctionDocblockComment();
+
+        self::checkDuplicatedTags($parsed_docblock);
+        self::checkUnexpectedTags($parsed_docblock, $info, $comment);
+
+        if (isset($parsed_docblock->combined_tags['return'])) {
+            self::extractReturnType(
+                $comment,
+                $parsed_docblock->combined_tags['return'],
+                $info,
+                $code_location,
+                $cased_function_id,
+            );
+        }
+
+        if (isset($parsed_docblock->combined_tags['param'])) {
+            self::extractParams(
+                $comment,
+                $parsed_docblock->combined_tags['param'],
+                $info,
+                $code_location,
+                $cased_function_id,
+            );
+        }
+
+        foreach (['param-out', 'param-closure-this'] as $tag) {
+            foreach ($parsed_docblock->combined_tags[$tag] ?? [] as $offset => $param) {
+                $parsed = self::parseTypeAndVariableTag(
+                    $tag,
+                    $param,
+                    $offset,
+                    $comment,
+                    $comment_text,
+                    $cased_function_id,
+                    $code_location,
+                    $info,
+                );
+
+                if ($parsed === null) {
+                    continue;
+                }
+
+                if ($tag === 'param-out') {
+                    $info->params_out[] = $parsed;
+                } else {
+                    $info->params_closure_this[] = $parsed;
+                }
+            }
+        }
+
+        foreach (['psalm-self-out', 'psalm-this-out', 'phpstan-self-out', 'phpstan-this-out'] as $alias) {
+            if (isset($parsed_docblock->tags[$alias])) {
+                foreach ($parsed_docblock->tags[$alias] as $offset => $param) {
+                    $line_parts = CommentAnalyzer::splitDocLine($param);
+
+                    $line_parts[0] = CommentAnalyzer::sanitizeDocblockType($line_parts[0]);
+
+                    $info->self_out = [
+                        'type' => $line_parts[0],
+                        'line_number' => $comment->getStartLine() + substr_count(
+                            $comment_text,
+                            "\n",
+                            0,
+                            $offset - $comment->getStartFilePos(),
+                        ),
+                    ];
+                }
+                break;
+            }
+        }
+
+        if (isset($parsed_docblock->tags['psalm-flow'])) {
+            foreach ($parsed_docblock->tags['psalm-flow'] as $param) {
+                $info->flows[] = trim($param);
+            }
+        }
+
+        if (isset($parsed_docblock->tags['psalm-if-this-is'])) {
+            foreach ($parsed_docblock->tags['psalm-if-this-is'] as $offset => $param) {
+                $line_parts = CommentAnalyzer::splitDocLine($param);
+
+                $line_parts[0] = CommentAnalyzer::sanitizeDocblockType($line_parts[0]);
+
+                $info->if_this_is = [
+                    'type' => $line_parts[0],
+                    'line_number' => $comment->getStartLine() + substr_count(
+                        $comment->getText(),
+                        "\n",
+                        0,
+                        $offset - $comment->getStartFilePos(),
+                    ),
+                ];
+            }
+        }
+
+        self::parseTaintTags($parsed_docblock, $info, $codebase, $code_location, $cased_function_id);
+
+        if (isset($parsed_docblock->tags['psalm-cli-only'])) {
+            $info->cli_only = true;
+        }
+
+        if (isset($parsed_docblock->tags['global'])) {
+            foreach ($parsed_docblock->tags['global'] as $offset => $global) {
+                $line_parts = CommentAnalyzer::splitDocLine($global);
+
+                if (count($line_parts) === 1 && isset($line_parts[0][0]) && $line_parts[0][0] === '$') {
+                    continue;
+                }
+
+                if (count($line_parts) > 1) {
+                    if (preg_match('/^(\.\.\.)?&?\$[A-Za-z0-9_\x80-\xff]+[,;]?$/', $line_parts[1])
+                        && $line_parts[0][0] !== '{'
+                    ) {
+                        if ($line_parts[1][0] === '&') {
+                            $line_parts[1] = substr($line_parts[1], 1);
+                        }
+
+                        if ($line_parts[0][0] === '$'
+                            && !preg_match('/^\$this *(\||$)/', CommentAnalyzer::sanitizeDocblockType($line_parts[0]))
+                        ) {
+                            throw new IncorrectDocblockException('Misplaced variable');
+                        }
+
+                        $line_parts[1] = (string) preg_replace('/[,;]$/', '', $line_parts[1], 1);
+
+                        $info->globals[] = [
+                            'name' => $line_parts[1],
+                            'type' => CommentAnalyzer::sanitizeDocblockType($line_parts[0]),
+                            'line_number' => $comment->getStartLine() + substr_count(
+                                $comment_text,
+                                "\n",
+                                0,
+                                $offset - $comment->getStartFilePos(),
+                            ),
+                            'start' => $offset,
+                            'end' => $offset + strlen($line_parts[0]),
+                        ];
+                    }
+                } else {
+                    $info->docblock_issues[] = new InvalidDocblock(
+                        'Badly-formatted @param in docblock for ' . $cased_function_id,
+                        $code_location,
+                    );
+                }
+            }
+        }
+
+        if (isset($parsed_docblock->tags['since'])) {
+            $since = trim((string) reset($parsed_docblock->tags['since']));
+            // only for phpstub files or @since 8.0.0 PHP
+            // since @since is commonly used with the project version, not the PHP version
+            // https://docs.phpdoc.org/3.0/guide/references/phpdoc/tags/since.html
+            // https://github.com/vimeo/psalm/issues/10761
+            if (preg_match('/^([4578])\.(\d)(\.\d+)?(\s+PHP)?$/i', $since, $since_match)
+                && isset($since_match[1])&& isset($since_match[2])
+                && (!empty($since_match[4]) || pathinfo($code_location->file_name, PATHINFO_EXTENSION) === 'phpstub')) {
+                $info->since_php_major_version = (int)$since_match[1];
+                $info->since_php_minor_version = (int)$since_match[2];
+            }
+        }
+
+        if (isset($parsed_docblock->tags['deprecated'])) {
+            $info->deprecated = true;
+        }
+
+        if (isset($parsed_docblock->tags['internal'])) {
+            $info->internal = true;
+        }
+
+        if (count($info->psalm_internal = DocblockParser::handlePsalmInternal($parsed_docblock)) !== 0) {
+            $info->internal = true;
+        }
+
+        if (isset($parsed_docblock->tags['psalm-suppress'])) {
+            foreach ($parsed_docblock->tags['psalm-suppress'] as $offset => $suppress_entry) {
+                foreach (DocComment::parseSuppressList($suppress_entry) as $issue_offset => $suppressed_issue) {
+                    $info->suppressed_issues[$issue_offset + $offset] = $suppressed_issue;
+                }
+            }
+        }
+
+        if (isset($parsed_docblock->tags['throws'])) {
+            foreach ($parsed_docblock->tags['throws'] as $offset => $throws_entry) {
+                // Take everything up to the first whitespace that is not inside generic parameters or next to
+                // a `|`, e.g. `Foo<int, string> | Bar description`
+                preg_match(
+                    '/^(?:[^\s<|]++|(<(?:[^<>]++|(?1))*+>)|(?: |\n *\*?)*\|(?: |\n *\*?)*)++/',
+                    $throws_entry,
+                    $matches,
+                );
+                $throws_class = $matches[0] ?? '';
+
+                if ($throws_class === '') {
+                    throw new IncorrectDocblockException('Unexpectedly empty @throws');
+                }
+
+                // `@throws void` says that nothing is thrown
+                if (strtolower($throws_class) === 'void') {
+                    continue;
+                }
+
+                $info->throws[] = [
+                    $throws_class,
+                    $offset,
+                    $comment->getStartLine() + substr_count(
+                        $comment->getText(),
+                        "\n",
+                        0,
+                        $offset - $comment->getStartFilePos(),
+                    ),
+                ];
+            }
+        }
+
+        if (stripos($parsed_docblock->description, '@inheritdoc') !== false
+            || isset($parsed_docblock->tags['inheritdoc'])
+            || isset($parsed_docblock->tags['inheritDoc'])
+        ) {
+            $info->inheritdoc = true;
+        }
+
+        $templates = [];
+
+        if (isset($parsed_docblock->tags['psalm-purity-template'])) {
+            // a purity template is a template whose values are capability sets
+            foreach ($parsed_docblock->tags['psalm-purity-template'] as $purity_template_line) {
+                foreach (PurityTemplateParser::parse($purity_template_line) as $purity_template) {
+                    if ($purity_template['default'] !== null || $purity_template['lower'] !== null) {
+                        throw new IncorrectDocblockException(
+                            'Only the purity templates of a class can have a default or a lower bound',
+                        );
+                    }
+
+                    $templates[$purity_template['name']]['psalm']
+                        = [$purity_template['name'], 'of', $purity_template['bound'], false, 0];
+                    $info->purity_templates[] = $purity_template['name'];
+                }
+            }
+        }
+
+        [$templates, $info->template_defaults] = TemplateTagParser::parseTags(
+            $parsed_docblock,
+            $comment,
+            ['template' => false],
+            $templates,
+        );
+
+        foreach ($templates as [$template_name, $modifier, $bound]) {
+            $info->templates[] = [$template_name, $modifier, $bound, false];
+        }
+
+        $info->assertions = self::parseAssertions($parsed_docblock, ['psalm-assert', 'phpstan-assert']);
+        $info->if_true_assertions = self::parseAssertions(
+            $parsed_docblock,
+            ['psalm-assert-if-true', 'phpstan-assert-if-true'],
+        );
+        $info->if_false_assertions = self::parseAssertions(
+            $parsed_docblock,
+            ['psalm-assert-if-false', 'phpstan-assert-if-false'],
+        );
+
+        $info->variadic = isset($parsed_docblock->tags['psalm-variadic']);
+        if (isset($parsed_docblock->tags['psalm-pure'])
+            || isset($parsed_docblock->tags['phpstan-pure'])
+            || isset($parsed_docblock->tags['pure'])
+        ) {
+            $info->capabilities = Capabilities::NONE;
+            $info->has_mutations_annotation = true;
+        } elseif (isset($parsed_docblock->tags['psalm-mutation-free'])) {
+            $info->capabilities = Capabilities::MUTATION_FREE;
+            $info->has_mutations_annotation = true;
+        } elseif (isset($parsed_docblock->tags['psalm-external-mutation-free'])) {
+            $info->capabilities = Capabilities::EXTERNAL_MUTATION_FREE;
+            $info->has_mutations_annotation = true;
+        } elseif (isset($parsed_docblock->tags['psalm-impure'])) {
+            $info->capabilities = Capabilities::ALL;
+            $info->has_mutations_annotation = true;
+        } elseif (isset($parsed_docblock->tags['psalm-capabilities'])) {
+            $info->capabilities = Capabilities::NONE;
+            $info->has_mutations_annotation = true;
+
+            foreach ($parsed_docblock->tags['psalm-capabilities'] as $capabilities_line) {
+                try {
+                    $info->capabilities |= Capabilities::fromList($capabilities_line);
+                } catch (CapabilitiesParseException) {
+                    // a purity type, possibly through type aliases: resolved by the scanner
+                    $info->capabilities_expressions[] = trim($capabilities_line);
+                }
+            }
+        }
+
+        if (isset($parsed_docblock->tags['psalm-purity-from-template'])) {
+            foreach ($parsed_docblock->tags['psalm-purity-from-template'] as $param) {
+                foreach (preg_split('/[\s,]+/', trim($param)) ?: [] as $token) {
+                    if ($token === '') {
+                        continue;
+                    }
+                    $info->purity_from_templates[] = $token;
+                }
+            }
+        }
+
+        if (isset($parsed_docblock->tags['no-named-arguments'])) {
+            $info->no_named_args = true;
+        }
+
+        $info->ignore_nullable_return = isset($parsed_docblock->tags['psalm-ignore-nullable-return']);
+        $info->ignore_falsable_return = isset($parsed_docblock->tags['psalm-ignore-falsable-return']);
+        $info->stub_override = isset($parsed_docblock->tags['psalm-stub-override']);
+
+        if (!empty($parsed_docblock->description)) {
+            $info->description = $parsed_docblock->description;
+        }
+
+        $info->public_api = isset($parsed_docblock->tags['psalm-api']) || isset($parsed_docblock->tags['api']);
+
+        return $info;
+    }
+
+    /**
+     * Registers the taint a docblock names. What is wrong with it is added to the issues found while scanning.
+     *
+     * @param list<CodeIssue> $scan_issues
+     */
+    public static function registerTaint(
+        Codebase $codebase,
+        string $taint_type,
+        CodeLocation $code_location,
+        array &$scan_issues,
+    ): ?int {
+        try {
+            return $codebase->getOrRegisterTaint($taint_type);
+        } catch (RuntimeException $e) {
+            $scan_issues[] = new InvalidDocblock($e->getMessage(), $code_location);
+
+            return null;
+        }
+    }
+
+    /**
+     * Reads `@psalm-taint-sink (<conditional>) $param`
+     */
+    private static function parseConditionalTaintSink(
+        string $sink,
+        FunctionDocblockComment $info,
+        CodeLocation $code_location,
+        string $cased_function_id,
+    ): void {
+        $line_parts = CommentAnalyzer::splitDocLine(trim($sink));
+
+        if (isset($line_parts[1]) && str_starts_with($line_parts[1], '$')) {
+            $info->conditional_taint_sink_params[] = [
+                'name' => $line_parts[1],
+                'type' => CommentAnalyzer::sanitizeDocblockType($line_parts[0]),
+            ];
+        } else {
+            $info->docblock_issues[] = new InvalidDocblock(
+                '@psalm-taint-sink expects 2 arguments in docblock for ' . $cased_function_id,
+                $code_location,
+            );
+        }
+    }
+
+    /**
+     * The assertions of the first of $tags the docblock has
+     *
+     * @param list<string> $tags
+     * @return list<array{type: string, param_name: string}>
+     * @psalm-capabilities read-props
+     */
+    private static function parseAssertions(ParsedDocblock $parsed_docblock, array $tags): array
+    {
+        foreach ($tags as $tag) {
+            if (!isset($parsed_docblock->tags[$tag])) {
+                continue;
+            }
+
+            $assertions = [];
+            foreach ($parsed_docblock->tags[$tag] as $assertion) {
+                $line_parts = self::sanitizeAssertionLineParts(CommentAnalyzer::splitDocLine($assertion));
+
+                $assertions[] = [
+                    'type'       => $line_parts[0],
+                    'param_name' => $line_parts[1][0] === '$' ? substr($line_parts[1], 1) : $line_parts[1],
+                ];
+            }
+
+            return $assertions;
+        }
+
+        return [];
+    }
+
+    /**
+     * Reads the taint annotations: `@psalm-taint-*`, `@psalm-assert-untainted` and those of the MediaWiki taint plugin
+     */
+    private static function parseTaintTags(
+        ParsedDocblock $parsed_docblock,
+        FunctionDocblockComment $info,
+        Codebase $codebase,
+        CodeLocation $code_location,
+        string $cased_function_id,
+    ): void {
+        if (isset($parsed_docblock->tags['psalm-taint-sink'])) {
+            foreach ($parsed_docblock->tags['psalm-taint-sink'] as $param) {
+                // a conditional type: the taints the parameter is a sink of depend on the arguments of the call
+                if (str_starts_with(trim($param), '(')) {
+                    self::parseConditionalTaintSink($param, $info, $code_location, $cased_function_id);
+
+                    continue;
+                }
+
+                $param_parts = preg_split('/\s+/', trim($param));
+                if ($param_parts === false) {
+                    throw new AssertionError(preg_last_error_msg());
+                }
+
+                if (count($param_parts) >= 2) {
+                    $t = self::registerTaint($codebase, $param_parts[0], $code_location, $info->scan_issues);
+                    if ($t !== null) {
+                        $info->taint_sink_params[] = ['name' => $param_parts[1], 'taint' => $t];
+                    }
+                } else {
+                    $info->docblock_issues[] = new InvalidDocblock(
+                        '@psalm-taint-sink expects 2 arguments in docblock for ' . $cased_function_id,
+                        $code_location,
+                    );
+                }
+            }
+        }
+
+        // support for MediaWiki taint plugin
+        if (isset($parsed_docblock->tags['param-taint'])) {
+            foreach ($parsed_docblock->tags['param-taint'] as $param) {
+                $param_parts = preg_split('/\s+/', trim($param));
+                if ($param_parts === false) {
+                    throw new AssertionError(preg_last_error_msg());
+                }
+
+                if (count($param_parts) === 2) {
+                    $taint_type = $param_parts[1];
+
+                    if (str_starts_with($taint_type, 'exec_')) {
+                        $taint_type = substr($taint_type, 5);
+                        $t = self::registerTaint($codebase, $taint_type, $code_location, $info->scan_issues);
+                        if ($t !== null) {
+                            $info->taint_sink_params[] = ['name' => $param_parts[0], 'taint' => $t];
+                        }
+                    }
+                }
+            }
+        }
+
+        if (isset($parsed_docblock->tags['psalm-taint-source'])) {
+            foreach ($parsed_docblock->tags['psalm-taint-source'] as $param) {
+                $param_parts = preg_split('/\s+/', trim($param));
+                if ($param_parts === false) {
+                    throw new AssertionError(preg_last_error_msg());
+                }
+
+                if ($param_parts[0]) {
+                    $t = self::registerTaint($codebase, $param_parts[0], $code_location, $info->scan_issues);
+                    $keys = isset($param_parts[1]) && str_starts_with($param_parts[1], 'return[')
+                        ? self::parseReturnKeys($param_parts[1])
+                        : null;
+                    if ($keys === []) {
+                        // the whole of what is returned is a source, as the annotation says no key it can read
+                        $info->docblock_issues[] = new InvalidDocblock(
+                            '@psalm-taint-source expects keys of the return like return[\'key\'] in docblock for '
+                                . $cased_function_id,
+                            $code_location,
+                        );
+                    }
+
+                    if ($t !== null) {
+                        if ($keys !== null && $keys !== []) {
+                            $info->taint_source_keys[] = [$keys, $t];
+                        } else {
+                            $info->taint_source_types |= $t;
+                        }
+                    }
+                } else {
+                    $info->docblock_issues[] = new InvalidDocblock(
+                        '@psalm-taint-source expects 1 argument in docblock for ' . $cased_function_id,
+                        $code_location,
+                    );
+                }
+            }
+        } elseif (isset($parsed_docblock->tags['return-taint'])) {
+            // support for MediaWiki taint plugin
+            foreach ($parsed_docblock->tags['return-taint'] as $param) {
+                $param_parts = preg_split('/\s+/', trim($param));
+                if ($param_parts === false) {
+                    throw new AssertionError(preg_last_error_msg());
+                }
+
+                if ($param_parts[0]) {
+                    if ($param_parts[0] !== 'none') {
+                        $t = self::registerTaint($codebase, $param_parts[0], $code_location, $info->scan_issues);
+                        if ($t !== null) {
+                            $info->taint_source_types |= $t;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (isset($parsed_docblock->tags['psalm-taint-unescape'])) {
+            foreach ($parsed_docblock->tags['psalm-taint-unescape'] as $param) {
+                $param = trim($param);
+                if ($param === '') {
+                    $info->docblock_issues[] = new InvalidDocblock(
+                        '@psalm-taint-unescape expects 1 argument in docblock for ' . $cased_function_id,
+                        $code_location,
+                    );
+                } else {
+                    $info->added_taints[] = $param;
+                }
+            }
+        }
+
+        if (isset($parsed_docblock->tags['psalm-taint-escape'])) {
+            foreach ($parsed_docblock->tags['psalm-taint-escape'] as $param) {
+                $param = trim($param);
+                if ($param === '') {
+                    $info->docblock_issues[] = new InvalidDocblock(
+                        '@psalm-taint-escape expects 1 argument in docblock for ' . $cased_function_id,
+                        $code_location,
+                    );
+                } elseif ($param[0] === '(') {
+                    $line_parts = CommentAnalyzer::splitDocLine($param);
+
+                    $info->conditionally_removed_taints[] = CommentAnalyzer::sanitizeDocblockType($line_parts[0]);
+                } else {
+                    $info->removed_taints[] = explode(' ', $param)[0];
+                }
+            }
+        }
+
+        if (isset($parsed_docblock->tags['psalm-assert-untainted'])) {
+            foreach ($parsed_docblock->tags['psalm-assert-untainted'] as $param) {
+                $param = trim($param);
+
+                $info->assert_untainted_params[] = ['name' => $param];
+            }
+        }
+
+        if (isset($parsed_docblock->tags['psalm-taint-specialize'])) {
+            $info->specialize_call = true;
+        }
+    }
+
+    /**
+     * @param array<int, string> $params
+     * @throws IncorrectDocblockException
+     */
+    private static function extractParams(
+        PhpParser\Comment\Doc $comment,
+        array $params,
+        FunctionDocblockComment $info,
+        CodeLocation $code_location,
+        string $cased_function_id,
+    ): void {
+        $comment_text = $comment->getText();
+
+        foreach ($params as $offset => $param) {
+            $line_parts = CommentAnalyzer::splitDocLine($param);
+
+            if (count($line_parts) === 1 && isset($line_parts[0][0]) && $line_parts[0][0] === '$') {
+                continue;
+            }
+
+            if (count($line_parts) > 1) {
+                if (preg_match('/^&?(\.\.\.)?&?\$[A-Za-z0-9_\x80-\xff]+[,;]?$/', $line_parts[1])
+                    && ($line_parts[0] === '' || $line_parts[0][0] !== '{')
+                ) {
+                    $line_parts[1] = str_replace('&', '', $line_parts[1]);
+
+                    $line_parts[1] = (string) preg_replace('/[,;]$/', '', $line_parts[1], 1);
+
+                    $end = $offset + strlen($line_parts[0]);
+
+                    $line_parts[0] = CommentAnalyzer::sanitizeDocblockType($line_parts[0]);
+
+                    if ($line_parts[0] === ''
+                        || ($line_parts[0][0] === '$'
+                            && !preg_match('/^\$this *(\||$)/', $line_parts[0]))
+                    ) {
+                        throw new IncorrectDocblockException('Misplaced variable');
+                    }
+
+                    $info_param = [
+                        'name' => trim($line_parts[1]),
+                        'type' => $line_parts[0],
+                        'line_number' => $comment->getStartLine() + substr_count(
+                            $comment_text,
+                            "\n",
+                            0,
+                            $offset - $comment->getStartFilePos(),
+                        ),
+                        'start' => $offset,
+                        'end' => $end,
+                    ];
+
+                    if (isset($line_parts[1]) && isset($line_parts[2])) {
+                        // the description follows the name as written: `& $x`, or on the next line
+                        $description = (string) preg_replace(
+                            '/^[\s*]*&?[\s*]*\S+/',
+                            '',
+                            substr($param, $end - $offset),
+                        );
+                        $info_param['description'] = trim($description);
+                        // Handle multiline description.
+                        $info_param['description'] = (string) preg_replace(
+                            '/\\n \\*\\s+/um',
+                            ' ',
+                            $info_param['description'],
+                        );
+                    }
+
+                    $info->params[] = $info_param;
+                }
+            } else {
+                $info->docblock_issues[] = new InvalidDocblock(
+                    'Badly-formatted @param in docblock for ' . $cased_function_id,
+                    $code_location,
+                );
+            }
+        }
+    }
+
+    /**
+     * The keys of `return['key']['other']` (quoted with ' or ", or digits), outermost first, or [] if it isn't
+     * that
+     *
+     * @return list<string>
+     * @psalm-pure
+     */
+    private static function parseReturnKeys(string $target): array
+    {
+        if (preg_match('/^return(?:\[(?:\'[^\'\]]*\'|"[^"\]]*"|\d+)\])+$/', $target) !== 1) {
+            return [];
+        }
+
+        // `'a']['b'`, split on `][`: the keys can't hold `]`
+        $keys = [];
+        foreach (explode('][', substr($target, strlen('return['), -1)) as $key) {
+            $keys[] = str_starts_with($key, '\'') || str_starts_with($key, '"') ? substr($key, 1, -1) : $key;
+        }
+
+        return $keys;
+    }
+
+    /**
+     * @psalm-pure
+     * @param list<string> $line_parts
+     * @return array{string, string}&array<int<0, max>, string> $line_parts
+     */
+    private static function sanitizeAssertionLineParts(array $line_parts): array
+    {
+        if (count($line_parts) < 2 || !str_contains($line_parts[1], '$')) {
+            throw new IncorrectDocblockException('Misplaced variable');
+        }
+
+        $line_parts[0] = CommentAnalyzer::sanitizeDocblockType($line_parts[0]);
+
+        if ($line_parts[1][0] === '$') {
+            $param_name_parts = explode('->', $line_parts[1]);
+
+            foreach ($param_name_parts as $i => $param_name_part) {
+                if (str_ends_with($param_name_part, '()')) {
+                    $param_name_parts[$i] = strtolower($param_name_part);
+                }
+            }
+
+            $line_parts[1] = implode('->', $param_name_parts);
+        }
+
+        return $line_parts;
+    }
+
+    /**
+     * @param array<int, string> $return_specials
+     */
+    private static function extractReturnType(
+        PhpParser\Comment\Doc $comment,
+        array $return_specials,
+        FunctionDocblockComment $info,
+        CodeLocation $code_location,
+        string $cased_function_id,
+    ): void {
+        foreach ($return_specials as $offset => $return_block) {
+            $return_lines = explode("\n", $return_block);
+
+            if (trim($return_lines[0]) === '') {
+                return;
+            }
+
+            $return_block = trim($return_block);
+
+            if ($return_block === '') {
+                return;
+            }
+
+            $line_parts = CommentAnalyzer::splitDocLine($return_block);
+
+            if ($line_parts[0][0] !== '{') {
+                if ($line_parts[0][0] === '$'
+                    && !preg_match('/^\$this *(\||$)/', CommentAnalyzer::sanitizeDocblockType($line_parts[0]))
+                ) {
+                    throw new IncorrectDocblockException('Misplaced variable');
+                }
+
+                $end = $offset + strlen($line_parts[0]);
+
+                $line_parts[0] = CommentAnalyzer::sanitizeDocblockType($line_parts[0]);
+
+                $info->return_type = array_shift($line_parts);
+                $info->return_type_description = $line_parts ? implode(' ', $line_parts) : null;
+
+                $info->return_type_line_number
+                    = $comment->getStartLine() + substr_count(
+                        $comment->getText(),
+                        "\n",
+                        0,
+                        $offset - $comment->getStartFilePos(),
+                    );
+                $info->return_type_start = $offset;
+                $info->return_type_end = $end;
+            } else {
+                $info->docblock_issues[] = new InvalidDocblock(
+                    'Badly-formatted @param in docblock for ' . $cased_function_id,
+                    $code_location,
+                );
+            }
+
+            break;
+        }
+    }
+
+    /**
+     * @throws DocblockParseException if a duplicate is found
+     * @psalm-mutation-free
+     */
+    private static function checkDuplicatedTags(ParsedDocblock $parsed_docblock): void
+    {
+        if (count($parsed_docblock->tags['return'] ?? []) > 1
+            || count($parsed_docblock->tags['psalm-return'] ?? []) > 1
+            || count($parsed_docblock->tags['phpstan-return'] ?? []) > 1
+        ) {
+            throw new DocblockParseException('Found duplicated @return or prefixed @return tag');
+        }
+
+        self::checkDuplicatedParams($parsed_docblock->tags['param'] ?? []);
+        self::checkDuplicatedParams($parsed_docblock->tags['psalm-param'] ?? []);
+        self::checkDuplicatedParams($parsed_docblock->tags['phpstan-param'] ?? []);
+    }
+
+    /**
+     * @param array<int, string> $param
+     * @throws DocblockParseException  if a duplicate is found
+     * @psalm-pure
+     */
+    private static function checkDuplicatedParams(array $param): void
+    {
+        $list_names = self::extractAllParamNames($param);
+
+        if (count($list_names) !== count(array_unique($list_names))) {
+            throw new DocblockParseException('Found duplicated @param or prefixed @param tag');
+        }
+    }
+
+    /**
+     * @param array<int, string> $lines
+     * @return list<string>
+     * @psalm-pure
+     */
+    private static function extractAllParamNames(array $lines): array
+    {
+        $names = [];
+
+        foreach ($lines as $line) {
+            $split_by_dollar = explode('$', $line, 2);
+            if (count($split_by_dollar) > 1) {
+                $split_by_space = explode(' ', $split_by_dollar[1], 2);
+                $names[] = $split_by_space[0];
+            }
+        }
+
+        return $names;
+    }
+
+    private static function checkUnexpectedTags(
+        ParsedDocblock $parsed_docblock,
+        FunctionDocblockComment $info,
+        PhpParser\Comment\Doc $comment,
+    ): void {
+        if (isset($parsed_docblock->tags['psalm-import-type'])) {
+            $info->unexpected_tags['psalm-import-type']['lines'] = self::tagOffsetsToLines(
+                array_keys($parsed_docblock->tags['psalm-import-type']),
+                $comment,
+            );
+        }
+
+        if (isset($parsed_docblock->combined_tags['var'])) {
+            $info->unexpected_tags['var'] = [
+                'lines' => self::tagOffsetsToLines(
+                    array_keys($parsed_docblock->combined_tags['var']),
+                    $comment,
+                ),
+                'suggested_replacement' => 'param',
+            ];
+        }
+
+        if (isset($parsed_docblock->tags['psalm-consistent-constructor'])) {
+            $info->unexpected_tags['psalm-consistent-constructor'] = [
+                'lines' => self::tagOffsetsToLines(
+                    array_keys($parsed_docblock->tags['psalm-consistent-constructor']),
+                    $comment,
+                ),
+                'suggested_replacement' => 'psalm-consistent-constructor on a class level',
+            ];
+        }
+    }
+
+    /**
+     * @param list<int> $offsets
+     * @return list<int>
+     * @psalm-pure
+     */
+    private static function tagOffsetsToLines(array $offsets, PhpParser\Comment\Doc $comment): array
+    {
+        $ret = [];
+        foreach ($offsets as $offset) {
+            $ret[] = self::docblockLineNumber($comment, $offset);
+        }
+        return $ret;
+    }
+
+    /**
+     * @psalm-pure
+     */
+    private static function docblockLineNumber(PhpParser\Comment\Doc $comment, int $offset): int
+    {
+        return $comment->getStartLine() + substr_count(
+            $comment->getText(),
+            "\n",
+            0,
+            $offset - $comment->getStartFilePos(),
+        );
+    }
+
+    /**
+     * Parses one `<type> $name` docblock line, the shape shared by `@param-out` and
+     * `@param-closure-this`.
+     *
+     * @param  'param-out'|'param-closure-this' $tag
+     * @return array{name:string, type:string, line_number: int}|null
+     *         null when the line carries no type, or is not in the `<type> $name` shape
+     */
+    private static function parseTypeAndVariableTag(
+        string $tag,
+        string $param,
+        int $offset,
+        PhpParser\Comment\Doc $comment,
+        string $comment_text,
+        string $cased_function_id,
+        CodeLocation $code_location,
+        FunctionDocblockComment $info,
+    ): ?array {
+        $line_parts = CommentAnalyzer::splitDocLine($param);
+
+        if (count($line_parts) === 1 && isset($line_parts[0][0]) && $line_parts[0][0] === '$') {
+            return null;
+        }
+
+        if (count($line_parts) <= 1) {
+            $info->docblock_issues[] = new InvalidDocblock(
+                'Badly-formatted @' . $tag . ' in docblock for ' . $cased_function_id,
+                $code_location,
+            );
+
+            return null;
+        }
+
+        if (!preg_match('/^(\.\.\.)?&?\$[A-Za-z0-9_\x80-\xff]+[,;]?$/', $line_parts[1])
+            || $line_parts[0][0] === '{'
+        ) {
+            return null;
+        }
+
+        // the name is matched against the parameter's own name later, which carries neither
+        // marker; `...` comes first so that `...&$name` also loses its `&`
+        if (str_starts_with($line_parts[1], '...')) {
+            $line_parts[1] = substr($line_parts[1], 3);
+        }
+
+        if ($line_parts[1][0] === '&') {
+            $line_parts[1] = substr($line_parts[1], 1);
+        }
+
+        $line_parts[0] = CommentAnalyzer::sanitizeDocblockType($line_parts[0]);
+
+        if ($line_parts[0] === ''
+            || ($line_parts[0][0] === '$' && !preg_match('/^\$this *(\||$)/', $line_parts[0]))
+        ) {
+            throw new IncorrectDocblockException('Misplaced variable');
+        }
+
+        $line_parts[1] = (string) preg_replace('/[,;]$/', '', $line_parts[1], 1);
+
+        return [
+            'name' => trim($line_parts[1]),
+            'type' => str_replace("\n", '', $line_parts[0]),
+            'line_number' => $comment->getStartLine() + substr_count(
+                $comment_text,
+                "\n",
+                0,
+                $offset - $comment->getStartFilePos(),
+            ),
+        ];
+    }
+}

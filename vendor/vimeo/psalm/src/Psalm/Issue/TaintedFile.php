@@ -1,0 +1,13 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Issue;
+
+/**
+ * @api
+ */
+final class TaintedFile extends TaintedInput
+{
+    public const SHORTCODE = 255;
+}

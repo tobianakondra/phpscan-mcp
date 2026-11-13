@@ -1,0 +1,294 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\LaravelPlugin\Handlers\Rules;
+
+use PhpParser\Node\Arg;
+use PhpParser\Node\Expr;
+use PhpParser\Node\Expr\BinaryOp;
+use PhpParser\Node\Expr\ConstFetch;
+use PhpParser\Node\Expr\FuncCall;
+use PhpParser\Node\Expr\UnaryMinus;
+use PhpParser\Node\Expr\UnaryPlus;
+use PhpParser\Node\Identifier;
+use PhpParser\Node\Name;
+use PhpParser\Node\Scalar;
+use Psalm\Codebase;
+use Psalm\CodeLocation;
+use Psalm\Plugin\EventHandler\AfterExpressionAnalysisInterface;
+use Psalm\Plugin\EventHandler\Event\AfterExpressionAnalysisEvent;
+use Psalm\StatementsSource;
+use Psalm\Type\TaintKind;
+use Psalm\Type\Union;
+
+/**
+ * Detects timing-unsafe string comparisons involving secrets (CWE-208).
+ *
+ * Comparing a secret (user_secret/system_secret taint) with ===, ==, !==, !=, <, <=, >,
+ * >=, <=>, strcmp(), strcasecmp(), strncmp(), strncasecmp(), or substr_compare() leaks the
+ * value character-by-character via response-time differences. Use hash_equals().
+ *
+ * The handler adds taint sinks at those operators/functions; a secret-tainted operand
+ * flowing in makes Psalm emit TaintedUserSecret/TaintedSystemSecret.
+ *
+ * Per-kind emission is expected, not a bug: the sink matches USER_SECRET | SYSTEM_SECRET,
+ * and Psalm's taint engine reports once per matching kind. A value carrying both taints
+ * (e.g. a decrypt() result, whose stub unescapes both) therefore raises BOTH issues at the
+ * same site. We cannot collapse them here: at AfterExpressionAnalysis the taint is not yet
+ * resolved (that happens later in connectSinksAndSources), so we don't know which kind — if
+ * any — will reach the sink. Emitting a single combined finding would mean abandoning the
+ * taint-sink design and losing the data-flow trace, so the duplicate-kind reports are kept.
+ *
+ * Upstream limitation: Psalm 7 hardcodes the per-kind message in
+ * TaintFlowGraph::connectSinksAndSources(), so until vimeo/psalm#11762 lands the text
+ * is the default "Detected tainted user secret leaking" rather than CWE-208-specific.
+ * The flow still pinpoints the comparison site correctly.
+ *
+ * @see https://cwe.mitre.org/data/definitions/208.html
+ * @see https://github.com/vimeo/psalm/issues/11762
+ */
+final class TimingUnsafeComparisonHandler implements AfterExpressionAnalysisInterface
+{
+    /** Taint mask for secrets that require constant-time comparison */
+    private const SECRET_TAINTS = TaintKind::USER_SECRET | TaintKind::SYSTEM_SECRET;
+
+    /**
+     * Timing-unsafe string-comparison functions (all C-level byte-by-byte), mapped to the two
+     * string comparands as `[paramName, canonicalPosition]`. Resolving by name AND position lets
+     * us find the secret operand even when the call uses named arguments in any order (e.g.
+     * `strncmp(length: 8, string1: $a, string2: $secret)` puts the secret at syntactic args[2]).
+     *
+     * @var array<string, array{array{string, int}, array{string, int}}>
+     */
+    private const TIMING_UNSAFE_FUNCTIONS = [
+        'strcmp' => [['string1', 0], ['string2', 1]],
+        'strcasecmp' => [['string1', 0], ['string2', 1]],
+        'strncmp' => [['string1', 0], ['string2', 1]],
+        'strncasecmp' => [['string1', 0], ['string2', 1]],
+        'substr_compare' => [['haystack', 0], ['needle', 1]],
+    ];
+
+    /** @inheritDoc */
+    #[\Override]
+    public static function afterExpressionAnalysis(AfterExpressionAnalysisEvent $event): ?bool
+    {
+        $codebase = $event->getCodebase();
+
+        // Cheap property read: runs per expression, so the suppression-aware
+        // tracksTaintFlow() check waits until a comparison actually matches.
+        if (!$codebase->taint_flow_graph instanceof \Psalm\Internal\Codebase\TaintFlowGraph) {
+            return null;
+        }
+
+        $expr = $event->getExpr();
+        $source = $event->getStatementsSource();
+
+        // BinaryOp gate first: this method runs for every expression, so the cheap check
+        // skips the FuncCall branch for the BinaryOp majority and the narrower instanceofs
+        // for everything else. `<=>` and the relational operators (<, <=, >, >=) count too —
+        // each leaks the secret's lexicographic ordering byte-by-byte just like strcmp().
+        if ($expr instanceof BinaryOp) {
+            if ($expr instanceof BinaryOp\Identical
+                || $expr instanceof BinaryOp\Equal
+                || $expr instanceof BinaryOp\NotIdentical
+                || $expr instanceof BinaryOp\NotEqual
+                || $expr instanceof BinaryOp\Spaceship
+                || $expr instanceof BinaryOp\Smaller
+                || $expr instanceof BinaryOp\SmallerOrEqual
+                || $expr instanceof BinaryOp\Greater
+                || $expr instanceof BinaryOp\GreaterOrEqual
+            ) {
+                self::addSinksForOperands(
+                    $codebase,
+                    $source,
+                    $expr,
+                    $expr->left,
+                    $expr->right,
+                    $source->getNodeTypeProvider()->getType($expr->left),
+                    $source->getNodeTypeProvider()->getType($expr->right),
+                );
+            }
+
+            return null;
+        }
+
+        // strcmp() and variants leak partial ordering even when the caller only checks `=== 0`.
+        // `count(args) >= 2` precedes `toLowerString()` so unrelated calls skip the lowercasing.
+        if ($expr instanceof FuncCall
+            && \count($expr->args) >= 2
+            && $expr->name instanceof Name
+        ) {
+            $operandSpecs = self::TIMING_UNSAFE_FUNCTIONS[$expr->name->toLowerString()] ?? null;
+
+            if ($operandSpecs !== null) {
+                [$leftSpec, $rightSpec] = $operandSpecs;
+                $leftExpr = self::resolveArgument($expr->args, $leftSpec[0], $leftSpec[1]);
+                $rightExpr = self::resolveArgument($expr->args, $rightSpec[0], $rightSpec[1]);
+
+                if ($leftExpr instanceof Expr && $rightExpr instanceof Expr) {
+                    self::addSinksForOperands(
+                        $codebase,
+                        $source,
+                        $expr,
+                        $leftExpr,
+                        $rightExpr,
+                        $source->getNodeTypeProvider()->getType($leftExpr),
+                        $source->getNodeTypeProvider()->getType($rightExpr),
+                    );
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Resolve a function argument by parameter name first, then by positional index, so a watched
+     * comparand is found regardless of whether the call passes it positionally or as a named
+     * argument. Returns null when the argument is absent, unpacked (`...$args`), or preceded by a
+     * placeholder (`...`, `?`), where the position can no longer be determined statically.
+     *
+     * @param array<Arg|\PhpParser\Node\VariadicPlaceholder|\PhpParser\Node\ArgPlaceholder> $args
+     *
+     * @psalm-mutation-free
+     */
+    private static function resolveArgument(array $args, string $name, int $position): ?Expr
+    {
+        // A named argument matching the parameter wins outright (it may appear in any order).
+        foreach ($args as $arg) {
+            if ($arg instanceof Arg && $arg->name instanceof Identifier && $arg->name->name === $name) {
+                return $arg->value;
+            }
+        }
+
+        // Otherwise count only positional (unnamed) arguments in source order. PHP requires
+        // positional args before named ones, so the n-th unnamed arg is at parameter position n.
+        $index = 0;
+        foreach ($args as $arg) {
+            // A placeholder (`...`, `?`) or an unpacked argument leaves positions unknown — give up.
+            if (!$arg instanceof Arg || $arg->unpack) {
+                return null;
+            }
+
+            if ($arg->name instanceof \PhpParser\Node\Identifier) {
+                continue;
+            }
+
+            if ($index === $position) {
+                return $arg->value;
+            }
+
+            $index++;
+        }
+
+        return null;
+    }
+
+    /**
+     * Add taint sinks for both operands of a timing-unsafe comparison: each operand's data
+     * flow parents connect to a sink matching user_secret|system_secret, so a secret-tainted
+     * operand gets reported.
+     *
+     * A literal operand (scalar / null / true / false) is the known half of the comparison and
+     * leaks nothing, so shapes like `$secret === null` or `$secret === ''` are skipped to avoid
+     * false positives on idiomatic checks.
+     */
+    private static function addSinksForOperands(
+        Codebase $codebase,
+        StatementsSource $source,
+        Expr $comparisonExpr,
+        Expr $leftExpr,
+        Expr $rightExpr,
+        ?Union $leftType,
+        ?Union $rightType,
+    ): void {
+        if (self::isLiteralOperand($leftExpr) || self::isLiteralOperand($rightExpr)) {
+            return;
+        }
+
+        // False where TaintedInput is suppressed, matching core sinks.
+        if (!$codebase->tracksTaintFlow($source)) {
+            return;
+        }
+
+        $codeLocation = new CodeLocation($source, $comparisonExpr);
+        $locationId = \strtolower($codeLocation->file_name)
+            . ':' . $codeLocation->raw_file_start
+            . '-' . $codeLocation->raw_file_end;
+
+        self::addSinkForType($codebase, $source, $leftType, 'timing-comparison-left', $locationId, $codeLocation);
+        self::addSinkForType($codebase, $source, $rightType, 'timing-comparison-right', $locationId, $codeLocation);
+    }
+
+    /**
+     * Whether the operand is a developer-written constant with no runtime data flow. Accepted:
+     * int/float/interpolation-free string scalars (heredoc/nowdoc without `{$x}` included), magic
+     * constants, `null`/`true`/`false`, unary `+`/`-` on a literal, and concat of literals on both
+     * sides.
+     *
+     * Class constants (`Foo::BAR`) and enum cases are NOT exempted: an attacker-controlled
+     * indirection could resolve to the same constant, so err on a rare FP over disarming the rule.
+     *
+     * Matching by AST shape (not inferred type) stays robust against Psalm narrowing `string $x`
+     * to `''` after a prior check — those still carry real data flow and must be flagged.
+     */
+    private static function isLiteralOperand(Expr $expr): bool
+    {
+        if ($expr instanceof Scalar\LNumber
+            || $expr instanceof Scalar\DNumber
+            || $expr instanceof Scalar\String_
+            || $expr instanceof Scalar\MagicConst
+        ) {
+            return true;
+        }
+
+        if ($expr instanceof ConstFetch) {
+            $name = $expr->name->toLowerString();
+
+            return in_array($name, ['null', 'true', 'false'], true);
+        }
+
+        if ($expr instanceof UnaryMinus || $expr instanceof UnaryPlus) {
+            return self::isLiteralOperand($expr->expr);
+        }
+
+        if ($expr instanceof BinaryOp\Concat) {
+            return self::isLiteralOperand($expr->left) && self::isLiteralOperand($expr->right);
+        }
+
+        return false;
+    }
+
+    /**
+     * Create one sink per operand side (avoids duplicate reports, keeps the graph compact) and
+     * connect all the operand's data flow parents to it. The sink matches USER_SECRET|SYSTEM_SECRET,
+     * so only secret-tainted data triggers an issue — ordinary input taint is unaffected.
+     */
+    private static function addSinkForType(
+        Codebase $codebase,
+        StatementsSource $source,
+        ?Union $type,
+        string $sinkLabel,
+        string $locationId,
+        CodeLocation $codeLocation,
+    ): void {
+        if (!$type instanceof Union || $type->parent_nodes === []) {
+            return;
+        }
+
+        // The sink id doubles as the label shown in taint flow traces.
+        // Keeping locationId in it is still required: sinks are keyed by id in the graph, so two
+        // comparison sites reusing the bare $sinkLabel would collide and drop one site's sink.
+        $sinkId = $sinkLabel . '-' . $locationId;
+
+        $sink = $codebase->addTaintSink($sinkId, $codeLocation, self::SECRET_TAINTS);
+        if (!$sink instanceof \Psalm\Internal\DataFlow\DataFlowNode) {
+            return;
+        }
+
+        foreach ($type->parent_nodes as $parentNode) {
+            $codebase->addTaintPath($source, $parentNode, $sink, 'timing-comparison');
+        }
+    }
+}

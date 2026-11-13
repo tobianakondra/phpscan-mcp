@@ -1,0 +1,700 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Internal\FileManipulation;
+
+use PhpParser;
+use PhpParser\Node\Expr\ArrowFunction;
+use PhpParser\Node\Expr\Closure;
+use PhpParser\Node\Stmt\ClassMethod;
+use PhpParser\Node\Stmt\Function_;
+use Psalm\DocComment;
+use Psalm\FileManipulation;
+use Psalm\Internal\Analyzer\CommentAnalyzer;
+use Psalm\Internal\Analyzer\ProjectAnalyzer;
+use Psalm\Internal\Scanner\ParsedDocblock;
+use Psalm\Internal\Type\PurityWildcardPaths;
+use Psalm\Storage\Capabilities;
+
+use function array_key_exists;
+use function array_reduce;
+use function array_slice;
+use function count;
+use function ctype_space;
+use function implode;
+use function is_string;
+use function ltrim;
+use function preg_match;
+use function reset;
+use function rtrim;
+use function str_replace;
+use function str_split;
+use function strlen;
+use function strpos;
+use function strrpos;
+use function substr;
+
+/**
+ * @internal
+ * @psalm-import-type CapabilitySet from Capabilities
+ */
+final class FunctionDocblockManipulator
+{
+    /**
+     * Manipulators keyed by function-like start offset
+     *
+     * @var array<string, array<int, FunctionDocblockManipulator>>
+     */
+    private static array $manipulators = [];
+
+    private readonly int $docblock_start;
+
+    private readonly int $docblock_end;
+
+    private readonly int $return_typehint_area_start;
+
+    private ?int $return_typehint_colon_start = null;
+
+    private ?int $return_typehint_start = null;
+
+    private ?int $return_typehint_end = null;
+
+    private ?string $new_php_return_type = null;
+
+    private bool $return_type_is_php_compatible = false;
+
+    private ?string $new_phpdoc_return_type = null;
+
+    private ?string $new_psalm_return_type = null;
+
+    /** @var array<string, string> */
+    private array $new_php_param_types = [];
+
+    /** @var array<string, string> */
+    private array $new_phpdoc_param_types = [];
+
+    /** @var array<string, string> */
+    private array $new_psalm_param_types = [];
+
+    private string $indentation;
+
+    private ?string $return_type_description = null;
+
+    /** @var array<string, int> */
+    private array $param_offsets = [];
+
+    /** @var array<string, array{int, int}> */
+    private array $param_typehint_offsets = [];
+
+    /**
+     * A bitmask of {@see Capabilities} constants
+     *
+     * @var CapabilitySet|null
+     */
+    private ?int $capabilities = null;
+
+    /** @var list<string> */
+    private array $throwsExceptions = [];
+
+    /**
+     * Where to give the parameters the `_` purity (param name => paths, {@see PurityWildcardPaths})
+     *
+     * @var array<string, list<string>>
+     */
+    private array $purity_wildcards = [];
+
+    public static function getForFunction(
+        ProjectAnalyzer $project_analyzer,
+        string $file_path,
+        Closure|Function_|ClassMethod|ArrowFunction $stmt,
+    ): FunctionDocblockManipulator {
+        $function_start = (int) $stmt->getAttribute('startFilePos');
+
+        if (isset(self::$manipulators[$file_path][$function_start])) {
+            return self::$manipulators[$file_path][$function_start];
+        }
+
+        $manipulator
+            = self::$manipulators[$file_path][$function_start]
+            = new self($file_path, $stmt, $project_analyzer);
+
+        return $manipulator;
+    }
+
+    private function __construct(
+        string $file_path,
+        private readonly Closure|Function_|ClassMethod|ArrowFunction $stmt,
+        ProjectAnalyzer $project_analyzer,
+    ) {
+        $docblock = $stmt->getDocComment();
+        $this->docblock_start = $docblock
+            ? $docblock->getStartFilePos()
+            : (int)$stmt->getAttribute('startFilePos');
+        $this->docblock_end = (int)$stmt->getAttribute('startFilePos');
+        $function_start = (int)$stmt->getAttribute('startFilePos');
+        $function_end = (int)$stmt->getAttribute('endFilePos');
+
+        $attributes = $stmt->getAttrGroups();
+        foreach ($attributes as $attribute) {
+            // if we have attribute groups, we need to consider that the function starts after them
+            if ((int) $attribute->getAttribute('endFilePos') > $function_start) {
+                $function_start = (int) $attribute->getAttribute('endFilePos');
+            }
+        }
+
+        foreach ($stmt->params as $param) {
+            if ($param->var instanceof PhpParser\Node\Expr\Variable
+                && is_string($param->var->name)
+            ) {
+                $this->param_offsets[$param->var->name] = (int) $param->getAttribute('startFilePos');
+
+                if ($param->type) {
+                    $this->param_typehint_offsets[$param->var->name] = [
+                        (int) $param->type->getAttribute('startFilePos'),
+                        (int) $param->type->getAttribute('endFilePos') + 1,
+                    ];
+                }
+            }
+        }
+
+        $codebase = $project_analyzer->getCodebase();
+
+        $file_contents = $codebase->getFileContents($file_path);
+
+        $last_arg_position = $stmt->params
+            ? (int) $stmt->params[count($stmt->params) - 1]->getAttribute('endFilePos') + 1
+            : null;
+
+        if ($stmt instanceof Closure && $stmt->uses) {
+            $last_arg_position = (int) $stmt->uses[count($stmt->uses) - 1]->getAttribute('endFilePos') + 1;
+        }
+
+        $end_bracket_position = (int) strpos($file_contents, ')', $last_arg_position ?: $function_start);
+
+        $this->return_typehint_area_start = $end_bracket_position + 1;
+
+        $function_code = substr($file_contents, $function_start, $function_end - $function_start);
+
+        $function_code_after_bracket = substr($function_code, $end_bracket_position + 1 - $function_start);
+
+        // do a little parsing here
+        $chars = str_split($function_code_after_bracket);
+
+        $in_single_line_comment = $in_multi_line_comment = false;
+
+        for ($i = 0, $iMax = count($chars); $i < $iMax; ++$i) {
+            $char = $chars[$i];
+
+            switch ($char) {
+                case "\n":
+                    $in_single_line_comment = false;
+                    continue 2;
+
+                case ':':
+                    if ($in_multi_line_comment || $in_single_line_comment) {
+                        continue 2;
+                    }
+
+                    $this->return_typehint_colon_start = $i + $end_bracket_position + 1;
+
+                    continue 2;
+
+                case '/':
+                    if ($in_multi_line_comment || $in_single_line_comment) {
+                        continue 2;
+                    }
+
+                    if ($chars[$i + 1] === '*') {
+                        $in_multi_line_comment = true;
+                        ++$i;
+                    }
+
+                    if ($chars[$i + 1] === '/') {
+                        $in_single_line_comment = true;
+                        ++$i;
+                    }
+
+                    continue 2;
+
+                case '*':
+                    if ($in_single_line_comment) {
+                        continue 2;
+                    }
+
+                    if ($chars[$i + 1] === '/') {
+                        $in_multi_line_comment = false;
+                        ++$i;
+                    }
+
+                    continue 2;
+
+                case '{':
+                    if ($in_multi_line_comment || $in_single_line_comment) {
+                        continue 2;
+                    }
+
+                    break 2;
+
+                case '=':
+                    if ($in_multi_line_comment || $in_single_line_comment) {
+                        continue 2;
+                    }
+                    break 2;
+
+                case '?':
+                    if ($in_multi_line_comment || $in_single_line_comment) {
+                        continue 2;
+                    }
+
+                    $this->return_typehint_start = $i + $end_bracket_position + 1;
+                    break;
+            }
+
+            if ($in_multi_line_comment || $in_single_line_comment) {
+                continue;
+            }
+
+            if ($chars[$i] === '\\' || preg_match('/\w/', $char)) {
+                if ($this->return_typehint_start === null) {
+                    $this->return_typehint_start = $i + $end_bracket_position + 1;
+                }
+
+                if (!isset($chars[$i + 1]) || ($chars[$i + 1] !== '\\' && !preg_match('/[\w]/', $chars[$i + 1]))) {
+                    $this->return_typehint_end = $i + $end_bracket_position + 2;
+
+                    $next = $i + 1;
+                    while (isset($chars[$next]) && ctype_space($chars[$next])) {
+                        ++$next;
+                    }
+
+                    if (!isset($chars[$next]) || ($chars[$next] !== '|' && $chars[$next] !== '&')) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        $preceding_newline_pos = strrpos($file_contents, "\n", $this->docblock_end - strlen($file_contents));
+
+        if ($preceding_newline_pos === false) {
+            $this->indentation = '';
+
+            return;
+        }
+
+        $first_line = substr($file_contents, $preceding_newline_pos + 1, $this->docblock_end - $preceding_newline_pos);
+
+        $this->indentation = str_replace(ltrim($first_line), '', $first_line);
+    }
+
+    /**
+     * Sets the new return type
+     *
+     * @psalm-external-mutation-free
+     */
+    public function setReturnType(
+        ?string $php_type,
+        string $new_type,
+        string $phpdoc_type,
+        bool $is_php_compatible,
+        ?string $description,
+    ): void {
+        $new_type = str_replace(['<mixed, mixed>', '<array-key, mixed>'], '', $new_type);
+
+        $this->new_php_return_type = $php_type;
+        $this->new_phpdoc_return_type = $phpdoc_type;
+        $this->new_psalm_return_type = $new_type;
+        $this->return_type_is_php_compatible = $is_php_compatible;
+        $this->return_type_description = $description;
+    }
+
+    /**
+     * Sets a new param type
+     *
+     * @psalm-external-mutation-free
+     */
+    public function setParamType(
+        string $param_name,
+        ?string $php_type,
+        string $new_type,
+        string $phpdoc_type,
+    ): void {
+        $new_type = str_replace(['<mixed, mixed>', '<array-key, mixed>', '<never, never>'], '', $new_type);
+
+        if ($php_type === 'static') {
+            $php_type = '';
+        }
+        if ($php_type) {
+            $this->new_php_param_types[$param_name] = $php_type;
+        }
+
+        if ($php_type !== $phpdoc_type) {
+            $this->new_phpdoc_param_types[$param_name] = $phpdoc_type;
+        }
+        if ($php_type !== $new_type && $phpdoc_type !== $new_type) {
+            $this->new_psalm_param_types[$param_name] = $new_type;
+        }
+    }
+
+    /**
+     * Gets a new docblock given the existing docblock, if one exists, and the updated return types
+     * and/or parameters
+     */
+    private function getDocblock(): string
+    {
+        $docblock = $this->stmt->getDocComment();
+
+        if ($docblock) {
+            $parsed_docblock = DocComment::parsePreservingLength($docblock);
+        } else {
+            $parsed_docblock = new ParsedDocblock('', []);
+        }
+
+        $modified_docblock = false;
+
+        foreach ($this->new_phpdoc_param_types as $param_name => $phpdoc_type) {
+            $found_in_params = false;
+            $new_param_block = $phpdoc_type . ' ' . '$' . $param_name;
+
+            if (isset($parsed_docblock->tags['param'])) {
+                foreach ($parsed_docblock->tags['param'] as &$param_block) {
+                    $doc_parts = CommentAnalyzer::splitDocLine($param_block);
+
+                    // If there's no type
+                    if (($doc_parts[0] ?? null) === '$' . $param_name) {
+                        // If the parameter has a description add that back
+                        if (count($doc_parts) > 1) {
+                            $new_param_block .= " ". implode(" ", array_slice($doc_parts, 1));
+                        }
+
+                        if ($param_block !== $new_param_block) {
+                            $modified_docblock = true;
+                        }
+
+                        $param_block = $new_param_block;
+                        $found_in_params = true;
+                        break;
+                    }
+
+                    // If there is a type
+                    if (($doc_parts[1] ?? null) === '$' . $param_name) {
+                        // If the parameter has a description add that back
+                        if (count($doc_parts) > 2) {
+                            $new_param_block .= " ". implode(" ", array_slice($doc_parts, 2));
+                        }
+
+                        if ($param_block !== $new_param_block) {
+                            $modified_docblock = true;
+                        }
+
+                        $param_block = $new_param_block;
+                        $found_in_params = true;
+                        break;
+                    }
+                }
+                unset($param_block);
+            }
+
+            if (!$found_in_params) {
+                $modified_docblock = true;
+                $parsed_docblock->tags['param'][] = $new_param_block;
+            }
+        }
+
+        foreach ($this->new_psalm_param_types as $param_name => $psalm_type) {
+            $found_in_params = false;
+            $new_param_block = $psalm_type . ' ' . '$' . $param_name;
+
+            if (isset($parsed_docblock->tags['psalm-param'])) {
+                foreach ($parsed_docblock->tags['psalm-param'] as &$param_block) {
+                    $doc_parts = CommentAnalyzer::splitDocLine($param_block);
+
+                    if (($doc_parts[1] ?? null) === '$' . $param_name) {
+                        if ($param_block !== $new_param_block) {
+                            $modified_docblock = true;
+                        }
+
+                        $param_block = $new_param_block;
+                        $found_in_params = true;
+                        break;
+                    }
+                }
+                unset($param_block);
+            }
+
+            if (!$found_in_params) {
+                $modified_docblock = true;
+                $parsed_docblock->tags['psalm-param'][] = $new_param_block;
+            }
+        }
+
+        foreach ($this->purity_wildcards as $param_name => $paths) {
+            $found_in_params = false;
+
+            foreach (['psalm-param', 'phpstan-param', 'param'] as $tag) {
+                foreach ($parsed_docblock->tags[$tag] ?? [] as $offset => $param_block) {
+                    $doc_parts = CommentAnalyzer::splitDocLine($param_block);
+
+                    if (($doc_parts[1] ?? null) !== '$' . $param_name
+                        && ($doc_parts[1] ?? null) !== '...$' . $param_name
+                    ) {
+                        continue;
+                    }
+
+                    $found_in_params = true;
+                    $new_type = PurityWildcardPaths::addToTypeString($doc_parts[0], $paths);
+
+                    if ($new_type !== null) {
+                        $modified_docblock = true;
+                        $parsed_docblock->tags[$tag][$offset] = rtrim(
+                            str_replace($doc_parts[0], $new_type, $param_block),
+                        );
+                    }
+                }
+            }
+
+            if (!$found_in_params) {
+                $new_type = PurityWildcardPaths::addToTypeString($this->getNativeParamType($param_name) ?? '', $paths);
+
+                if ($new_type !== null) {
+                    $modified_docblock = true;
+                    $parsed_docblock->tags['param'][] = $new_type . ' $' . $param_name;
+                }
+            }
+        }
+
+        $old_phpdoc_return_type = null;
+        if (isset($parsed_docblock->tags['return'])) {
+            $old_phpdoc_return_type = reset($parsed_docblock->tags['return']);
+        }
+
+        if ($this->capabilities !== null) {
+            $modified_docblock = true;
+            unset($parsed_docblock->tags['psalm-pure']);
+            unset($parsed_docblock->tags['psalm-mutation-free']);
+            unset($parsed_docblock->tags['psalm-external-mutation-free']);
+            unset($parsed_docblock->tags['psalm-impure']);
+            unset($parsed_docblock->tags['psalm-capabilities']);
+            $annotation = Capabilities::toFunctionAnnotation($this->capabilities);
+            $space = strpos($annotation, ' ');
+            $tag = $space === false ? $annotation : substr($annotation, 0, $space);
+            $parsed_docblock->tags[$tag] = [$space === false ? '' : substr($annotation, $space + 1)];
+        }
+        if (count($this->throwsExceptions) > 0) {
+            $modified_docblock = true;
+            $inferredThrowsClause = array_reduce(
+                $this->throwsExceptions,
+                static fn(string $throwsClause, string $exception) => $throwsClause === ''
+                    ? $exception
+                    : $throwsClause.'|'.$exception,
+                '',
+            );
+            if (array_key_exists('throws', $parsed_docblock->tags)) {
+                $parsed_docblock->tags['throws'][] = $inferredThrowsClause;
+            } else {
+                $parsed_docblock->tags['throws'] = [$inferredThrowsClause];
+            }
+        }
+
+
+        if ($this->new_phpdoc_return_type && $this->new_phpdoc_return_type !== $old_phpdoc_return_type) {
+            $modified_docblock = true;
+            if ($this->new_phpdoc_return_type !== $this->new_php_return_type || $this->return_type_description) {
+                //only add the type if it's different than signature or if there's a description
+                $parsed_docblock->tags['return'] = [
+                    $this->new_phpdoc_return_type
+                    . ($this->return_type_description ? (' ' . $this->return_type_description) : ''),
+                ];
+            } else {
+                unset($parsed_docblock->tags['return']);
+            }
+        }
+
+        $old_psalm_return_type = null;
+        if (isset($parsed_docblock->tags['psalm-return'])) {
+            $old_psalm_return_type = reset($parsed_docblock->tags['psalm-return']);
+        }
+
+        if ($this->new_psalm_return_type
+            && $this->new_phpdoc_return_type !== $this->new_psalm_return_type
+            && $this->new_psalm_return_type !== $old_psalm_return_type
+        ) {
+            $modified_docblock = true;
+            $parsed_docblock->tags['psalm-return'] = [$this->new_psalm_return_type];
+        }
+
+        if (!$parsed_docblock->tags && !$parsed_docblock->description) {
+            return '';
+        }
+
+        if (!$modified_docblock) {
+            return (string)$docblock . "\n" . $this->indentation;
+        }
+
+        return $parsed_docblock->render($this->indentation);
+    }
+
+    /**
+     * @return array<int, FileManipulation>
+     */
+    public static function getManipulationsForFile(string $file_path): array
+    {
+        if (!isset(self::$manipulators[$file_path])) {
+            return [];
+        }
+
+        $file_manipulations = [];
+
+        foreach (self::$manipulators[$file_path] as $manipulator) {
+            if ($manipulator->new_php_return_type) {
+                if ($manipulator->return_typehint_start && $manipulator->return_typehint_end) {
+                    $file_manipulations[$manipulator->return_typehint_start] = new FileManipulation(
+                        $manipulator->return_typehint_start,
+                        $manipulator->return_typehint_end,
+                        $manipulator->new_php_return_type,
+                    );
+                } else {
+                    $file_manipulations[$manipulator->return_typehint_area_start] = new FileManipulation(
+                        $manipulator->return_typehint_area_start,
+                        $manipulator->return_typehint_area_start,
+                        ': ' . $manipulator->new_php_return_type,
+                    );
+                }
+            } elseif ($manipulator->new_php_return_type === ''
+                && $manipulator->return_typehint_colon_start
+                && $manipulator->new_phpdoc_return_type
+                && $manipulator->return_typehint_start
+                && $manipulator->return_typehint_end
+            ) {
+                $file_manipulations[$manipulator->return_typehint_start] = new FileManipulation(
+                    $manipulator->return_typehint_colon_start,
+                    $manipulator->return_typehint_end,
+                    '',
+                );
+            }
+
+            if (!$manipulator->new_php_return_type
+                || !$manipulator->return_type_is_php_compatible
+                || $manipulator->docblock_start !== $manipulator->docblock_end
+                || $manipulator->capabilities !== null
+                || $manipulator->purity_wildcards !== []
+            ) {
+                $file_manipulations[$manipulator->docblock_start] = new FileManipulation(
+                    $manipulator->docblock_start,
+                    $manipulator->docblock_end,
+                    $manipulator->getDocblock(),
+                );
+            }
+
+            foreach ($manipulator->new_php_param_types as $param_name => $new_php_param_type) {
+                if (!isset($manipulator->param_offsets[$param_name])) {
+                    continue;
+                }
+
+                $param_offset = $manipulator->param_offsets[$param_name];
+
+                $typehint_offsets = $manipulator->param_typehint_offsets[$param_name] ?? null;
+
+                if ($new_php_param_type) {
+                    if ($typehint_offsets) {
+                        $file_manipulations[$typehint_offsets[0]] = new FileManipulation(
+                            $typehint_offsets[0],
+                            $typehint_offsets[1],
+                            $new_php_param_type,
+                        );
+                    } else {
+                        $file_manipulations[$param_offset] = new FileManipulation(
+                            $param_offset,
+                            $param_offset,
+                            $new_php_param_type . ' ',
+                        );
+                    }
+                } elseif ($new_php_param_type === ''
+                    && $typehint_offsets
+                ) {
+                    $file_manipulations[$typehint_offsets[0]] = new FileManipulation(
+                        $typehint_offsets[0],
+                        $param_offset,
+                        '',
+                    );
+                }
+            }
+        }
+
+        return $file_manipulations;
+    }
+
+    /**
+     * @param CapabilitySet $capabilities a bitmask of {@see Capabilities} constants
+     * @psalm-external-mutation-free
+     */
+    public function setCapabilities(int $capabilities): void
+    {
+        $this->capabilities = $capabilities;
+    }
+
+    /**
+     * Gives the parameters the `_` purity (`Closure[_]`, `list<Closure[_]>`, `Traversable[_]`) where
+     * the paths say ({@see PurityWildcardPaths}).
+     *
+     * @param array<string, list<string>> $paths_by_param
+     * @psalm-external-mutation-free
+     */
+    public function addPurityWildcards(array $paths_by_param): void
+    {
+        $this->purity_wildcards = $paths_by_param;
+    }
+
+    /**
+     * The native type of the parameter as written.
+     */
+    private function getNativeParamType(string $param_name): ?string
+    {
+        foreach ($this->stmt->getParams() as $param) {
+            if ($param->var instanceof PhpParser\Node\Expr\Variable
+                && $param->var->name === $param_name
+                && $param->type !== null
+            ) {
+                return PurityWildcardPaths::getNativeTypeString($param->type);
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param list<string> $exceptions
+     * @psalm-external-mutation-free
+     */
+    public function addThrowsDocblock(array $exceptions): void
+    {
+        $this->throwsExceptions = $exceptions;
+    }
+
+    /**
+     * @psalm-external-mutation-free
+     */
+    public static function clearCache(): void
+    {
+        self::$manipulators = [];
+    }
+
+    /**
+     * @param array<string, array<int, FunctionDocblockManipulator>> $manipulators
+     * @psalm-external-mutation-free
+     */
+    public static function addManipulators(array $manipulators): void
+    {
+        self::$manipulators = [...$manipulators, ...self::$manipulators];
+    }
+
+    /**
+     * @return array<string, array<int, FunctionDocblockManipulator>>
+     * @psalm-external-mutation-free
+     */
+    public static function getManipulators(): array
+    {
+        return self::$manipulators;
+    }
+}

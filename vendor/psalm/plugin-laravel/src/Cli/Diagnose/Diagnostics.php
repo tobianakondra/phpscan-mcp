@@ -1,0 +1,236 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\LaravelPlugin\Cli\Diagnose;
+
+use Composer\InstalledVersions;
+use Illuminate\Foundation\Application as LaravelApplication;
+use Psalm\Config;
+use Psalm\LaravelPlugin\Bootstrap\ApplicationProvider;
+use Psalm\LaravelPlugin\Config\PluginConfig;
+use Psalm\LaravelPlugin\Config\PluginOverrides;
+use Psalm\LaravelPlugin\Plugin;
+
+/**
+ * Collects runtime introspection data about the plugin's resolved state.
+ *
+ * Subclassable so unit tests can override {@see collect()} with a fixture
+ * report without booting Laravel.
+ *
+ * @internal
+ */
+class Diagnostics
+{
+    private const PLUGIN_PACKAGE = 'psalm/plugin-laravel';
+
+    public function collect(): Report
+    {
+        $bootstrapErrors = [];
+
+        try {
+            ApplicationProvider::bootApp();
+        } catch (\Throwable $throwable) {
+            $bootstrapErrors[] = $throwable->getMessage();
+        }
+
+        // Throws swallowed inside `doGetApp()` (e.g. `$consoleApp->bootstrap()`
+        // failing on a bad `config/*.php`) never propagate to the catch above —
+        // ApplicationProvider stashes them so diagnose can surface partial-boot state.
+        $swallowed = ApplicationProvider::getBootstrapError();
+        if ($swallowed instanceof \Throwable) {
+            $bootstrapErrors[] = $swallowed->getMessage();
+        }
+
+        // A null bootMode means the boot pipeline never reached a resolution branch
+        // (the try/catch above swallowed a hard throw). Treat that as a hard failure
+        // so the CLI exits non-zero; partial-bootstrap warnings alone are informational.
+        $hardFailures = [];
+        if (ApplicationProvider::getBootMode() === null && $bootstrapErrors !== []) {
+            $hardFailures[] = 'Application boot failed: ' . $bootstrapErrors[0];
+        }
+
+        $cwd = \getcwd();
+        $projectRoot = \is_string($cwd) ? $cwd : null;
+
+        [$analysisVersion, $analysisSource] = $this->resolveAnalysisPhpVersion($projectRoot);
+
+        return new Report(
+            pluginVersion: $this->safePrettyVersion(self::PLUGIN_PACKAGE),
+            psalmVersion: $this->safePrettyVersion('vimeo/psalm'),
+            laravelVersion: \defined(LaravelApplication::class . '::VERSION') ? LaravelApplication::VERSION : null,
+            phpRuntimeVersion: \PHP_VERSION,
+            phpAnalysisVersion: $analysisVersion,
+            phpAnalysisSource: $analysisSource,
+            bootMode: ApplicationProvider::getBootMode(),
+            bootPath: ApplicationProvider::getBootPath(),
+            bootstrapErrors: $bootstrapErrors,
+            hardFailures: $hardFailures,
+            loadedProviders: $this->collectLoadedProviders(),
+            blade: $projectRoot === null ? 'off' : $this->bladeStatus($projectRoot),
+        );
+    }
+
+    /**
+     * Read from the Psalm config alone: booting Blade would compile every template, too slow for a
+     * report. Why a run disabled it is that run's own warning.
+     *
+     * @return string `off`, `on (cache <dir>)`, or `unknown: <reason>` when the config cannot be read
+     */
+    public function bladeStatus(string $projectRoot): string
+    {
+        try {
+            $pluginXml = $this->loadPluginXml($projectRoot);
+
+            if ($pluginXml === false) {
+                return 'off';
+            }
+
+            $config = PluginConfig::fromXml($pluginXml, PluginOverrides::parse((string) \getenv(PluginOverrides::ENV_VAR)));
+        } catch (\Throwable $throwable) {
+            return 'unknown: ' . $throwable->getMessage();
+        }
+
+        return $config->bladeEnabled ? 'on (cache ' . $config->bladeCacheDir . ')' : 'off';
+    }
+
+    /**
+     * This plugin's settings from the Psalm config governing the project, found and loaded by Psalm
+     * itself (dist names, parent directories, `<xi:include>`). Loading also plants Psalm's Config
+     * singleton, which the default Blade cache directory derives from.
+     *
+     * Loading reads the constant Psalm's CLI defines, and `exit(1)`s on any argv token that is not an
+     * existing path (see {@see resolveAnalysisPhpVersion()}), so argv is hidden for the duration.
+     *
+     * @return \SimpleXMLElement|null|false null when the plugin is registered without settings,
+     *                                      false when no config registers it
+     */
+    private function loadPluginXml(string $projectRoot): \SimpleXMLElement|false|null
+    {
+        global $argv;
+
+        $path = Config::locateConfigFile($projectRoot);
+
+        if ($path === null) {
+            return false;
+        }
+
+        if (!\defined('PSALM_VERSION')) {
+            \define('PSALM_VERSION', $this->safePrettyVersion('vimeo/psalm') ?? 'unknown');
+        }
+
+        $saved = $argv;
+        $argv = [];
+
+        try {
+            $psalmConfig = Config::loadFromXMLFile($path, $projectRoot);
+        } finally {
+            $argv = $saved;
+        }
+
+        foreach ($psalmConfig->getPluginClasses() as $plugin) {
+            if (\strcasecmp(\ltrim($plugin['class'], '\\'), Plugin::class) === 0) {
+                return $plugin['config'];
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Service providers the booted kernel registered, sorted for stable output.
+     *
+     * Includes framework core providers plus anything package discovery (and, in
+     * package-source boots, {@see ApplicationProvider::registerDiscoveredVendorProviders()})
+     * registered. Returns an empty list when the app never resolved — `getApp()`
+     * throws in that case, and a failed boot has no providers to report.
+     *
+     * @return list<string>
+     */
+    private function collectLoadedProviders(): array
+    {
+        try {
+            $providers = \array_keys(ApplicationProvider::getApp()->getLoadedProviders());
+        } catch (\Throwable) {
+            return [];
+        }
+
+        \sort($providers);
+
+        return $providers;
+    }
+
+    /**
+     * Resolve the PHP version Psalm uses for analysis. Only `psalm.xml`'s
+     * `phpVersion=` attribute is a concrete version; otherwise we fall back
+     * to the runtime.
+     *
+     * We parse `psalm.xml` directly with SimpleXML instead of
+     * `Config::getConfigForPath()` because the latter eagerly validates every
+     * entry in `$argv` as a filesystem path (see Psalm's
+     * {@see \Psalm\Internal\CliUtils::getPathsToCheck()}) and `exit(1)`s on
+     * `bin/psalm-laravel diagnose` — its Symfony bypass only spares the `psalm-plugin` binary.
+     *
+     * @return array{string, 'runtime'|'psalm.xml'}
+     */
+    private function resolveAnalysisPhpVersion(?string $projectRoot): array
+    {
+        if ($projectRoot !== null) {
+            $fromXml = $this->readPsalmXmlPhpVersion($projectRoot);
+            if ($fromXml !== null) {
+                return [$fromXml, 'psalm.xml'];
+            }
+        }
+
+        return [\PHP_VERSION, 'runtime'];
+    }
+
+    /**
+     * Read the `phpVersion` attribute from `<projectRoot>/psalm.xml`. We don't
+     * walk parent directories — diagnose is intended for the project root.
+     */
+    private function readPsalmXmlPhpVersion(string $projectRoot): ?string
+    {
+        $path = $projectRoot . \DIRECTORY_SEPARATOR . 'psalm.xml';
+        if (!\is_file($path)) {
+            return null;
+        }
+
+        $contents = \file_get_contents($path);
+        if ($contents === false) {
+            return null;
+        }
+
+        // Toggle libxml's internal error buffer so a malformed psalm.xml never
+        // bubbles a warning to STDOUT and breaks the diagnose report layout.
+        $previous = \libxml_use_internal_errors(true);
+        $xml = \simplexml_load_string($contents);
+        \libxml_clear_errors();
+        \libxml_use_internal_errors($previous);
+
+        if (!$xml instanceof \SimpleXMLElement) {
+            return null;
+        }
+
+        $attr = $xml['phpVersion'] ?? null;
+        if (!$attr instanceof \SimpleXMLElement) {
+            return null;
+        }
+
+        $value = (string) $attr;
+        return $value === '' ? null : $value;
+    }
+
+    private function safePrettyVersion(string $package): ?string
+    {
+        if (!InstalledVersions::isInstalled($package)) {
+            return null;
+        }
+
+        try {
+            return InstalledVersions::getPrettyVersion($package);
+        } catch (\OutOfBoundsException) {
+            return null;
+        }
+    }
+}

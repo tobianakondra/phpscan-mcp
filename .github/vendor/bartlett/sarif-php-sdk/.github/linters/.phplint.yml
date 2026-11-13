@@ -1,0 +1,8 @@
+path: .
+jobs: 5
+file-extensions:
+    - php
+exclude:
+    - vendor
+    - examples/converters/fixtures
+warning: false

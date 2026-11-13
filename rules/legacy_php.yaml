@@ -1,0 +1,80 @@
+rules:
+  - id: legacy-php-exec-eval
+    patterns:
+      - pattern-either:
+          - pattern: eval($X)
+          - pattern: assert($X)
+          - pattern: create_function($X)
+          - pattern: preg_replace('/e', ...)
+    message: |
+      Détecté usage d'évaluation de code PHP dynamique (eval / assert / create_function / preg_replace /e).
+      Risque: injection de code, exécution arbitraire.
+    severity: ERROR
+    languages:
+      - php
+
+  - id: legacy-php-shell-execution
+    patterns:
+      - pattern-either:
+          - pattern: system($X)
+          - pattern: exec($X)
+          - pattern: shell_exec($X)
+          - pattern: passthru($X)
+          - pattern: popen($X)
+          - pattern: proc_open($X)
+          - pattern: sh($X)
+          - pattern: $X = `...`
+    message: |
+      Détection d'appel système externe. Risque: injection de commande si les entrées sont non échappées.
+    severity: ERROR
+    languages:
+      - php
+
+  - id: legacy-php-glob
+    patterns:
+      - pattern: glob($X)
+    message: |
+      Détecté utilisation de glob() : potential path traversal si $X est contrôlé par une entrée utilisateur.
+    severity: WARNING
+    languages:
+      - php
+
+  - id: legacy-php-include-remote
+    patterns:
+      - pattern: include($X)
+      - pattern: include_once($X)
+      - pattern: require($X)
+      - pattern: require_once($X)
+      - pattern: include_once($X)
+    message: |
+      Détection d'inclusion de fichier. Risque: include/require de fichiers contrôlés par l'utilisateur (LFI).
+    severity: WARNING
+    languages:
+      - php
+
+  - id: legacy-php-mysql-connect
+    patterns:
+      - pattern: mysql_connect($X)
+      - pattern: mysql_pconnect($X)
+      - pattern: mysql_query($X)
+      - pattern: mysql_error($X)
+    message: |
+      Détection de l'API mysql_* obsolète (PHP 5.5+). Déprecation: utilisation de l'extension MySQL native obsolète.
+    severity: INFO
+    languages:
+      - php
+
+  - id: legacy-php-magic-strings
+    patterns:
+      - pattern: $_GET
+      - pattern: $_POST
+      - pattern: $_REQUEST
+      - pattern: $_FILES
+      - pattern: $_COOKIE
+      - pattern: $_SESSION
+      - pattern: $_SERVER
+    message: |
+      Détection d'entrée utilisateur directe non validée. S'assurer d'y apporter une échappement/validation avant utilisation.
+    severity: WARNING
+    languages:
+      - php

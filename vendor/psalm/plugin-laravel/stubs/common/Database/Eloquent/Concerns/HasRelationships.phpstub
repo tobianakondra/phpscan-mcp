@@ -1,0 +1,178 @@
+<?php
+
+namespace Illuminate\Database\Eloquent\Concerns;
+
+trait HasRelationships
+{
+
+    /**
+     * @return list<string>
+     */
+    public function getTouchedRelations() {}
+
+    /**
+     * @template TRelatedModel of \Illuminate\Database\Eloquent\Model
+     * @psalm-param class-string<TRelatedModel> $related
+     *
+     * @param  string  $related
+     * @param  string  $foreignKey
+     * @param  string  $localKey
+     * @return \Illuminate\Database\Eloquent\Relations\HasOne<TRelatedModel, static>
+     */
+    public function hasOne($related, $foreignKey = null, $localKey = null) {}
+
+    /**
+     * @template TRelatedModel of \Illuminate\Database\Eloquent\Model
+     * @template TIntermediateModel of \Illuminate\Database\Eloquent\Model
+     * @psalm-param class-string<TRelatedModel> $related
+     * @psalm-param class-string<TIntermediateModel> $through
+     *
+     * @param  string  $related
+     * @param  string  $through
+     * @param  string|null  $firstKey
+     * @param  string|null  $secondKey
+     * @param  string|null  $localKey
+     * @param  string|null  $secondLocalKey
+     * @return \Illuminate\Database\Eloquent\Relations\HasOneThrough<TRelatedModel, TIntermediateModel, static>
+     */
+    public function hasOneThrough($related, $through, $firstKey = null, $secondKey = null, $localKey = null, $secondLocalKey = null) {}
+
+    /**
+     * @template TRelatedModel of \Illuminate\Database\Eloquent\Model
+     * @psalm-param class-string<TRelatedModel> $related
+     *
+     * @param  string  $related
+     * @param  string  $name
+     * @param  string  $type
+     * @param  string  $id
+     * @param  string  $localKey
+     * @return \Illuminate\Database\Eloquent\Relations\MorphOne<TRelatedModel, static>
+     */
+    public function morphOne($related, $name, $type = null, $id = null, $localKey = null) {}
+
+    /**
+     * @template TRelatedModel of \Illuminate\Database\Eloquent\Model
+     * @psalm-param class-string<TRelatedModel> $related
+     *
+     * @param  string  $related
+     * @param  string  $foreignKey
+     * @param  string  $ownerKey
+     * @param  string  $relation
+     * @return \Illuminate\Database\Eloquent\Relations\BelongsTo<TRelatedModel, static>
+     */
+    public function belongsTo($related, $foreignKey = null, $ownerKey = null, $relation = null) {}
+
+    /**
+     * The related model type cannot be determined statically for polymorphic relations,
+     * so TRelatedModel defaults to Model.
+     *
+     * Narrowing TRelatedModel to the registered morph-map union is not attempted, so an app
+     * `@return MorphTo<Concrete|..., self>` raises MoreSpecificReturnType; the inherent-limitation
+     * assertions are pinned in tests/Type/tests/Relation/RelationStubKnownLimitationsTest.phpt.
+     *
+     * @return \Illuminate\Database\Eloquent\Relations\MorphTo<\Illuminate\Database\Eloquent\Model, static>
+     */
+    public function morphTo($name = null, $type = null, $id = null, $ownerKey = null) {}
+
+    /**
+     * @template TRelatedModel of \Illuminate\Database\Eloquent\Model
+     * @psalm-param class-string<TRelatedModel> $related
+     *
+     * @param  string  $related
+     * @param  string  $foreignKey
+     * @param  string  $localKey
+     * @return \Illuminate\Database\Eloquent\Relations\HasMany<TRelatedModel, static>
+     */
+    public function hasMany($related, $foreignKey = null, $localKey = null) {}
+
+    /**
+     * @template TRelatedModel of \Illuminate\Database\Eloquent\Model
+     * @template TIntermediateModel of \Illuminate\Database\Eloquent\Model
+     * @psalm-param class-string<TRelatedModel> $related
+     * @psalm-param class-string<TIntermediateModel> $through
+     *
+     * @param  string  $related
+     * @param  string  $through
+     * @param  string|null  $firstKey
+     * @param  string|null  $secondKey
+     * @param  string|null  $localKey
+     * @param  string|null  $secondLocalKey
+     * @return \Illuminate\Database\Eloquent\Relations\HasManyThrough<TRelatedModel, TIntermediateModel, static>
+     */
+    public function hasManyThrough($related, $through, $firstKey = null, $secondKey = null, $localKey = null, $secondLocalKey = null) {}
+
+    /**
+     * @template TRelatedModel of \Illuminate\Database\Eloquent\Model
+     * @psalm-param class-string<TRelatedModel> $related
+     *
+     * @param  string  $related
+     * @param  string  $name
+     * @param  string  $type
+     * @param  string  $id
+     * @param  string  $localKey
+     * @return \Illuminate\Database\Eloquent\Relations\MorphMany<TRelatedModel, static>
+     */
+    public function morphMany($related, $name, $type = null, $id = null, $localKey = null) {}
+
+    /**
+     * @template TRelatedModel of \Illuminate\Database\Eloquent\Model
+     * @psalm-param class-string<TRelatedModel> $related
+     *
+     * @param  string  $related
+     * @param  string  $table
+     * @param  string  $foreignPivotKey
+     * @param  string  $relatedPivotKey
+     * @param  string  $parentKey
+     * @param  string  $relatedKey
+     * @param  string  $relation
+     *
+     * The trailing pivot/accessor slots fill from the `BelongsToMany` template defaults (Pivot, 'pivot'),
+     * so the 2-arg return carries `->pivot` on in-body chains (#1088). `->using()` / `->as()` re-narrow
+     * them; `static` avoids the #913 collapse. Psalm fills defaults only for docblock types: the
+     * handler-built 4-slot type (ModelRelationReturnTypeHandler) is spelled out in full.
+     * @return \Illuminate\Database\Eloquent\Relations\BelongsToMany<TRelatedModel, static>
+     */
+    public function belongsToMany($related, $table = null, $foreignPivotKey = null, $relatedPivotKey = null,
+                                  $parentKey = null, $relatedKey = null, $relation = null) {}
+
+    /**
+     * @template TRelatedModel of \Illuminate\Database\Eloquent\Model
+     * @psalm-param class-string<TRelatedModel> $related
+     *
+     * @param  string  $related
+     * @param  string  $name
+     * @param  string  $table
+     * @param  string  $foreignPivotKey
+     * @param  string  $relatedPivotKey
+     * @param  string  $parentKey
+     * @param  string  $relatedKey
+     * @param  string  $relation
+     * @param  bool  $inverse
+     *
+     * Trailing pivot/accessor slots fill from the `MorphToMany` defaults (MorphPivot, 'pivot'); see belongsToMany().
+     * @return \Illuminate\Database\Eloquent\Relations\MorphToMany<TRelatedModel, static>
+     */
+    public function morphToMany($related, $name, $table = null, $foreignPivotKey = null,
+                                $relatedPivotKey = null, $parentKey = null,
+                                $relatedKey = null, $relation = null, $inverse = false) {}
+
+    /**
+     * @template TRelatedModel of \Illuminate\Database\Eloquent\Model
+     * @psalm-param class-string<TRelatedModel> $related
+     *
+     * @param  string  $related
+     * @param  string  $name
+     * @param  string  $table
+     * @param  string  $foreignPivotKey
+     * @param  string  $relatedPivotKey
+     * @param  string  $parentKey
+     * @param  string  $relatedKey
+     * @param  string  $relation
+     *
+     * Trailing pivot/accessor slots fill from the `MorphToMany` defaults (MorphPivot, 'pivot'); see belongsToMany().
+     * @return \Illuminate\Database\Eloquent\Relations\MorphToMany<TRelatedModel, static>
+     */
+    public function morphedByMany($related, $name, $table = null, $foreignPivotKey = null,
+                                  $relatedPivotKey = null, $parentKey = null,
+                                  $relatedKey = null, $relation = null) {}
+}

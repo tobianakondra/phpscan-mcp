@@ -1,0 +1,431 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Psalm\Type;
+
+use Override;
+use Psalm\Internal\DataFlow\DataFlowNode;
+use Psalm\Internal\TypeVisitor\FromDocblockSetter;
+use Psalm\Storage\ImmutableNonCloneableTrait;
+use Psalm\Type\Atomic\TClassString;
+use Psalm\Type\Atomic\TLiteralFloat;
+use Psalm\Type\Atomic\TLiteralInt;
+use Psalm\Type\Atomic\TLiteralString;
+
+/**
+ * @psalm-immutable
+ * @psalm-type TProperties=array{
+ *      from_docblock?: bool,
+ *      from_calculation?: bool,
+ *      int_mask_bits?: ?int,
+ *      from_property?: bool,
+ *      from_static_property?: bool,
+ *      from_global_state?: bool,
+ *      initialized?: bool,
+ *      initialized_class?: ?string,
+ *      checked?: bool,
+ *      failed_reconciliation?: bool,
+ *      ignore_nullable_issues?: bool,
+ *      ignore_falsable_issues?: bool,
+ *      ignore_isset?: bool,
+ *      possibly_undefined?: bool,
+ *      possibly_undefined_from_try?: bool,
+ *      explicit_never?: bool,
+ *      had_template?: bool,
+ *      from_template_default?: bool,
+ *      by_ref?: bool,
+ *      reference_free?: bool,
+ *      closure_state?: bool,
+ *      allow_mutations?: bool,
+ *      has_mutations?: bool,
+ *      different?: bool,
+ *      parent_nodes?: array<string, DataFlowNode>,
+ *      propagate_parent_nodes?: bool
+ * }
+ * @api
+ */
+final class Union implements TypeNode
+{
+    use ImmutableNonCloneableTrait;
+    use UnionTrait;
+
+    /**
+     * @psalm-readonly
+     * @var non-empty-array<string, Atomic>
+     */
+    private array $types;
+
+    /**
+     * Whether the type originated in a docblock
+     */
+    public bool $from_docblock = false;
+
+    /**
+     * Whether the type originated from integer calculation
+     */
+    public bool $from_calculation = false;
+
+    /**
+     * Set when the value is a bit set: declared as `int-mask` or `int-mask-of`, or derived from one
+     * with `&`, `|` or `^`. It holds every bit the value may have. Such a value may only be compared
+     * by value with 0 (no bit set) or with all of these bits, see IntMaskComparison.
+     */
+    public ?int $int_mask_bits = null;
+
+    /**
+     * Whether the type originated from a property
+     *
+     * This helps turn isset($foo->bar) into a different sort of issue
+     */
+    public bool $from_property = false;
+
+    /**
+     * Whether the type originated from *static* property
+     *
+     * Unlike non-static properties, static properties have no prescribed place
+     * like __construct() to be initialized in
+     */
+    public bool $from_static_property = false;
+
+    /**
+     * Whether the value was reached from global state: read from a static property, a
+     * superglobal or a `global` variable, returned by a callee that reads globals, or fetched
+     * from such a value. Mutating it needs the write-globals capability.
+     */
+    public bool $from_global_state = false;
+
+    /**
+     * Whether the property that this type has been derived from has been initialized in a constructor
+     */
+    public bool $initialized = true;
+
+    /**
+     * Which class the type was initialised in
+     */
+    public ?string $initialized_class = null;
+
+    /**
+     * Whether or not the type has been checked yet
+     */
+    public bool $checked = false;
+
+    public bool $failed_reconciliation = false;
+
+    /**
+     * Whether or not to ignore issues with possibly-null values
+     */
+    public bool $ignore_nullable_issues = false;
+
+    /**
+     * Whether or not to ignore issues with possibly-false values
+     */
+    public bool $ignore_falsable_issues = false;
+
+    /**
+     * Whether or not to ignore issues with isset on this type
+     */
+    public bool $ignore_isset = false;
+
+    /**
+     * Whether or not this variable is possibly undefined
+     */
+    public bool $possibly_undefined = false;
+
+    /**
+     * Whether or not this variable is possibly undefined
+     */
+    public bool $possibly_undefined_from_try = false;
+
+    /**
+     * whether this type had never set explicitly
+     * since it's the bottom type, it's combined into everything else and lost
+     */
+    public bool $explicit_never = false;
+
+    /**
+     * Whether or not this union had a template, since replaced
+     */
+    public bool $had_template = false;
+
+    /**
+     * Whether or not this union comes from a template "as" default
+     */
+    public bool $from_template_default = false;
+
+    /**
+     * @var array<string, TLiteralString>
+     */
+    private array $literal_string_types = [];
+
+    /**
+     * @var array<string, TClassString>
+     */
+    private array $typed_class_strings = [];
+
+    /**
+     * @var array<string, TLiteralInt>
+     */
+    private array $literal_int_types = [];
+
+    /**
+     * @var array<string, TLiteralFloat>
+     */
+    private array $literal_float_types = [];
+
+    /**
+     * True if the type was passed or returned by reference, or if the type refers to an object's
+     * property or an item in an array. Note that this is not true for locally created references
+     * that don't refer to properties or array items (see Context::$references_in_scope).
+     */
+    public bool $by_ref = false;
+
+    public bool $reference_free = false;
+
+    /**
+     * Whether the value is state of the closure being analysed: a closure captured it from the
+     * scope that created it (it was reference-free there), so only that scope and the closure hold
+     * it, as a class instance holds the objects it creates. Writing it needs write-this-props.
+     */
+    public bool $closure_state = false;
+
+    public bool $allow_mutations = true;
+
+    public bool $has_mutations = true;
+
+    /**
+     * This is a cache of getId on non-exact mode
+     */
+    private ?string $id = null;
+
+    /**
+     * This is a cache of getId on exact mode
+     */
+    private ?string $exact_id = null;
+
+
+    /**
+     * @var array<string, DataFlowNode>
+     */
+    public array $parent_nodes = [];
+
+    public bool $propagate_parent_nodes = false;
+
+    public bool $different = false;
+
+    private const PROPERTY_KEYS_FOR_UNSERIALIZE = [
+        "\0" . self::class . "\0" . 'types' => 'types',
+        'from_docblock' => 'from_docblock',
+        'from_calculation' => 'from_calculation',
+        'int_mask_bits' => 'int_mask_bits',
+        'from_property' => 'from_property',
+        'from_static_property' => 'from_static_property',
+        'from_global_state' => 'from_global_state',
+        'initialized' => 'initialized',
+        'initialized_class' => 'initialized_class',
+        'checked' => 'checked',
+        'failed_reconciliation' => 'failed_reconciliation',
+        'ignore_nullable_issues' => 'ignore_nullable_issues',
+        'ignore_falsable_issues' => 'ignore_falsable_issues',
+        'ignore_isset' => 'ignore_isset',
+        'possibly_undefined' => 'possibly_undefined',
+        'possibly_undefined_from_try' => 'possibly_undefined_from_try',
+        'explicit_never' => 'explicit_never',
+        'had_template' => 'had_template',
+        'from_template_default' => 'from_template_default',
+        "\0" . self::class . "\0" . 'literal_string_types' => 'literal_string_types',
+        "\0" . self::class . "\0" . 'typed_class_strings' => 'typed_class_strings',
+        "\0" . self::class . "\0" . 'literal_int_types' => 'literal_int_types',
+        "\0" . self::class . "\0" . 'literal_float_types' => 'literal_float_types',
+        'by_ref' => 'by_ref',
+        'reference_free' => 'reference_free',
+        'closure_state' => 'closure_state',
+        'allow_mutations' => 'allow_mutations',
+        'has_mutations' => 'has_mutations',
+        "\0" . self::class . "\0" . 'id' => 'id',
+        "\0" . self::class . "\0" . 'exact_id' => 'exact_id',
+        'parent_nodes' => 'parent_nodes',
+        'propagate_parent_nodes' => 'propagate_parent_nodes',
+        'different' => 'different',
+    ];
+
+    /**
+     * Suppresses memory usage when unserializing objects.
+     *
+     * @see \Psalm\Storage\UnserializeMemoryUsageSuppressionTrait
+     */
+    public function __unserialize(array $properties): void
+    {
+        foreach (self::PROPERTY_KEYS_FOR_UNSERIALIZE as $key => $property_name) {
+            /** @psalm-suppress PossiblyUndefinedStringArrayOffset */
+            $this->$property_name = $properties[$key];
+        }
+    }
+
+    /**
+     * @param TProperties $properties
+     * @return static
+     */
+    public function setProperties(array $properties): self
+    {
+        $obj = null;
+        foreach ($properties as $key => $value) {
+            if ($this->{$key} !== $value) {
+                if ($obj === null) {
+                    $obj = clone $this;
+                }
+                /** @psalm-suppress ImpurePropertyAssignment We just cloned this object */
+                $obj->{$key} = $value;
+            }
+        }
+        return $obj ?? $this;
+    }
+
+    /**
+     * @return static
+     */
+    public function setDifferent(bool $different): self
+    {
+        if ($different === $this->different) {
+            return $this;
+        }
+        $cloned = clone $this;
+        $cloned->different = $different;
+        return $cloned;
+    }
+
+    /**
+     * @param array<string, DataFlowNode>|list<DataFlowNode> $parent_nodes keyed by their ids, or a list of them
+     * @return static
+     */
+    public function setParentNodes(array $parent_nodes, bool $propagate_changes = false): self
+    {
+        $parent_nodes = self::keyParentNodes($parent_nodes);
+        if ($parent_nodes === $this->parent_nodes) {
+            return $this;
+        }
+        $cloned = clone $this;
+        $cloned->parent_nodes = $parent_nodes;
+        $cloned->propagate_parent_nodes = $propagate_changes;
+        return $cloned;
+    }
+
+
+    /**
+     * @param array<string, DataFlowNode>|list<DataFlowNode> $parent_nodes keyed by their ids, or a list of them
+     * @return static
+     */
+    public function addParentNodes(array $parent_nodes): self
+    {
+        if (!$parent_nodes) {
+            return $this;
+        }
+        $parent_nodes = DataFlowNode::combineParentNodes($this->parent_nodes, self::keyParentNodes($parent_nodes));
+        if ($parent_nodes === $this->parent_nodes) {
+            return $this;
+        }
+        $cloned = clone $this;
+        $cloned->parent_nodes = $parent_nodes;
+        return $cloned;
+    }
+
+    /**
+     * The nodes keyed by their ids: plugins may give a list of nodes, whose ids are internal
+     *
+     * @param array<string, DataFlowNode>|list<DataFlowNode> $parent_nodes
+     * @return array<string, DataFlowNode>
+     * @psalm-capabilities read-props
+     */
+    private static function keyParentNodes(array $parent_nodes): array
+    {
+        $keyed = [];
+        foreach ($parent_nodes as $parent_node) {
+            $keyed[$parent_node->id] = $parent_node;
+        }
+
+        return $keyed;
+    }
+
+    /** @return static */
+    public function setPossiblyUndefined(bool $possibly_undefined, ?bool $from_try = null): self
+    {
+        $from_try ??= $this->possibly_undefined_from_try;
+        if ($this->possibly_undefined === $possibly_undefined
+            && $this->possibly_undefined_from_try == $from_try
+        ) {
+            return $this;
+        }
+        $cloned = clone $this;
+        $cloned->possibly_undefined = $possibly_undefined;
+        $cloned->possibly_undefined_from_try = $from_try;
+        return $cloned;
+    }
+
+    /** @return static */
+    public function setByRef(bool $by_ref): static
+    {
+        if ($by_ref === $this->by_ref) {
+            return $this;
+        }
+        $cloned = clone $this;
+        $cloned->by_ref = $by_ref;
+        return $cloned;
+    }
+
+    /**
+     * @psalm-mutation-free
+     * @param non-empty-array<Atomic>  $types
+     */
+    public function setTypes(array $types): self
+    {
+        if ($types === $this->types) {
+            return $this;
+        }
+        return $this->getBuilder()->setTypes($types)->freeze();
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function getBuilder(): MutableUnion
+    {
+        return new MutableUnion($this->types, $this->getNonDefaultProperties());
+    }
+
+    /**
+     * @psalm-mutation-free
+     */
+    public function setFromDocblock(bool $fromDocblock = true): self
+    {
+        $cloned = clone $this;
+        /** @psalm-suppress ImpureMethodCall Acting on clone */
+        (new FromDocblockSetter($fromDocblock))->traverse($cloned);
+        return $cloned;
+    }
+
+    /**
+     * @phpcsSuppress SlevomatCodingStandard.TypeHints.ParameterTypeHint.MissingAnyTypeHint
+     */
+    #[Override]
+    public static function visitMutable(MutableTypeVisitor $visitor, &$node, bool $cloned): bool
+    {
+        $result = true;
+        $changed = false;
+        $types = $node->types;
+        foreach ($types as &$type) {
+            $type_orig = $type;
+            $result = $visitor->traverse($type);
+            $changed = $changed || $type_orig !== $type;
+            if (!$result) {
+                break;
+            }
+        }
+        unset($type);
+
+        if ($changed) {
+            $node = $node->setTypes($types);
+        }
+
+        return $result;
+    }
+}

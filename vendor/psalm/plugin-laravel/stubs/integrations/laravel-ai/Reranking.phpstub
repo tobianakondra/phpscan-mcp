@@ -1,0 +1,28 @@
+<?php
+
+namespace Laravel\Ai;
+
+use Illuminate\Support\Collection;
+use Laravel\Ai\PendingResponses\PendingReranking;
+
+/**
+ * Only the test-double surface is waived; every other member must stay restated so a new sink fails CI
+ * (policy: "Stub merging" in docs/contributing/README.md).
+ *
+ * @stub-waive assert*()  test-double assertions; recorded calls, never model-facing text
+ * @stub-waive fake()     test double; swaps the gateway, carries no prompt text
+ * @stub-waive isFaked()  no parameters; a boolean over whether the gateway is swapped
+ */
+class Reranking
+{
+    /**
+     * Documents are fed to the reranking model alongside the query —
+     * an attacker-controlled document can hijack the reranker the same way it
+     * hijacks the main LLM.
+     *
+     * @param  Collection<int, string>|array<int, string>  $documents
+     *
+     * @psalm-taint-sink llm_prompt $documents
+     */
+    public static function of(Collection|array $documents): PendingReranking {}
+}
